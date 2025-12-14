@@ -135,16 +135,17 @@ pub fn check_exclusivity_invariant(
         });
     }
 
-    // Count nodes meeting threshold
-    let occupants: Vec<_> = bindings_by_node
+    // Checks exclusivity without allocation
+    let thresh_filter = |(_, b)| *b >= FULL_THRESHOLD
+    let second_thresh = bindings_by_node
         .iter()
-        .filter(|(_, b)| *b >= FULL_THRESHOLD)
-        .collect();
+        .filter(thresh_filter)
+        .nth(1)
 
-    if occupants.len() > 1 {
+    if second_thresh.is_some() {
         return Err(ExclusivityViolation::MultipleOccupants {
             slot,
-            occupants: occupants.iter().map(|(n, _)| *n).collect(),
+            occupants: bindings_by_node.iter().filter(thresh_filter).map(|(n, _)| *n).collect(),
         });
     }
 
