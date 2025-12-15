@@ -29,23 +29,25 @@ pub fn build_router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/api/v1/health", get(health))
         .route("/ready", get(ready))
-        // Releases
-        .route("/api/v1/releases", get(list_releases))
-        .route("/api/v1/releases", post(create_release))
-        .route("/api/v1/releases/:id", get(get_release))
-        .route("/api/v1/releases/:id", delete(delete_release))
-        // Categories
-        .route("/api/v1/content-categories", get(list_categories))
-        // Featured releases (for flagship home page)
-        .route("/api/v1/featured-releases", get(list_featured_releases))
-        // Account (identity management)
-        .route("/api/v1/account/:public_key", get(get_account))
-        // Network mesh topology map
-        .route("/api/v1/map", get(get_network_map))
-        // Mesh state (slots, peers, TGP sessions)
-        .route("/api/v1/mesh/state", get(get_mesh_state))
-        // WebSocket for real-time mesh updates
-        .route("/api/v1/ws/mesh", get(ws_mesh_handler))
+        .nest("/api/v1",
+            // Releases
+            .route("/releases", get(list_releases))
+            .route("/releases", post(create_release))
+            .route("/releases/:id", get(get_release))
+            .route("/releases/:id", delete(delete_release))
+            // Categories
+            .route("/content-categories", get(list_categories))
+            // Featured releases (for flagship home page)
+            .route("/featured-releases", get(list_featured_releases))
+            // Account (identity management)
+            .route("/account/:public_key", get(get_account))
+            // Network mesh topology map
+            .route("/map", get(get_network_map))
+            // Mesh state (slots, peers, TGP sessions)
+            .route("/mesh/state", get(get_mesh_state))
+            // WebSocket for real-time mesh updates
+            .route("/ws/mesh", get(ws_mesh_handler))
+        )
         .layer(cors)
         .with_state(state)
 }
@@ -73,6 +75,8 @@ async fn list_releases(
     Ok(Json(releases))
 }
 
+// Ben Review: Premature optimisation possible: instead of String, some sort of optimised string
+// such as a Cow.
 #[derive(Debug, Deserialize)]
 struct CreateReleaseRequest {
     title: String,
@@ -128,6 +132,7 @@ async fn delete_release(
     let state = state.read().await;
     match state.storage.delete_release(&id) {
         Ok(()) => StatusCode::NO_CONTENT,
+        // BenPH review: log the actual error
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
@@ -155,6 +160,7 @@ async fn list_featured_releases(
     let releases = state
         .storage
         .list_releases()
+        // BenPH review: log the actual error
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(releases))
 }
@@ -253,6 +259,7 @@ struct PeerEdge {
     from: String,
     to: String,
     connection_type: String,  // "neighbor" or "relay"
+    // BenPH review: consider using us with u64
     latency_ms: Option<u32>,
     bidirectional: bool,
 }
@@ -263,9 +270,11 @@ struct NetworkStats {
     server_nodes: u32,
     browser_nodes: u32,
     total_edges: u32,
+    // BenPH review: consider using us with u64
     avg_latency_ms: Option<f64>,
 }
 
+// BenPH review: This is a particularly long function. consider refactoring
 async fn get_network_map(
     State(state): State<AppState>,
 ) -> Json<NetworkMap> {
@@ -289,6 +298,8 @@ async fn get_network_map(
             z: claim.coord.z,
         }
     } else {
+        // BenPH review: consider use of Derive(default)
+        //  - the `self_slot_opt` can be initialised with `unwrap_or_default()`
         // No slot claimed yet - position at origin until claimed
         HexSlot { index: None, q: 0, r: 0, z: 0 }
     };
@@ -314,6 +325,9 @@ async fn get_network_map(
     if let Some(ref mesh_state) = state.mesh_state {
         let mesh = mesh_state.read().await;
 
+        // BenPH review: use an iterator, map and collect, or declare nodes and edges with an
+        // expected capacity. Should already be handled via optimiser, but clearly stating intent
+        // can help
         // Add all connected peers as nodes
         // Use peer_id (hashmap key) as authoritative ID - gets updated from hello
         for (peer_id, peer) in &mesh.peers {
@@ -408,6 +422,7 @@ async fn get_network_map(
     })
 }
 
+// BenPH review: this can likely return an &str based on the input id
 /// Extract short ID from peer ID (strips "b3b3/" prefix, shows first 12 chars)
 fn short_peer_id(id: &str) -> String {
     let hash = id.strip_prefix("b3b3/").unwrap_or(id);
@@ -455,6 +470,7 @@ struct PeerSummary {
     last_seen_ms: u64,
 }
 
+// BenPH review: state could probably be bassed in as a `RwLockReadGuard<AppState>`
 async fn get_mesh_state(
     State(state): State<AppState>,
 ) -> Json<MeshStateResponse> {
