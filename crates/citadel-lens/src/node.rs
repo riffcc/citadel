@@ -27,6 +27,7 @@ pub struct LensConfig {
     /// P2P listen address (for mesh)
     pub p2p_addr: SocketAddr,
 
+    // BenPH review: consider something like `type BsPeers(string)`
     /// Bootstrap peers
     pub bootstrap_peers: Vec<String>,
 
@@ -100,11 +101,15 @@ impl LensConfig {
 pub struct LensState {
     pub storage: Arc<Storage>,
     pub config: LensConfig,
+    // BenPH review: go to all places where read and write guards are obtained imediately on
+    // function entry, and consider passing in the RwLockRead|WriteGuard<MeshState> in some way
     pub mesh_state: Option<Arc<RwLock<MeshState>>>,
 }
 
 /// A Lens node instance.
 pub struct LensNode {
+    // BenPH review: go to all places where read and write guards are obtained imediately on
+    // function entry, and consider passing in the RwLockRead|WriteGuard<LensState> in some way
     state: Arc<RwLock<LensState>>,
     config: LensConfig,
 }
@@ -144,7 +149,7 @@ impl LensNode {
     /// Get shared storage for admin socket.
     pub async fn storage(&self) -> Arc<Storage> {
         Arc::clone(&self.state.read().await.storage)
-    }
+    }.
 
     /// Run the node (starts HTTP server, admin socket, and P2P mesh).
     pub async fn run(self) -> Result<()> {

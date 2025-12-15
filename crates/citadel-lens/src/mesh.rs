@@ -60,6 +60,10 @@
 //! - 2 vertical (directly above/below)
 //! - 12 extended (6 above + 6 below diagonals)
 
+// BenPH review: lots of use of VerifyingKey in a String representation where the length of the
+// BenPH review: Lot's of different things going on. suggest mesh as a top level module that
+// re-exports, the individual components.
+// string is always known. Suggest a structure that doesn't require dynamic memory
 use crate::error::Result;
 use crate::storage::Storage;
 use crate::vdf_race::{VdfRace, VdfLink, AnchoredSlotClaim, claim_has_priority};
@@ -100,7 +104,7 @@ pub fn verify_peer_id(claimed_id: &str, pubkey: &VerifyingKey) -> bool {
 }
 
 /// Mesh node identity and state
-#[derive(Debug, Clone)]
+#[deriie(Debug, Clone)]
 pub struct MeshPeer {
     pub id: String,
     pub addr: SocketAddr,
@@ -118,6 +122,8 @@ pub struct SlotClaim {
     pub index: u64,
     /// 3D hex coordinate
     pub coord: HexCoord,
+    // BenPH review: suggest a wrapper type: `struct PeerId(id: <some string type>)`. Similarly for
+    // other commonly used things represented as a primitive, such as public key.
     /// PeerID that claimed this slot
     pub peer_id: String,
     /// Public key of the claiming peer (for TGP)
@@ -225,6 +231,7 @@ pub struct TgpSession {
     pub peer_tgp_addr: SocketAddr,
 }
 
+// BenPH review: consider using BTreeMap|Set
 /// Mesh service state
 pub struct MeshState {
     /// Our node ID (PeerID)
@@ -402,6 +409,7 @@ impl MeshService {
             listen_addr,
             entry_peers,
             storage,
+            // BenPH review: use `default..`
             state: Arc::new(RwLock::new(MeshState {
                 self_id,
                 signing_key,
@@ -469,6 +477,7 @@ impl MeshService {
         // This function currently floods a claim without TGP validation
         // See docs/MESH_PROTOCOL.md for the correct protocol
 
+        // BenPH review: use a helper function that takes a RwWriteGuard<AppState>
         let mut state = self.state.write().await;
 
         // Check if slot is already claimed
@@ -518,6 +527,7 @@ impl MeshService {
     /// Genesis seed for VDF chain (shared across all nodes in the mesh)
     /// In production, this would be derived from network genesis block or similar
     const VDF_GENESIS_SEED: [u8; 32] = [
+        // BenPH review: use something akin to as_bytes::<...>("....") instead if possible
         0x43, 0x49, 0x54, 0x41, 0x44, 0x45, 0x4c, 0x2d,  // "CITADEL-"
         0x56, 0x44, 0x46, 0x2d, 0x47, 0x45, 0x4e, 0x45,  // "VDF-GENE"
         0x53, 0x49, 0x53, 0x2d, 0x53, 0x45, 0x45, 0x44,  // "SIS-SEED"
@@ -538,6 +548,8 @@ impl MeshService {
     /// Initialize VDF race when joining existing mesh
     /// Takes chain links from bootstrap peer
     pub async fn init_vdf_join(&self, chain_links: Vec<VdfLink>) -> bool {
+        // Ben review use a RwWriteGuard<AppState> helper if possible.
+        // review followup: scan for other places where acquiring the guard is a first line thing
         let mut state = self.state.write().await;
         let signing_key = state.signing_key.clone();
 
@@ -558,6 +570,7 @@ impl MeshService {
     /// Claim a slot with VDF anchoring for deterministic priority
     /// Returns the anchored claim for flooding to the network
     pub async fn claim_slot_with_vdf(&self, index: u64) -> Option<AnchoredSlotClaim> {
+        // Ben review use a RwWriteGuard<AppState> helper if possible.
         let mut state = self.state.write().await;
 
         // Ensure VDF race is initialized
@@ -836,6 +849,7 @@ impl MeshService {
         Some((rounds, slots))
     }
 
+    // BenPH review: much of the following functions can be a single dot-chain
     /// Check if we should adopt another chain (heavier)
     pub async fn cvdf_should_adopt(&self, other_rounds: &[CvdfRound]) -> bool {
         let state = self.state.read().await;
@@ -876,6 +890,7 @@ impl MeshService {
         state.cvdf.is_some()
     }
 
+    // BenPH review: consider renaming to `main_cvdf_loop`
     /// Run CVDF coordination loop
     /// This handles periodic attestation and round production
     pub async fn run_cvdf_loop(&self) {
@@ -937,6 +952,7 @@ impl MeshService {
     ///
     /// Returns `true` if slot was successfully occupied.
     pub async fn attempt_slot_via_tgp(&self, target_slot: u64) -> bool {
+        // BenPH review: long function, consider breaking up
         let state = self.state.read().await;
 
         // Get mesh size for threshold calculation
@@ -1017,7 +1033,7 @@ impl MeshService {
                 warn!("Invalid public key for {}", peer_id);
                 continue;
             };
-
+.
             // Get cached TGP keypair (zerocopy - just clone the Arc's content)
             let my_keypair = {
                 let state = self.state.read().await;
@@ -1136,6 +1152,7 @@ impl MeshService {
         priority_a < priority_b  // Lower hash wins
     }
 
+    // BenPH review: long function, consider breaking up
     /// Process a slot claim from another node
     /// Returns true if WE lost our slot to this claim (caller should reclaim)
     pub async fn process_slot_claim(&self, index: u64, peer_id: String, coord: (i64, i64, i64), public_key: Option<Vec<u8>>) -> bool {
@@ -1247,6 +1264,7 @@ impl MeshService {
         self.flood_tx.clone()
     }
 
+    // BenPH review: consider renaming to `main_...`
     /// Run TGP UDP listener - receives incoming TGP messages from any peer
     /// This is connectionless - we can receive from anyone who knows our address
     /// Event-driven: immediately responds after receiving each message
@@ -1280,6 +1298,7 @@ impl MeshService {
         }
     }
 
+    // BenPH review: long function, consider breaking up
     /// Handle incoming TGP message from UDP.
     /// Returns the peer_id if message was processed (for sending response).
     /// Uses symmetric TGP - party roles determined by public key comparison.
