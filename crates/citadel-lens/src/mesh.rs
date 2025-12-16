@@ -1875,32 +1875,52 @@ impl MeshService {
         for peer_addr in &self.entry_peers {
             info!("Connecting to peer: {}", peer_addr);
 
-            match TcpStream::connect(peer_addr).await {
-                Ok(stream) => {
-                    // Use the actual peer address from the connected socket
-                    // This gives us the resolved IP, not the hostname
-                    let addr = match stream.peer_addr() {
-                        Ok(a) => a,
-                        Err(e) => {
-                            warn!("Failed to get peer addr: {}", e);
-                            continue;
-                        }
-                    };
-                    info!("Connected to entry peer {} at {}", peer_addr, addr);
-                    connected += 1;
-
-                    // Spawn connection handler as task - don't block!
-                    // Entry peers are marked as such for later pruning when we have enough SPIRAL neighbors
-                    let self_clone = Arc::clone(self);
-                    tokio::spawn(async move {
-                        if let Err(e) = self_clone.handle_connection(stream, addr, true).await {
-                            warn!("Entry peer {} disconnected: {}", addr, e);
-                        }
-                    });
-                }
+            // Resolve DNS explicitly for better error messages
+            // Supports both "hostname:port" and "ip:port" formats
+            let resolved_addrs: Vec<SocketAddr> = match tokio::net::lookup_host(peer_addr).await {
+                Ok(addrs) => addrs.collect(),
                 Err(e) => {
-                    warn!("Failed to connect to peer {}: {}", peer_addr, e);
+                    warn!("DNS resolution failed for {}: {}", peer_addr, e);
+                    continue;
                 }
+            };
+
+            if resolved_addrs.is_empty() {
+                warn!("No addresses found for {}", peer_addr);
+                continue;
+            }
+
+            // Try each resolved address (IPv4 preferred)
+            let mut peer_connected = false;
+            let addr_count = resolved_addrs.len();
+            for resolved_addr in resolved_addrs {
+                debug!("Trying {} -> {}", peer_addr, resolved_addr);
+
+                match TcpStream::connect(resolved_addr).await {
+                    Ok(stream) => {
+                        info!("Connected to entry peer {} at {}", peer_addr, resolved_addr);
+                        connected += 1;
+                        peer_connected = true;
+
+                        // Spawn connection handler as task - don't block!
+                        // Entry peers are marked as such for later pruning when we have enough SPIRAL neighbors
+                        let self_clone = Arc::clone(self);
+                        let addr = resolved_addr;
+                        tokio::spawn(async move {
+                            if let Err(e) = self_clone.handle_connection(stream, addr, true).await {
+                                warn!("Entry peer {} disconnected: {}", addr, e);
+                            }
+                        });
+                        break; // Connected successfully, don't try other addresses
+                    }
+                    Err(e) => {
+                        debug!("Failed to connect to {} ({}): {}", peer_addr, resolved_addr, e);
+                    }
+                }
+            }
+
+            if !peer_connected {
+                warn!("Failed to connect to peer {} (tried {} addresses)", peer_addr, addr_count);
             }
         }
 
