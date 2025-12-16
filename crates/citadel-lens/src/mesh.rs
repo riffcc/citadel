@@ -112,6 +112,9 @@ pub struct MeshPeer {
     /// True if this peer is an entry/bootstrap peer (from CITADEL_PEERS)
     /// Entry peers should be disconnected once we have enough SPIRAL neighbors
     pub is_entry_peer: bool,
+    /// SPORE: True if WE have all content THIS peer has (our WantList from them = ∅)
+    /// When all peers are content_synced, this node is "ready" to serve traffic
+    pub content_synced: bool,
 }
 
 /// A claimed SPIRAL slot in the mesh
@@ -358,6 +361,9 @@ pub struct MeshState {
     /// Our observed public IP (learned from peers who connect to us)
     /// This is what other nodes see us as - used instead of hardcoded announce_addr
     pub observed_public_addr: Option<SocketAddr>,
+    /// SPORE: DoNotWantList - accumulated double-hashes of deleted content
+    /// H(H(id)) prevents enumeration while allowing deletion propagation
+    pub do_not_want: HashSet<[u8; 32]>,
     // NOTE: tgp_sessions moved to MeshService for contention-free access
 }
 
@@ -448,6 +454,29 @@ impl MeshState {
             .count()
     }
 
+    /// SPORE: Check if this node has all content from all peers (WantList = ∅)
+    /// Returns true when we have everything that any peer has - our HaveList ⊇ ∪(all peer HaveLists)
+    /// This is used by /api/v1/ready to indicate the node is caught up with the mesh
+    ///
+    /// Note: This is about US having everything, not about peers being synced with each other.
+    /// One peer going offline or having extra content doesn't affect our readiness.
+    pub fn is_content_ready(&self) -> bool {
+        // If no peers, we're trivially ready (genesis node)
+        if self.peers.is_empty() {
+            return true;
+        }
+
+        // Ready when we have all content from ALL peers (our WantList for each is empty)
+        self.peers.values().all(|peer| peer.content_synced)
+    }
+
+    /// SPORE: Get sync status breakdown for debugging
+    pub fn sync_status(&self) -> (usize, usize) {
+        let synced = self.peers.values().filter(|p| p.content_synced).count();
+        let total = self.peers.len();
+        (synced, total)
+    }
+
     /// Get entry peers that should be disconnected (have enough SPIRAL neighbors)
     pub fn entry_peers_to_disconnect(&self) -> Vec<String> {
         // Need at least 3 SPIRAL neighbors before we can safely disconnect from entry peers
@@ -498,6 +527,13 @@ pub enum FloodMessage {
     CvdfSyncRequest { from_node: String, from_height: u64 },
     /// CVDF chain sync response (all rounds)
     CvdfSyncResponse { rounds: Vec<CvdfRound>, slots: Vec<(u64, [u8; 32])> },
+    /// SPORE: Content HaveList - advertise release IDs we have (for content sync)
+    ContentHaveList { peer_id: String, release_ids: Vec<String> },
+    /// SPORE: Release flood - propagate a release across the mesh
+    Release { release_json: String },
+    /// SPORE: DoNotWantList - double-hashed IDs of deleted content (proof of absence)
+    /// H(H(id)) is shared to prevent enumeration while allowing verification
+    DoNotWantList { peer_id: String, double_hashes: Vec<[u8; 32]> },
 }
 
 /// Citadel Mesh Service
@@ -589,6 +625,7 @@ impl MeshService {
                 cvdf: None,        // Initialized as genesis or when joining mesh
                 latency_history: HashMap::new(),
                 observed_public_addr: None,  // Learned from peers via hello
+                do_not_want: HashSet::new(),  // SPORE: DoNotWantList for deletion sync
             })),
             // Separate lock for TGP sessions - contention-free TGP operations
             tgp_sessions: Arc::new(RwLock::new(HashMap::new())),
@@ -1851,6 +1888,7 @@ impl MeshService {
                     coordinated: false,
                     slot: None,  // Will be learned via SPORE slot_claim flood
                     is_entry_peer,
+                    content_synced: false,  // Will become true when HaveLists match
                 },
             );
         }
@@ -1954,6 +1992,21 @@ impl MeshService {
             });
             writer.write_all(have_list.to_string().as_bytes()).await?;
             writer.write_all(b"\n").await?;
+        }
+
+        // SPORE: Send ContentHaveList with our release IDs for eventual consistency
+        // This allows peers to discover what releases we have and request missing ones
+        if let Ok(releases) = self.storage.list_releases() {
+            if !releases.is_empty() {
+                let release_ids: Vec<String> = releases.iter().map(|r| r.id.clone()).collect();
+                let content_have_list = serde_json::json!({
+                    "type": "content_have_list",
+                    "release_ids": release_ids,
+                });
+                writer.write_all(content_have_list.to_string().as_bytes()).await?;
+                writer.write_all(b"\n").await?;
+                debug!("Sent ContentHaveList with {} releases to peer {}", release_ids.len(), peer_id);
+            }
         }
 
         // CVDF chain sync: Send our chain state so peer can adopt heavier chain
@@ -2294,6 +2347,36 @@ impl MeshService {
                             let _ = writer.write_all(flood_msg.to_string().as_bytes()).await;
                             let _ = writer.write_all(b"\n").await;
                         }
+                        Ok(FloodMessage::ContentHaveList { peer_id, release_ids }) => {
+                            let flood_msg = serde_json::json!({
+                                "type": "content_have_list",
+                                "peer_id": peer_id,
+                                "release_ids": release_ids,
+                            });
+                            let _ = writer.write_all(flood_msg.to_string().as_bytes()).await;
+                            let _ = writer.write_all(b"\n").await;
+                        }
+                        Ok(FloodMessage::Release { release_json }) => {
+                            let flood_msg = serde_json::json!({
+                                "type": "release_flood",
+                                "release": serde_json::from_str::<serde_json::Value>(&release_json).unwrap_or_default(),
+                            });
+                            let _ = writer.write_all(flood_msg.to_string().as_bytes()).await;
+                            let _ = writer.write_all(b"\n").await;
+                        }
+                        Ok(FloodMessage::DoNotWantList { peer_id, double_hashes }) => {
+                            // Encode double-hashes as hex strings for JSON transport
+                            let hashes_hex: Vec<String> = double_hashes.iter()
+                                .map(|h| hex::encode(h))
+                                .collect();
+                            let flood_msg = serde_json::json!({
+                                "type": "do_not_want_list",
+                                "peer_id": peer_id,
+                                "double_hashes": hashes_hex,
+                            });
+                            let _ = writer.write_all(flood_msg.to_string().as_bytes()).await;
+                            let _ = writer.write_all(b"\n").await;
+                        }
                         Err(_) => {
                             // Channel closed or lagged, continue
                         }
@@ -2484,6 +2567,7 @@ impl MeshService {
                                     coordinated: false,
                                     slot,
                                     is_entry_peer: false,  // Discovered via flooding, not an entry peer
+                                    content_synced: false,  // Will become true when HaveLists match
                                 },
                             );
                             new_peers.push((id.clone(), addr_str, slot_index, public_key));
@@ -2990,6 +3074,90 @@ impl MeshService {
             // ==================== END CVDF MESSAGE HANDLERS ====================
             // NOTE: TGP messages are now handled over UDP, not TCP
             // See run_tgp_udp_listener() and handle_tgp_message()
+
+            // ==================== SPORE CONTENT SYNC HANDLERS ====================
+            "content_have_list" => {
+                // Peer is advertising what releases they have
+                // Compare with our releases: XOR = 0 means fully synced
+                if let Some(their_ids) = msg.get("release_ids").and_then(|r| r.as_array()) {
+                    let their_set: std::collections::HashSet<String> = their_ids.iter()
+                        .filter_map(|id| id.as_str().map(|s| s.to_string()))
+                        .collect();
+
+                    // Get our releases
+                    if let Ok(our_releases) = self.storage.list_releases() {
+                        let our_set: std::collections::HashSet<String> = our_releases.iter()
+                            .map(|r| r.id.clone())
+                            .collect();
+
+                        // Check what they're missing (we have, they don't)
+                        let mut we_sent_releases = false;
+                        for release in &our_releases {
+                            if !their_set.contains(&release.id) {
+                                if let Ok(json) = serde_json::to_string(&release) {
+                                    info!("SPORE: Sending missing release {} to {}", release.id, peer_id);
+                                    self.flood(FloodMessage::Release { release_json: json });
+                                    we_sent_releases = true;
+                                }
+                            }
+                        }
+
+                        // Check what we're missing (they have, we don't)
+                        // This is our WantList for this peer - if empty, we have everything they have
+                        let we_want_from_them: Vec<&String> = their_set.iter()
+                            .filter(|id| !our_set.contains(*id))
+                            .collect();
+
+                        // We consider ourselves "synced" with this peer if our WantList is empty
+                        // (we have all the content they have - our HaveList ⊇ their HaveList)
+                        let we_have_all_their_content = we_want_from_them.is_empty();
+
+                        // Update peer's sync status (tracks if WE have everything THEY have)
+                        {
+                            let mut state = self.state.write().await;
+                            if let Some(peer) = state.peers.get_mut(peer_id) {
+                                if we_have_all_their_content != peer.content_synced {
+                                    peer.content_synced = we_have_all_their_content;
+                                    if we_have_all_their_content {
+                                        info!("SPORE: We have all content from peer {} (WantList=∅)", peer_id);
+                                    } else {
+                                        debug!("SPORE: Missing {} items from peer {}", we_want_from_them.len(), peer_id);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            "release_flood" => {
+                // Receive a release flooded through the mesh
+                if let Some(release_data) = msg.get("release") {
+                    // Try to parse as Release
+                    if let Ok(release) = serde_json::from_value::<crate::models::Release>(release_data.clone()) {
+                        // Check if we already have it (deduplication)
+                        if self.storage.get_release(&release.id).ok().flatten().is_none() {
+                            // Store it
+                            if let Err(e) = self.storage.put_release(&release) {
+                                warn!("Failed to store flooded release {}: {}", release.id, e);
+                            } else {
+                                info!("SPORE: Received and stored release {} from mesh", release.id);
+
+                                // SPORE: Broadcast our updated ContentHaveList so peers know our new state
+                                // This enables continuous sync as our state changes
+                                if let Ok(all_releases) = self.storage.list_releases() {
+                                    let self_id = self.state.read().await.self_id.clone();
+                                    let release_ids: Vec<String> = all_releases.iter().map(|r| r.id.clone()).collect();
+                                    self.flood(FloodMessage::ContentHaveList {
+                                        peer_id: self_id,
+                                        release_ids
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // ==================== END SPORE CONTENT SYNC HANDLERS ====================
             _ => {
                 debug!("Unknown message type from {}: {}", peer_id, msg_type);
             }

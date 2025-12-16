@@ -124,6 +124,18 @@ impl Storage {
         }
     }
 
+    /// Save a category (alias for put_category).
+    pub fn save_category(&self, category: &Category) -> Result<()> {
+        self.put_category(category)
+    }
+
+    /// Delete a category by ID.
+    pub fn delete_category(&self, id: &str) -> Result<()> {
+        let key = format!("category:{}", id);
+        self.db.delete(key.as_bytes())?;
+        Ok(())
+    }
+
     /// Initialize default categories if not present.
     pub fn init_default_categories(&self) -> Result<()> {
         for category in Category::defaults() {

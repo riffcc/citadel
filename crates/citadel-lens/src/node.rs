@@ -113,6 +113,8 @@ pub struct LensState {
     pub storage: Arc<Storage>,
     pub config: LensConfig,
     pub mesh_state: Option<Arc<RwLock<MeshState>>>,
+    /// Flood sender for SPORE content propagation
+    pub flood_tx: Option<tokio::sync::broadcast::Sender<crate::mesh::FloodMessage>>,
 }
 
 /// A Lens node instance.
@@ -149,6 +151,7 @@ impl LensNode {
             storage,
             config: config.clone(),
             mesh_state: None,
+            flood_tx: None,
         }));
 
         Ok(Self { state, config })
@@ -189,24 +192,25 @@ impl LensNode {
             mesh_storage,
         ));
 
-        // Get flood sender for admin socket
+        // Get flood sender for admin socket and API
         let flood_tx = mesh_service.flood_tx();
 
         // Start admin socket server in background (with flood capability)
         let admin_socket = AdminSocket::new(
             Arc::clone(&storage),
             self.config.admin_socket.to_str().unwrap_or("./lens-data/admin.sock"),
-        ).with_flood_tx(flood_tx);
+        ).with_flood_tx(flood_tx.clone());
         tokio::spawn(async move {
             if let Err(e) = admin_socket.run().await {
                 tracing::error!("Admin socket error: {}", e);
             }
         });
 
-        // Share mesh state with API layer
+        // Share mesh state and flood_tx with API layer
         {
             let mut state = self.state.write().await;
             state.mesh_state = Some(mesh_service.mesh_state());
+            state.flood_tx = Some(flood_tx);
         }
 
         let mesh_clone = Arc::clone(&mesh_service);

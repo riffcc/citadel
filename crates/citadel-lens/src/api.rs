@@ -1,12 +1,13 @@
 //! HTTP API for Lens.
 
+use crate::mesh::FloodMessage;
 use crate::models::{Category, Release};
 use crate::node::LensState;
 use crate::ws::ws_mesh_handler;
 use axum::{
     extract::{Path, State},
     http::StatusCode,
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -30,6 +31,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/api/v1/health", get(health))
         .route("/ready", get(ready))
+        .route("/api/v1/ready", get(ready))
         // Releases
         .route("/api/v1/releases", get(list_releases))
         .route("/api/v1/releases", post(create_release))
@@ -37,6 +39,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/releases/:id", delete(delete_release))
         // Categories
         .route("/api/v1/content-categories", get(list_categories))
+        .route("/api/v1/content-categories", post(create_category))
+        .route("/api/v1/content-categories/:id", get(get_category))
+        .route("/api/v1/content-categories/:id", put(update_category))
+        .route("/api/v1/content-categories/:id", delete(delete_category))
         // Featured releases (for flagship home page)
         .route("/api/v1/featured-releases", get(list_featured_releases))
         // Account (identity management)
@@ -61,8 +67,50 @@ async fn health() -> &'static str {
     "OK"
 }
 
-async fn ready() -> &'static str {
-    "OK"
+/// Ready check response with sync status details
+#[derive(Debug, Serialize)]
+struct ReadyResponse {
+    ready: bool,
+    synced_peers: usize,
+    total_peers: usize,
+    message: String,
+}
+
+/// GET /ready, /api/v1/ready - Check if node is synced and ready to serve traffic
+/// Returns 200 OK when all peers are content-synced (HaveList XOR = 0)
+/// Returns 503 Service Unavailable when still syncing
+async fn ready(
+    State(state): State<AppState>,
+) -> Result<Json<ReadyResponse>, (StatusCode, Json<ReadyResponse>)> {
+    let state = state.read().await;
+
+    // Check mesh state for sync status
+    let (synced, total, is_ready) = if let Some(ref mesh_state) = state.mesh_state {
+        let mesh = mesh_state.read().await;
+        let (synced, total) = mesh.sync_status();
+        let ready = mesh.is_content_ready();
+        (synced, total, ready)
+    } else {
+        // No mesh state = standalone mode, trivially ready
+        (0, 0, true)
+    };
+
+    let response = ReadyResponse {
+        ready: is_ready,
+        synced_peers: synced,
+        total_peers: total,
+        message: if is_ready {
+            "Content ready (WantList=∅ from all peers)".to_string()
+        } else {
+            format!("Syncing: have all content from {}/{} peers", synced, total)
+        },
+    };
+
+    if is_ready {
+        Ok(Json(response))
+    } else {
+        Err((StatusCode::SERVICE_UNAVAILABLE, Json(response)))
+    }
 }
 
 // --- Release endpoints ---
@@ -74,7 +122,10 @@ async fn list_releases(
     let releases = state
         .storage
         .list_releases()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .into_iter()
+        .map(|r| r.with_defaults())
+        .collect();
     Ok(Json(releases))
 }
 
@@ -111,6 +162,23 @@ async fn create_release(
         .put_release(&release)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
+    // SPORE: Flood the release to propagate across mesh
+    if let Some(ref flood_tx) = state.flood_tx {
+        if let Ok(json) = serde_json::to_string(&release) {
+            let _ = flood_tx.send(FloodMessage::Release { release_json: json });
+            tracing::debug!("SPORE: Flooding new release {}", release.id);
+        }
+
+        // SPORE: Broadcast our updated ContentHaveList so peers know our new state
+        if let Ok(all_releases) = state.storage.list_releases() {
+            let release_ids: Vec<String> = all_releases.iter().map(|r| r.id.clone()).collect();
+            let _ = flood_tx.send(FloodMessage::ContentHaveList {
+                peer_id: "api-create".to_string(),
+                release_ids,
+            });
+        }
+    }
+
     Ok((StatusCode::CREATED, Json(release)))
 }
 
@@ -120,7 +188,7 @@ async fn get_release(
 ) -> Result<Json<Release>, StatusCode> {
     let state = state.read().await;
     match state.storage.get_release(&id) {
-        Ok(Some(release)) => Ok(Json(release)),
+        Ok(Some(release)) => Ok(Json(release.with_defaults())),
         Ok(None) => Err(StatusCode::NOT_FOUND),
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
@@ -150,6 +218,157 @@ async fn list_categories(
     Ok(Json(categories))
 }
 
+async fn get_category(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Category>, StatusCode> {
+    let state = state.read().await;
+    let categories = state
+        .storage
+        .list_categories()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    categories
+        .into_iter()
+        .find(|c| c.id == id)
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateCategoryRequest {
+    /// Public key for authentication
+    public_key: String,
+    id: Option<String>,
+    category_id: Option<String>,
+    name: Option<String>,
+    display_name: Option<String>,
+    slug: Option<String>,
+    metadata_schema: Option<serde_json::Value>,
+    featured: Option<bool>,
+}
+
+async fn create_category(
+    State(state): State<AppState>,
+    Json(req): Json<CreateCategoryRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let state_read = state.read().await;
+
+    // Check if requester is admin
+    if !state_read.storage.is_admin(&req.public_key).unwrap_or(false) {
+        return Ok(Json(serde_json::json!({
+            "error": "Admin permission required to create categories"
+        })));
+    }
+    drop(state_read);
+
+    // Use categoryId or id
+    let id = match req.category_id.or(req.id) {
+        Some(id) => id,
+        None => return Ok(Json(serde_json::json!({
+            "error": "Category ID is required"
+        }))),
+    };
+    // Use displayName or name
+    let name = match req.display_name.or(req.name) {
+        Some(name) => name,
+        None => return Ok(Json(serde_json::json!({
+            "error": "Category name is required"
+        }))),
+    };
+
+    let category = Category::with_schema(
+        id,
+        name,
+        req.featured.unwrap_or(false),
+        req.metadata_schema,
+    );
+
+    let state = state.write().await;
+    state
+        .storage
+        .save_category(&category)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(serde_json::to_value(&category).unwrap()))
+}
+
+async fn update_category(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<CreateCategoryRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let state_write = state.write().await;
+
+    // Check if requester is admin
+    if !state_write.storage.is_admin(&req.public_key).unwrap_or(false) {
+        return Ok(Json(serde_json::json!({
+            "error": "Admin permission required to update categories"
+        })));
+    }
+
+    // Get existing category
+    let categories = state_write
+        .storage
+        .list_categories()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let existing = match categories.into_iter().find(|c| c.id == id) {
+        Some(cat) => cat,
+        None => return Ok(Json(serde_json::json!({
+            "error": "Category not found"
+        }))),
+    };
+
+    // Update fields
+    let name = req.display_name.or(req.name).unwrap_or(existing.name);
+    let category = Category::with_schema(
+        id,
+        name,
+        req.featured.unwrap_or(existing.featured),
+        req.metadata_schema.or(existing.metadata_schema),
+    );
+
+    state_write
+        .storage
+        .save_category(&category)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(serde_json::to_value(&category).unwrap()))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DeleteCategoryRequest {
+    /// Public key for authentication
+    public_key: String,
+}
+
+async fn delete_category(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<DeleteCategoryRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let state = state.write().await;
+
+    // Check if requester is admin
+    if !state.storage.is_admin(&req.public_key).unwrap_or(false) {
+        return Ok(Json(serde_json::json!({
+            "error": "Admin permission required to delete categories"
+        })));
+    }
+
+    state
+        .storage
+        .delete_category(&id)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "deleted": id
+    })))
+}
+
 // --- Featured releases endpoints ---
 
 async fn list_featured_releases(
@@ -160,7 +379,10 @@ async fn list_featured_releases(
     let releases = state
         .storage
         .list_releases()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .into_iter()
+        .map(|r| r.with_defaults())
+        .collect();
     Ok(Json(releases))
 }
 
@@ -558,7 +780,9 @@ struct LegacyRelease {
     name: String,
     category_id: String,
     category_slug: Option<String>,
+    #[serde(alias = "contentCID")]
     content_cid: Option<String>,
+    #[serde(alias = "thumbnailCID")]
     thumbnail_cid: Option<String>,
     metadata: Option<serde_json::Value>,
 }
@@ -660,6 +884,10 @@ async fn import_releases(
                 );
                 release.creator = creator;
                 release.thumbnail_cid = legacy_release.thumbnail_cid;
+                release.content_cid = legacy_release.content_cid;
+                release.site_address = legacy_release.site_address;
+                // Store raw metadata for Flagship compatibility
+                release.metadata = legacy_release.metadata.clone();
 
                 // Extract metadata fields if available
                 if let Some(metadata) = &legacy_release.metadata {
@@ -677,10 +905,32 @@ async fn import_releases(
                     continue;
                 }
 
+                // SPORE: Flood the release to propagate across mesh
+                if let Some(ref flood_tx) = state.flood_tx {
+                    if let Ok(json) = serde_json::to_string(&release) {
+                        let _ = flood_tx.send(FloodMessage::Release { release_json: json });
+                        tracing::debug!("SPORE: Flooding imported release {}", release.id);
+                    }
+                }
+
                 imported += 1;
             }
 
             tracing::info!("Import complete: {} imported, {} skipped", imported, skipped);
+
+            // SPORE: Broadcast our updated ContentHaveList so peers know our complete state
+            if imported > 0 {
+                if let Some(ref flood_tx) = state.flood_tx {
+                    if let Ok(all_releases) = state.storage.list_releases() {
+                        let release_ids: Vec<String> = all_releases.iter().map(|r| r.id.clone()).collect();
+                        let _ = flood_tx.send(FloodMessage::ContentHaveList {
+                            peer_id: "api-import".to_string(), // API doesn't have mesh identity
+                            release_ids,
+                        });
+                        tracing::info!("SPORE: Broadcast ContentHaveList with {} releases after import", all_releases.len());
+                    }
+                }
+            }
         }
         Err(e) => {
             let error_msg = format!("Failed to parse import data: {}", e);

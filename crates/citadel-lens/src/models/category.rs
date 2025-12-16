@@ -10,8 +10,16 @@ pub struct Category {
     /// Unique identifier
     pub id: String,
 
+    /// Category ID (same as id, for lens-sdk compatibility)
+    #[serde(default)]
+    pub category_id: Option<String>,
+
     /// Human-readable name
     pub name: String,
+
+    /// Display name (same as name, for lens-sdk compatibility)
+    #[serde(default)]
+    pub display_name: Option<String>,
 
     /// URL-friendly slug
     pub slug: String,
@@ -33,6 +41,8 @@ impl Category {
     pub fn new(id: String, name: String) -> Self {
         let slug = id.clone();
         Self {
+            category_id: Some(id.clone()),
+            display_name: Some(name.clone()),
             id,
             name,
             slug,
@@ -46,6 +56,8 @@ impl Category {
     pub fn with_schema(id: String, name: String, featured: bool, schema: Option<serde_json::Value>) -> Self {
         let slug = id.clone();
         Self {
+            category_id: Some(id.clone()),
+            display_name: Some(name.clone()),
             id,
             name,
             slug,

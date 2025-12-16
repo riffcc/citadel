@@ -344,5 +344,9 @@ pub fn flood_to_event(msg: FloodMessage) -> Option<MeshEvent> {
                 weight: total_weight,
             })
         }
+        // SPORE content sync messages - internal, not exposed to WebSocket
+        FloodMessage::ContentHaveList { .. } => None,
+        FloodMessage::Release { .. } => None,
+        FloodMessage::DoNotWantList { .. } => None,
     }
 }
