@@ -348,5 +348,6 @@ pub fn flood_to_event(msg: FloodMessage) -> Option<MeshEvent> {
         FloodMessage::ContentHaveList { .. } => None,
         FloodMessage::Release { .. } => None,
         FloodMessage::DoNotWantList { .. } => None,
+        FloodMessage::ErasureConfirmation { .. } => None,
     }
 }

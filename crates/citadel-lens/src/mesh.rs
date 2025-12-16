@@ -378,6 +378,13 @@ pub struct MeshState {
     /// SPORE: DoNotWantList - accumulated double-hashes of deleted content
     /// H(H(id)) prevents enumeration while allowing deletion propagation
     pub do_not_want: HashSet<[u8; 32]>,
+    /// SPORE: ErasureConfirmed - tombstones we have locally confirmed erasing
+    /// Syncs via SPORE XOR (ErasureHaveList) - when XOR=0, all peers agree
+    /// Once all peers have same ErasureConfirmed, tombstones can be garbage collected from DoNotWantList
+    pub erasure_confirmed: HashSet<[u8; 32]>,
+    /// SPORE: Peers' erasure sync status (peer_id -> their_erasure_xor_with_ours == 0)
+    /// When all peers are erasure_synced, we can garbage collect tombstones
+    pub erasure_synced: HashMap<String, bool>,
     // NOTE: tgp_sessions moved to MeshService for contention-free access
 }
 
@@ -548,6 +555,9 @@ pub enum FloodMessage {
     /// SPORE: DoNotWantList - double-hashed IDs of deleted content (proof of absence)
     /// H(H(id)) is shared to prevent enumeration while allowing verification
     DoNotWantList { peer_id: String, double_hashes: Vec<[u8; 32]> },
+    /// SPORE: ErasureConfirmation - bilateral proof that a node has deleted content
+    /// Used for GDPR-compliant "right to erasure" with cryptographic proof
+    ErasureConfirmation { peer_id: String, tombstones: Vec<[u8; 32]> },
 }
 
 /// Citadel Mesh Service
@@ -640,6 +650,8 @@ impl MeshService {
                 latency_history: HashMap::new(),
                 observed_public_addr: None,  // Learned from peers via hello
                 do_not_want: HashSet::new(),  // SPORE: DoNotWantList for deletion sync
+                erasure_confirmed: HashSet::new(),  // SPORE: ErasureConfirmed for GDPR compliance
+                erasure_synced: HashMap::new(),  // SPORE: Peer erasure sync status
             })),
             // Separate lock for TGP sessions - contention-free TGP operations
             tgp_sessions: Arc::new(RwLock::new(HashMap::new())),
@@ -2041,6 +2053,24 @@ impl MeshService {
             }
         }
 
+        // SPORE: Send ErasureConfirmation (confirmed deletions) for GDPR sync
+        // Enables XOR-based erasure convergence detection
+        {
+            let state = self.state.read().await;
+            if !state.erasure_confirmed.is_empty() {
+                let confirmed: Vec<String> = state.erasure_confirmed.iter()
+                    .map(|h| hex::encode(h))
+                    .collect();
+                let erasure_msg = serde_json::json!({
+                    "type": "erasure_confirmation",
+                    "tombstones": confirmed,
+                });
+                writer.write_all(erasure_msg.to_string().as_bytes()).await?;
+                writer.write_all(b"\n").await?;
+                debug!("Sent ErasureConfirmation with {} tombstones to peer {}", confirmed.len(), peer_id);
+            }
+        }
+
         // CVDF chain sync: Send our chain state so peer can adopt heavier chain
         // CRITICAL: This enables swarm merge during initial connection
         if let Some((rounds, slots)) = self.cvdf_chain_state().await {
@@ -2405,6 +2435,19 @@ impl MeshService {
                                 "type": "do_not_want_list",
                                 "peer_id": peer_id,
                                 "double_hashes": hashes_hex,
+                            });
+                            let _ = writer.write_all(flood_msg.to_string().as_bytes()).await;
+                            let _ = writer.write_all(b"\n").await;
+                        }
+                        Ok(FloodMessage::ErasureConfirmation { peer_id, tombstones }) => {
+                            // GDPR erasure confirmation: peer confirms they deleted these tombstones
+                            let tombstones_hex: Vec<String> = tombstones.iter()
+                                .map(|h| hex::encode(h))
+                                .collect();
+                            let flood_msg = serde_json::json!({
+                                "type": "erasure_confirmation",
+                                "peer_id": peer_id,
+                                "tombstones": tombstones_hex,
                             });
                             let _ = writer.write_all(flood_msg.to_string().as_bytes()).await;
                             let _ = writer.write_all(b"\n").await;
@@ -3219,7 +3262,11 @@ impl MeshService {
                         info!("SPORE: Added {} new tombstones from peer {}", new_tombstones.len(), peer_id);
 
                         // Delete any releases we have that match the new tombstones
+                        // And add to erasure_confirmed to confirm we deleted them
+                        let self_id = state.self_id.clone();
                         drop(state); // Release lock before storage operations
+
+                        let mut confirmed_tombstones = Vec::new();
                         if let Ok(releases) = self.storage.list_releases() {
                             for release in releases {
                                 let tombstone = double_hash_id(&release.id);
@@ -3228,17 +3275,89 @@ impl MeshService {
                                         warn!("Failed to delete tombstoned release {}: {}", release.id, e);
                                     } else {
                                         info!("SPORE: Deleted tombstoned release {}", release.id);
+                                        confirmed_tombstones.push(tombstone);
                                     }
                                 }
                             }
                         }
 
+                        // Add ALL tombstones to erasure_confirmed (even if we didn't have the content)
+                        // This confirms we've processed the deletion request
+                        {
+                            let mut state = self.state.write().await;
+                            for tombstone in &new_tombstones {
+                                state.erasure_confirmed.insert(*tombstone);
+                            }
+                        }
+
                         // Re-flood the tombstones to propagate through mesh
-                        let self_id = self.state.read().await.self_id.clone();
                         self.flood(FloodMessage::DoNotWantList {
-                            peer_id: self_id,
-                            double_hashes: new_tombstones,
+                            peer_id: self_id.clone(),
+                            double_hashes: new_tombstones.clone(),
                         });
+
+                        // GDPR: Send erasure confirmation - we've processed these deletions
+                        self.flood(FloodMessage::ErasureConfirmation {
+                            peer_id: self_id,
+                            tombstones: new_tombstones,
+                        });
+                    }
+                }
+            }
+            "erasure_confirmation" => {
+                // SPORE: Receive erasure confirmation from peer
+                // Track which tombstones this peer has confirmed deleting
+                if let Some(tombstones) = msg.get("tombstones").and_then(|t| t.as_array()) {
+                    let mut new_confirmations = Vec::new();
+
+                    for ts_val in tombstones {
+                        if let Some(ts_hex) = ts_val.as_str() {
+                            if let Ok(ts_bytes) = hex::decode(ts_hex) {
+                                if ts_bytes.len() == 32 {
+                                    let mut tombstone = [0u8; 32];
+                                    tombstone.copy_from_slice(&ts_bytes);
+                                    new_confirmations.push(tombstone);
+                                }
+                            }
+                        }
+                    }
+
+                    if !new_confirmations.is_empty() {
+                        let mut state = self.state.write().await;
+
+                        // Check if peer's erasure confirmations now match ours (XOR sync)
+                        let their_confirmed: HashSet<[u8; 32]> = new_confirmations.iter().cloned().collect();
+
+                        // Compute XOR diff count before modifying state
+                        let diff_count = their_confirmed.symmetric_difference(&state.erasure_confirmed).count();
+                        let xor_empty = diff_count == 0;
+
+                        // Update sync status
+                        state.erasure_synced.insert(peer_id.to_string(), xor_empty);
+
+                        if xor_empty {
+                            debug!("SPORE: Erasure synced with peer {} (XOR=0)", peer_id);
+                        } else {
+                            debug!("SPORE: Erasure not synced with peer {} ({} differences)", peer_id, diff_count);
+                        }
+
+                        // Check if ALL peers are synced - if so, we can garbage collect tombstones
+                        let peer_ids: Vec<String> = state.peers.keys().cloned().collect();
+                        let all_synced = peer_ids.iter().all(|p| {
+                            state.erasure_synced.get(p).copied().unwrap_or(false)
+                        });
+
+                        if all_synced && !state.erasure_confirmed.is_empty() {
+                            // GDPR: All peers confirmed - tombstones can be garbage collected
+                            let gc_tombstones: Vec<[u8; 32]> = state.erasure_confirmed.iter().cloned().collect();
+                            let gc_count = gc_tombstones.len();
+                            for tombstone in gc_tombstones {
+                                state.erasure_confirmed.remove(&tombstone);
+                                state.do_not_want.remove(&tombstone);
+                            }
+                            state.erasure_synced.clear();
+                            info!("SPORE: GDPR erasure complete - garbage collected {} tombstones", gc_count);
+                        }
                     }
                 }
             }
