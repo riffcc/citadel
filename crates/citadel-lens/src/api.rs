@@ -1,6 +1,6 @@
 //! HTTP API for Lens.
 
-use crate::mesh::FloodMessage;
+use crate::mesh::{double_hash_id, FloodMessage};
 use crate::models::{Category, Release};
 use crate::node::LensState;
 use crate::ws::ws_mesh_handler;
@@ -199,10 +199,33 @@ async fn delete_release(
     Path(id): Path<String>,
 ) -> StatusCode {
     let state = state.read().await;
-    match state.storage.delete_release(&id) {
-        Ok(()) => StatusCode::NO_CONTENT,
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+
+    // Delete from storage
+    if let Err(_) = state.storage.delete_release(&id) {
+        return StatusCode::INTERNAL_SERVER_ERROR;
     }
+
+    // SPORE: Compute double-hash tombstone and add to DoNotWantList
+    let tombstone = double_hash_id(&id);
+
+    // Add to mesh state's do_not_want set
+    if let Some(ref mesh_state) = state.mesh_state {
+        let mut mesh = mesh_state.write().await;
+        mesh.do_not_want.insert(tombstone);
+        let self_id = mesh.self_id.clone();
+        drop(mesh); // Release lock before flooding
+
+        // Flood the tombstone to propagate deletion through mesh
+        if let Some(ref flood_tx) = state.flood_tx {
+            let _ = flood_tx.send(FloodMessage::DoNotWantList {
+                peer_id: self_id,
+                double_hashes: vec![tombstone],
+            });
+            tracing::info!("SPORE: Flooding tombstone for deleted release {}", id);
+        }
+    }
+
+    StatusCode::NO_CONTENT
 }
 
 // --- Category endpoints ---

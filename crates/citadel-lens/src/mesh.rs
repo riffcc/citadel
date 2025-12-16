@@ -99,6 +99,20 @@ pub fn verify_peer_id(claimed_id: &str, pubkey: &VerifyingKey) -> bool {
     compute_peer_id(pubkey) == claimed_id
 }
 
+/// Compute double-hash of an ID for DoNotWantList (proof of absence)
+/// H(H(id)) prevents enumeration while allowing verification
+/// Only someone with the original ID can verify a deletion matches
+pub fn double_hash_id(id: &str) -> [u8; 32] {
+    let hash1 = blake3::hash(id.as_bytes());
+    let hash2 = blake3::hash(hash1.as_bytes());
+    *hash2.as_bytes()
+}
+
+/// Verify if an ID matches a double-hash (for tombstone checking)
+pub fn matches_tombstone(id: &str, tombstone: &[u8; 32]) -> bool {
+    double_hash_id(id) == *tombstone
+}
+
 /// Mesh node identity and state
 #[derive(Debug, Clone)]
 pub struct MeshPeer {
@@ -2009,6 +2023,24 @@ impl MeshService {
             }
         }
 
+        // SPORE: Send DoNotWantList (tombstones) for deletion sync
+        // H(H(id)) prevents enumeration while allowing verification
+        {
+            let state = self.state.read().await;
+            if !state.do_not_want.is_empty() {
+                let tombstones: Vec<String> = state.do_not_want.iter()
+                    .map(|h| hex::encode(h))
+                    .collect();
+                let do_not_want_list = serde_json::json!({
+                    "type": "do_not_want_list",
+                    "double_hashes": tombstones,
+                });
+                writer.write_all(do_not_want_list.to_string().as_bytes()).await?;
+                writer.write_all(b"\n").await?;
+                debug!("Sent DoNotWantList with {} tombstones to peer {}", tombstones.len(), peer_id);
+            }
+        }
+
         // CVDF chain sync: Send our chain state so peer can adopt heavier chain
         // CRITICAL: This enables swarm merge during initial connection
         if let Some((rounds, slots)) = self.cvdf_chain_state().await {
@@ -3134,8 +3166,13 @@ impl MeshService {
                 if let Some(release_data) = msg.get("release") {
                     // Try to parse as Release
                     if let Ok(release) = serde_json::from_value::<crate::models::Release>(release_data.clone()) {
-                        // Check if we already have it (deduplication)
-                        if self.storage.get_release(&release.id).ok().flatten().is_none() {
+                        // SPORE: Check if this release is in our DoNotWantList (tombstoned)
+                        let tombstone = double_hash_id(&release.id);
+                        let is_tombstoned = self.state.read().await.do_not_want.contains(&tombstone);
+
+                        if is_tombstoned {
+                            debug!("SPORE: Ignoring tombstoned release {} (in DoNotWantList)", release.id);
+                        } else if self.storage.get_release(&release.id).ok().flatten().is_none() {
                             // Store it
                             if let Err(e) = self.storage.put_release(&release) {
                                 warn!("Failed to store flooded release {}: {}", release.id, e);
@@ -3154,6 +3191,54 @@ impl MeshService {
                                 }
                             }
                         }
+                    }
+                }
+            }
+            "do_not_want_list" => {
+                // SPORE: Receive DoNotWantList (tombstones) from peer
+                // These are double-hashed IDs: H(H(id)) - prevents enumeration
+                if let Some(hashes) = msg.get("double_hashes").and_then(|h| h.as_array()) {
+                    let mut state = self.state.write().await;
+                    let mut new_tombstones = Vec::new();
+
+                    for hash_val in hashes {
+                        if let Some(hash_hex) = hash_val.as_str() {
+                            if let Ok(hash_bytes) = hex::decode(hash_hex) {
+                                if hash_bytes.len() == 32 {
+                                    let mut tombstone = [0u8; 32];
+                                    tombstone.copy_from_slice(&hash_bytes);
+                                    if state.do_not_want.insert(tombstone) {
+                                        new_tombstones.push(tombstone);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if !new_tombstones.is_empty() {
+                        info!("SPORE: Added {} new tombstones from peer {}", new_tombstones.len(), peer_id);
+
+                        // Delete any releases we have that match the new tombstones
+                        drop(state); // Release lock before storage operations
+                        if let Ok(releases) = self.storage.list_releases() {
+                            for release in releases {
+                                let tombstone = double_hash_id(&release.id);
+                                if new_tombstones.contains(&tombstone) {
+                                    if let Err(e) = self.storage.delete_release(&release.id) {
+                                        warn!("Failed to delete tombstoned release {}: {}", release.id, e);
+                                    } else {
+                                        info!("SPORE: Deleted tombstoned release {}", release.id);
+                                    }
+                                }
+                            }
+                        }
+
+                        // Re-flood the tombstones to propagate through mesh
+                        let self_id = self.state.read().await.self_id.clone();
+                        self.flood(FloodMessage::DoNotWantList {
+                            peer_id: self_id,
+                            double_hashes: new_tombstones,
+                        });
                     }
                 }
             }
