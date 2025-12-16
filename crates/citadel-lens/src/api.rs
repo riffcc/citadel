@@ -961,6 +961,9 @@ struct LegacyExport {
     version: String,
     export_date: String,
     releases: Vec<LegacyRelease>,
+    /// Featured releases (optional for backwards compatibility)
+    #[serde(default)]
+    featured_releases: Vec<FeaturedRelease>,
 }
 
 /// Legacy release format from Lens SDK v1
@@ -1010,6 +1013,7 @@ struct ExportData {
     version: String,
     export_date: String,
     releases: Vec<Release>,
+    featured_releases: Vec<FeaturedRelease>,
 }
 
 /// Import request with public key for authentication
@@ -1109,7 +1113,31 @@ async fn import_releases(
                 imported += 1;
             }
 
-            tracing::info!("Import complete: {} imported, {} skipped", imported, skipped);
+            tracing::info!("Releases import complete: {} imported, {} skipped", imported, skipped);
+
+            // Import featured releases if present
+            let mut featured_imported = 0;
+            let mut featured_skipped = 0;
+            for featured in legacy_export.featured_releases {
+                // Check if featured release already exists
+                if state.storage.get_featured_release(&featured.id).ok().flatten().is_some() {
+                    tracing::debug!("Skipping existing featured release: {}", featured.id);
+                    featured_skipped += 1;
+                    continue;
+                }
+
+                // Save featured release
+                if let Err(e) = state.storage.put_featured_release(&featured) {
+                    errors.push(format!("Failed to save featured release {}: {}", featured.id, e));
+                    continue;
+                }
+
+                featured_imported += 1;
+            }
+
+            if featured_imported > 0 || featured_skipped > 0 {
+                tracing::info!("Featured releases import: {} imported, {} skipped", featured_imported, featured_skipped);
+            }
 
             // SPORE: Broadcast our updated ContentHaveList so peers know our complete state
             if imported > 0 {
@@ -1140,7 +1168,7 @@ async fn import_releases(
     }))
 }
 
-/// GET /api/v1/export - Export all releases
+/// GET /api/v1/export - Export all releases and featured releases
 async fn export_releases(
     State(state): State<AppState>,
 ) -> Result<Json<ExportData>, StatusCode> {
@@ -1150,12 +1178,17 @@ async fn export_releases(
         .list_releases()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    tracing::info!("Exporting {} releases", releases.len());
+    let featured_releases = state.storage
+        .list_featured_releases()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    tracing::info!("Exporting {} releases and {} featured releases", releases.len(), featured_releases.len());
 
     Ok(Json(ExportData {
         version: "2.0".to_string(),
         export_date: chrono::Utc::now().to_rfc3339(),
         releases,
+        featured_releases,
     }))
 }
 

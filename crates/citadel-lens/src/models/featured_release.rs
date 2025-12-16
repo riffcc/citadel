@@ -81,7 +81,12 @@ pub struct FeaturedRelease {
     pub clicks: u64,
 
     /// Creation timestamp (ISO 8601)
+    #[serde(default = "default_created")]
     pub created: String,
+}
+
+fn default_created() -> String {
+    chrono::Utc::now().to_rfc3339()
 }
 
 fn default_priority() -> u32 {
