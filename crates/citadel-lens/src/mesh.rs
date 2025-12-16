@@ -109,6 +109,9 @@ pub struct MeshPeer {
     pub coordinated: bool,
     /// The SPIRAL slot this peer has claimed (if known)
     pub slot: Option<SlotClaim>,
+    /// True if this peer is an entry/bootstrap peer (from CITADEL_PEERS)
+    /// Entry peers should be disconnected once we have enough SPIRAL neighbors
+    pub is_entry_peer: bool,
 }
 
 /// A claimed SPIRAL slot in the mesh
@@ -154,6 +157,95 @@ impl SlotClaim {
     /// Get the 20 neighbor coordinates of this slot
     pub fn neighbor_coords(&self) -> [HexCoord; 20] {
         Neighbors::of(self.coord)
+    }
+}
+
+/// A single latency measurement sample
+#[derive(Debug, Clone)]
+pub struct LatencySample {
+    pub latency_ms: u64,
+    pub timestamp: std::time::Instant,
+}
+
+/// Latency history for a single neighbor - tracks samples over time windows
+/// Uses VecDeque for O(1) push/pop. Memory-optimized: 360 samples (10s intervals)
+#[derive(Debug, Clone, Default)]
+pub struct LatencyHistory {
+    /// Recent samples (circular buffer, 360 samples = 1h at 10s resolution)
+    samples: std::collections::VecDeque<LatencySample>,
+    /// Maximum samples to keep (reduced to save memory)
+    max_samples: usize,
+}
+
+impl LatencyHistory {
+    pub fn new() -> Self {
+        Self {
+            samples: std::collections::VecDeque::with_capacity(64), // Start small, grow as needed
+            max_samples: 360, // 1 hour at 10-second resolution
+        }
+    }
+
+    /// Record a new latency sample - O(1) amortized
+    pub fn record(&mut self, latency_ms: u64) {
+        let sample = LatencySample {
+            latency_ms,
+            timestamp: std::time::Instant::now(),
+        };
+
+        if self.samples.len() >= self.max_samples {
+            self.samples.pop_front(); // O(1) with VecDeque
+        }
+        self.samples.push_back(sample);
+    }
+
+    /// Compute latency statistics over multiple time windows
+    pub fn compute_stats(&self) -> crate::api::LatencyStats {
+        use std::time::Duration;
+
+        let now = std::time::Instant::now();
+        let one_sec = Duration::from_secs(1);
+        let one_min = Duration::from_secs(60);
+        let one_hour = Duration::from_secs(3600);
+
+        let mut sum_1s = 0u64;
+        let mut count_1s = 0u32;
+        let mut sum_60s = 0u64;
+        let mut count_60s = 0u32;
+        let mut sum_1h = 0u64;
+        let mut count_1h = 0u32;
+
+        for sample in &self.samples {
+            let age = now.duration_since(sample.timestamp);
+
+            if age <= one_hour {
+                sum_1h += sample.latency_ms;
+                count_1h += 1;
+
+                if age <= one_min {
+                    sum_60s += sample.latency_ms;
+                    count_60s += 1;
+
+                    if age <= one_sec {
+                        sum_1s += sample.latency_ms;
+                        count_1s += 1;
+                    }
+                }
+            }
+        }
+
+        crate::api::LatencyStats {
+            last_1s_ms: if count_1s > 0 { Some(sum_1s as f64 / count_1s as f64) } else { None },
+            last_60s_ms: if count_60s > 0 { Some(sum_60s as f64 / count_60s as f64) } else { None },
+            last_1h_ms: if count_1h > 0 { Some(sum_1h as f64 / count_1h as f64) } else { None },
+            samples_1s: count_1s,
+            samples_60s: count_60s,
+            samples_1h: count_1h,
+        }
+    }
+
+    /// Get the most recent latency measurement
+    pub fn latest(&self) -> Option<u64> {
+        self.samples.back().map(|s| s.latency_ms)
     }
 }
 
@@ -260,10 +352,34 @@ pub struct MeshState {
     /// CVDF coordinator for collaborative VDF consensus
     /// Weight-based chain comparison (heavier wins, not taller)
     pub cvdf: Option<CvdfCoordinator>,
+    /// Latency history for each neighbor (from_node -> to_node -> history)
+    /// Used for map visualization and swap optimization
+    pub latency_history: HashMap<String, HashMap<String, LatencyHistory>>,
+    /// Our observed public IP (learned from peers who connect to us)
+    /// This is what other nodes see us as - used instead of hardcoded announce_addr
+    pub observed_public_addr: Option<SocketAddr>,
     // NOTE: tgp_sessions moved to MeshService for contention-free access
 }
 
 impl MeshState {
+    /// Record a latency measurement between two nodes
+    pub fn record_latency(&mut self, from_node: &str, to_node: &str, latency_ms: u64) {
+        let from_map = self.latency_history
+            .entry(from_node.to_string())
+            .or_insert_with(HashMap::new);
+
+        let history = from_map
+            .entry(to_node.to_string())
+            .or_insert_with(LatencyHistory::new);
+
+        history.record(latency_ms);
+    }
+
+    /// Get latency history between two nodes
+    pub fn get_latency_history(&self, from_node: &str, to_node: &str) -> Option<&LatencyHistory> {
+        self.latency_history.get(from_node)?.get(to_node)
+    }
+
     /// Find the next available SPIRAL slot
     pub fn next_available_slot(&self) -> u64 {
         let mut index = 0u64;
@@ -297,6 +413,55 @@ impl MeshState {
     /// Count how many of our 20 neighbors are present
     pub fn neighbor_count(&self) -> usize {
         self.present_neighbors().len()
+    }
+
+    /// Check if a peer is in our SPIRAL neighborhood (one of 20 possible neighbors)
+    pub fn is_spiral_neighbor(&self, peer_id: &str) -> bool {
+        let Some(ref self_slot) = self.self_slot else {
+            return false;
+        };
+
+        // Check if this peer has claimed a slot that is adjacent to ours
+        let neighbor_coords: std::collections::HashSet<_> = self_slot.neighbor_coords().into_iter().collect();
+
+        self.claimed_slots.values()
+            .any(|claim| claim.peer_id == peer_id && neighbor_coords.contains(&claim.coord))
+    }
+
+    /// Count connected SPIRAL neighbors (not entry peers)
+    pub fn connected_neighbor_count(&self) -> usize {
+        let Some(ref self_slot) = self.self_slot else {
+            return 0;
+        };
+
+        let neighbor_coords: std::collections::HashSet<_> = self_slot.neighbor_coords().into_iter().collect();
+
+        // Count peers whose slots are in our neighborhood
+        self.peers.values()
+            .filter(|peer| {
+                if let Some(ref slot) = peer.slot {
+                    neighbor_coords.contains(&slot.coord)
+                } else {
+                    false
+                }
+            })
+            .count()
+    }
+
+    /// Get entry peers that should be disconnected (have enough SPIRAL neighbors)
+    pub fn entry_peers_to_disconnect(&self) -> Vec<String> {
+        // Need at least 3 SPIRAL neighbors before we can safely disconnect from entry peers
+        const MIN_NEIGHBORS_FOR_DISCONNECT: usize = 3;
+
+        if self.connected_neighbor_count() < MIN_NEIGHBORS_FOR_DISCONNECT {
+            return Vec::new();
+        }
+
+        // Return entry peers that are NOT also SPIRAL neighbors
+        self.peers.iter()
+            .filter(|(id, peer)| peer.is_entry_peer && !self.is_spiral_neighbor(id))
+            .map(|(id, _)| id.clone())
+            .collect()
     }
 }
 
@@ -339,6 +504,9 @@ pub enum FloodMessage {
 pub struct MeshService {
     /// P2P listen address (TCP and UDP share this port)
     listen_addr: SocketAddr,
+    /// P2P announce address (public IP for other peers to connect to)
+    /// If None, uses listen_addr (which may be 0.0.0.0 - won't work!)
+    announce_addr: Option<SocketAddr>,
     /// Bootstrap peers to connect to
     entry_peers: Vec<String>,
     /// Shared storage for replication
@@ -361,6 +529,7 @@ impl MeshService {
     /// Create a new mesh service
     pub fn new(
         listen_addr: SocketAddr,
+        announce_addr: Option<SocketAddr>,
         entry_peers: Vec<String>,
         storage: Arc<Storage>,
     ) -> Self {
@@ -400,6 +569,7 @@ impl MeshService {
 
         Self {
             listen_addr,
+            announce_addr,
             entry_peers,
             storage,
             state: Arc::new(RwLock::new(MeshState {
@@ -417,6 +587,8 @@ impl MeshService {
                 pol_manager: None,  // Initialized after claiming a slot
                 pol_pending_pings: HashMap::new(),
                 cvdf: None,        // Initialized as genesis or when joining mesh
+                latency_history: HashMap::new(),
+                observed_public_addr: None,  // Learned from peers via hello
             })),
             // Separate lock for TGP sessions - contention-free TGP operations
             tgp_sessions: Arc::new(RwLock::new(HashMap::new())),
@@ -1176,24 +1348,26 @@ impl MeshService {
             false
         };
 
-        // Check if already claimed by someone else
+        // Check if already claimed
         if let Some(existing) = state.claimed_slots.get(&index) {
-            if existing.peer_id != peer_id {
-                // Ungameable tiebreaker: hash(blake3(peer_id) XOR blake3(tx))
-                if Self::peer_wins_slot(&peer_id, &existing.peer_id, index) {
-                    let loser_id = existing.peer_id.clone();
-                    info!("Slot {} taken by {} (beats previous claimer {} by priority)",
-                          index, peer_id, loser_id);
-                    // Clear the loser's slot in our peer records
-                    if let Some(loser_peer) = state.peers.get_mut(&loser_id) {
-                        loser_peer.slot = None;
-                    }
-                    // Fall through to accept the new claim
-                } else {
-                    debug!("Slot {} stays with {} (beats new claimer {} by priority)",
-                           index, existing.peer_id, peer_id);
-                    return we_lost;
+            if existing.peer_id == peer_id {
+                // Same claim we already have - skip (deduplication)
+                return we_lost;
+            }
+            // Different claimer - use ungameable tiebreaker
+            if Self::peer_wins_slot(&peer_id, &existing.peer_id, index) {
+                let loser_id = existing.peer_id.clone();
+                info!("Slot {} taken by {} (beats previous claimer {} by priority)",
+                      index, peer_id, loser_id);
+                // Clear the loser's slot in our peer records
+                if let Some(loser_peer) = state.peers.get_mut(&loser_id) {
+                    loser_peer.slot = None;
                 }
+                // Fall through to accept the new claim
+            } else {
+                debug!("Slot {} stays with {} (beats new claimer {} by priority)",
+                       index, existing.peer_id, peer_id);
+                return we_lost;
             }
         }
 
@@ -1473,6 +1647,9 @@ impl MeshService {
     /// Run the mesh service
     pub async fn run(self: Arc<Self>) -> Result<()> {
         info!("Starting mesh service on {}", self.listen_addr);
+        if let Some(announce) = self.announce_addr {
+            info!("Announcing as {} (public address)", announce);
+        }
 
         // Start TCP listener for incoming connections
         let listener = TcpListener::bind(self.listen_addr).await?;
@@ -1583,7 +1760,8 @@ impl MeshService {
                             info!("Incoming mesh connection from {}", addr);
                             let self_clone = Arc::clone(&self);
                             tokio::spawn(async move {
-                                if let Err(e) = self_clone.handle_connection(stream, addr).await {
+                                // Incoming connections are not entry peers
+                                if let Err(e) = self_clone.handle_connection(stream, addr, false).await {
                                     warn!("Connection error from {}: {}", addr, e);
                                 }
                             });
@@ -1600,7 +1778,8 @@ impl MeshService {
                         match TcpStream::connect(&addr).await {
                             Ok(stream) => {
                                 debug!("Connected to discovered peer {} at {}", discovered_id, addr);
-                                if let Err(e) = self_clone.handle_connection(stream, addr).await {
+                                // Discovered peers are not entry peers
+                                if let Err(e) = self_clone.handle_connection(stream, addr, false).await {
                                     debug!("Discovered peer {} connection closed: {}", discovered_id, e);
                                 }
                             }
@@ -1632,14 +1811,15 @@ impl MeshService {
                             continue;
                         }
                     };
-                    info!("Connected to peer {} at {}", peer_addr, addr);
+                    info!("Connected to entry peer {} at {}", peer_addr, addr);
                     connected += 1;
 
                     // Spawn connection handler as task - don't block!
+                    // Entry peers are marked as such for later pruning when we have enough SPIRAL neighbors
                     let self_clone = Arc::clone(self);
                     tokio::spawn(async move {
-                        if let Err(e) = self_clone.handle_connection(stream, addr).await {
-                            warn!("Peer {} disconnected: {}", addr, e);
+                        if let Err(e) = self_clone.handle_connection(stream, addr, true).await {
+                            warn!("Entry peer {} disconnected: {}", addr, e);
                         }
                     });
                 }
@@ -1653,7 +1833,7 @@ impl MeshService {
     }
 
     /// Handle a peer connection
-    async fn handle_connection(self: &Arc<Self>, stream: TcpStream, addr: SocketAddr) -> Result<()> {
+    async fn handle_connection(self: &Arc<Self>, stream: TcpStream, addr: SocketAddr, is_entry_peer: bool) -> Result<()> {
         // Use full IP:port as initial peer_id to avoid collisions when connecting to
         // multiple peers that listen on the same port (e.g., all bootstrap nodes on :9000)
         let peer_id = format!("peer-{}", addr);
@@ -1670,6 +1850,7 @@ impl MeshService {
                     last_seen: std::time::Instant::now(),
                     coordinated: false,
                     slot: None,  // Will be learned via SPORE slot_claim flood
+                    is_entry_peer,
                 },
             );
         }
@@ -1685,12 +1866,18 @@ impl MeshService {
         let self_id = state.self_id.clone();
         let self_pubkey = state.signing_key.verifying_key();
         let pubkey_hex = hex::encode(self_pubkey.as_bytes());
+        // Priority: 1) explicit announce_addr, 2) learned from peers, 3) listen_addr
+        let our_addr = self.announce_addr
+            .or(state.observed_public_addr)
+            .unwrap_or(self.listen_addr);
         drop(state);
         let hello = serde_json::json!({
             "type": "hello",
             "node_id": self_id,
-            "addr": self.listen_addr.to_string(),
+            "addr": our_addr.to_string(),
             "public_key": pubkey_hex,
+            // Tell peer what IP we see them as (STUN-like)
+            "your_addr": addr.to_string(),
         });
         writer.write_all(hello.to_string().as_bytes()).await?;
         writer.write_all(b"\n").await?;
@@ -1715,9 +1902,13 @@ impl MeshService {
             let state = self.state.read().await;
             let self_slot = state.self_slot.as_ref().map(|s| s.index);
             let self_pubkey = hex::encode(state.signing_key.verifying_key().as_bytes());
+            // Priority: 1) explicit announce_addr, 2) learned from peers, 3) listen_addr
+            let our_addr_for_flood = self.announce_addr
+                .or(state.observed_public_addr)
+                .unwrap_or(self.listen_addr);
             let mut all_peers = vec![serde_json::json!({
                 "id": state.self_id,
-                "addr": self.listen_addr.to_string(),
+                "addr": our_addr_for_flood.to_string(),
                 "slot": self_slot,
                 "public_key": self_pubkey,
             })];
@@ -1816,12 +2007,25 @@ impl MeshService {
         // Track current peer key (may change from peer-{port} to real PeerID)
         let mut current_peer_key = peer_id.clone();
 
+        // Timer for checking if this entry peer should be disconnected
+        // Only relevant if is_entry_peer=true
+        let mut entry_peer_check_interval = tokio::time::interval(std::time::Duration::from_secs(10));
+
         // Read peer messages and forward floods concurrently
         // NOTE: TGP is now over UDP (connectionless), not TCP
         let mut line = String::new();
         loop {
             line.clear();
             tokio::select! {
+                // Check if this entry peer should be disconnected (have enough SPIRAL neighbors)
+                _ = entry_peer_check_interval.tick(), if is_entry_peer => {
+                    let state = self.state.read().await;
+                    if state.entry_peers_to_disconnect().contains(&current_peer_key) {
+                        info!("Disconnecting entry peer {} - have sufficient SPIRAL neighbors ({})",
+                            current_peer_key, state.connected_neighbor_count());
+                        break;
+                    }
+                }
                 // Handle incoming messages from peer
                 read_result = reader.read_line(&mut line) => {
                     match read_result {
@@ -2099,9 +2303,39 @@ impl MeshService {
         }
 
         // Remove peer on disconnect using current key
+        // Also clean up their slot claim and latency history to avoid ghost nodes and memory leaks
         {
             let mut state = self.state.write().await;
-            state.peers.remove(&current_peer_key);
+            if let Some(peer) = state.peers.remove(&current_peer_key) {
+                // If this peer had a slot, remove it from claimed_slots
+                if let Some(slot) = peer.slot {
+                    info!("Cleaning up slot {} from disconnected peer {}", slot.index, current_peer_key);
+                    state.claimed_slots.remove(&slot.index);
+                    state.slot_coords.remove(&slot.coord);
+                }
+            }
+            // Also scan claimed_slots for any claims by this peer ID
+            // (in case slot was learned via flooding but not stored on peer struct)
+            let slots_to_remove: Vec<u64> = state.claimed_slots
+                .iter()
+                .filter(|(_, claim)| claim.peer_id == current_peer_key)
+                .map(|(idx, _)| *idx)
+                .collect();
+            for idx in slots_to_remove {
+                if let Some(claim) = state.claimed_slots.remove(&idx) {
+                    info!("Cleaning up flooded slot {} from disconnected peer {}", idx, current_peer_key);
+                    state.slot_coords.remove(&claim.coord);
+                }
+            }
+
+            // Clean up latency history for this peer to prevent memory leak
+            // latency_history uses short peer IDs (first 8 chars after b3b3/)
+            let short_peer = crate::api::short_peer_id(&current_peer_key);
+            state.latency_history.remove(&short_peer);
+            // Also remove any entries where this peer was the target
+            for (_, targets) in state.latency_history.iter_mut() {
+                targets.remove(&short_peer);
+            }
         }
 
         Ok(())
@@ -2136,7 +2370,22 @@ impl MeshService {
                         .map(|addr| addr.port())
                         .unwrap_or(9000);  // Default to 9000 if not provided
 
+                    // Learn our public IP from what the peer sees us as (STUN-like)
+                    let their_view_of_us = msg.get("your_addr")
+                        .and_then(|a| a.as_str())
+                        .and_then(|addr_str| addr_str.parse::<SocketAddr>().ok());
+
                     let mut state = self.state.write().await;
+
+                    // Update our observed public address if peer told us what they see
+                    if let Some(observed) = their_view_of_us {
+                        if state.observed_public_addr.is_none() {
+                            // Use our listen port, but the IP the peer sees
+                            let public_addr = SocketAddr::new(observed.ip(), self.listen_addr.port());
+                            info!("Learned our public IP from {}: {}", peer_id, public_addr);
+                            state.observed_public_addr = Some(public_addr);
+                        }
+                    }
                     // Remove temporary peer-{port} entry and re-add with real ID
                     if let Some(mut peer) = state.peers.remove(peer_id) {
                         // Only add if we don't already have this peer (avoid duplicates)
@@ -2160,8 +2409,25 @@ impl MeshService {
                 if let Some(admins) = msg.get("admins").and_then(|a| a.as_array()) {
                     for admin in admins {
                         if let Some(key) = admin.as_str() {
-                            let _ = self.storage.set_admin(key, true);
-                            info!("Merged admin from {}: {}", peer_id, key);
+                            let key = key.trim();
+                            // Skip malformed combo strings from old nodes
+                            if key.contains(',') {
+                                continue;
+                            }
+                            // Accept ed25519p/... (prefix + 64 hex) or raw 64 hex
+                            let valid = if let Some(hex) = key.strip_prefix("ed25519p/") {
+                                hex.len() == 64
+                            } else {
+                                key.len() == 64
+                            };
+                            if valid {
+                                // Only log if this is a NEW admin (deduplication)
+                                let is_new = !self.storage.is_admin(key).unwrap_or(true);
+                                if is_new {
+                                    let _ = self.storage.set_admin(key, true);
+                                    info!("Merged admin from {}: {}", peer_id, key);
+                                }
+                            }
                         }
                     }
                 }
@@ -2217,6 +2483,7 @@ impl MeshService {
                                     last_seen: std::time::Instant::now(),
                                     coordinated: false,
                                     slot,
+                                    is_entry_peer: false,  // Discovered via flooding, not an entry peer
                                 },
                             );
                             new_peers.push((id.clone(), addr_str, slot_index, public_key));
@@ -2491,7 +2758,14 @@ impl MeshService {
 
                                     if let Some(ref mut pol) = state.pol_manager {
                                         if let Some(proof) = pol.complete_ping(from_arr, vdf_height, vdf_output) {
-                                            debug!("PoL: measured latency to {} = {}µs", peer_id, proof.latency_us);
+                                            let latency_ms = proof.latency_us / 1000;
+                                            debug!("PoL: measured latency to {} = {}ms", peer_id, latency_ms);
+
+                                            // Record latency in history for map visualization
+                                            let self_id = state.self_id.clone();
+                                            let short_self = crate::api::short_peer_id(&self_id);
+                                            let short_peer = crate::api::short_peer_id(&peer_id);
+                                            state.record_latency(&short_self, &short_peer, latency_ms);
                                         }
                                     }
                                 }

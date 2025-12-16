@@ -39,6 +39,7 @@ blake3 = { workspace = true }
 ed25519-dalek = { workspace = true }
 hex = { workspace = true }
 rand = "0.8"
+getrandom = "0.2"
 
 # Storage
 rocksdb = "0.22"
@@ -47,6 +48,9 @@ rocksdb = "0.22"
 axum = { version = "0.7", features = ["ws"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 futures = "0.3"
+
+# Date/time
+chrono = { version = "0.4", features = ["serde"] }
 
 [dev-dependencies]
 tempfile = "3"

@@ -60,14 +60,26 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-/// VDF iterations per round - tuned for ~50ms on modern hardware
-pub const CVDF_ITERATIONS: u32 = 100_000;
+/// VDF iterations per round - base difficulty (~50ms on modern hardware)
+pub const CVDF_ITERATIONS_BASE: u32 = 100_000;
+
+/// Minimum VDF iterations (when network is stable, ~10ms)
+pub const CVDF_ITERATIONS_MIN: u32 = 20_000;
+
+/// Maximum VDF iterations (under attack, ~500ms)
+pub const CVDF_ITERATIONS_MAX: u32 = 500_000;
 
 /// Minimum attestations for a valid round (prevents solo mining)
 pub const MIN_ATTESTATIONS: usize = 1;
 
 /// Weight multiplier per attester (for chain comparison)
 pub const ATTESTATION_WEIGHT: u64 = 1;
+
+/// Rounds without attestation before a slot is considered stale
+pub const SLOT_LIVENESS_THRESHOLD: u64 = 10;
+
+/// Rounds to track for difficulty adjustment
+pub const DIFFICULTY_WINDOW: usize = 20;
 
 /// An attestation to a round - proves a node participated
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -170,7 +182,7 @@ impl CvdfRound {
         let washed_input = *blake3::hash(seed).as_bytes();
 
         // Compute VDF
-        let output = compute_cvdf(&washed_input, CVDF_ITERATIONS);
+        let output = compute_cvdf(&washed_input, CVDF_ITERATIONS_BASE);
 
         // Sign the round
         let mut msg = Vec::with_capacity(96);
@@ -222,7 +234,7 @@ impl CvdfRound {
         let washed_input = wash_attestations(&prev_output, &attestations);
 
         // Compute VDF
-        let output = compute_cvdf(&washed_input, CVDF_ITERATIONS);
+        let output = compute_cvdf(&washed_input, CVDF_ITERATIONS_BASE);
 
         let producer = signing_key.verifying_key().to_bytes();
 
@@ -279,7 +291,7 @@ impl CvdfRound {
         }
 
         // Verify VDF output
-        let expected_output = compute_cvdf(&self.washed_input, CVDF_ITERATIONS);
+        let expected_output = compute_cvdf(&self.washed_input, CVDF_ITERATIONS_BASE);
         if self.output != expected_output {
             return false;
         }
@@ -349,6 +361,148 @@ fn compute_cvdf(input: &[u8; 32], iterations: u32) -> [u8; 32] {
     }
 
     *state.as_bytes()
+}
+
+/// Network health metrics for difficulty adjustment
+#[derive(Debug, Clone, Default)]
+pub struct NetworkHealth {
+    /// Attestation counts for recent rounds
+    pub recent_attestation_counts: Vec<usize>,
+    /// Fork events detected
+    pub fork_count: u32,
+    /// Spam claim attempts
+    pub spam_claim_count: u32,
+    /// Current difficulty level
+    pub current_iterations: u32,
+}
+
+impl NetworkHealth {
+    pub fn new() -> Self {
+        Self {
+            recent_attestation_counts: Vec::with_capacity(DIFFICULTY_WINDOW),
+            fork_count: 0,
+            spam_claim_count: 0,
+            current_iterations: CVDF_ITERATIONS_BASE,
+        }
+    }
+
+    /// Record a round's attestation count
+    pub fn record_round(&mut self, attestation_count: usize) {
+        self.recent_attestation_counts.push(attestation_count);
+        if self.recent_attestation_counts.len() > DIFFICULTY_WINDOW {
+            self.recent_attestation_counts.remove(0);
+        }
+        // Decay fork/spam counts over time
+        if self.fork_count > 0 {
+            self.fork_count = self.fork_count.saturating_sub(1);
+        }
+        if self.spam_claim_count > 0 {
+            self.spam_claim_count = self.spam_claim_count.saturating_sub(1);
+        }
+    }
+
+    /// Record a fork detection
+    pub fn record_fork(&mut self) {
+        self.fork_count = self.fork_count.saturating_add(5);
+    }
+
+    /// Record a spam claim attempt
+    pub fn record_spam(&mut self) {
+        self.spam_claim_count = self.spam_claim_count.saturating_add(1);
+    }
+
+    /// Compute optimal difficulty based on network health
+    pub fn compute_difficulty(&mut self) -> u32 {
+        // Attack indicators
+        let attack_score = self.fork_count + self.spam_claim_count;
+
+        // Participation health
+        let avg_attesters = if self.recent_attestation_counts.is_empty() {
+            0.0
+        } else {
+            self.recent_attestation_counts.iter().sum::<usize>() as f64
+                / self.recent_attestation_counts.len() as f64
+        };
+
+        // Healthy network: low difficulty (fast rounds)
+        // Under attack: high difficulty (slow but secure)
+        let target_iterations = if attack_score > 10 {
+            // Heavy attack - max difficulty
+            CVDF_ITERATIONS_MAX
+        } else if attack_score > 5 {
+            // Moderate attack - elevated difficulty
+            CVDF_ITERATIONS_BASE + (CVDF_ITERATIONS_MAX - CVDF_ITERATIONS_BASE) / 2
+        } else if avg_attesters >= 3.0 && attack_score == 0 {
+            // Healthy collaborative network - minimum difficulty
+            CVDF_ITERATIONS_MIN
+        } else {
+            // Normal operation - base difficulty
+            CVDF_ITERATIONS_BASE
+        };
+
+        // Smooth transitions (don't jump instantly)
+        let diff = target_iterations as i64 - self.current_iterations as i64;
+        let step = (diff / 4).clamp(-50000, 50000) as i32;
+        self.current_iterations = (self.current_iterations as i32 + step)
+            .clamp(CVDF_ITERATIONS_MIN as i32, CVDF_ITERATIONS_MAX as i32) as u32;
+
+        self.current_iterations
+    }
+}
+
+/// Slot liveness tracker - prunes slots that stop contributing
+#[derive(Debug, Clone, Default)]
+pub struct SlotLiveness {
+    /// Last round each slot attested (slot -> round)
+    last_attestation: HashMap<u64, u64>,
+    /// Current round number
+    current_round: u64,
+}
+
+impl SlotLiveness {
+    pub fn new() -> Self {
+        Self {
+            last_attestation: HashMap::new(),
+            current_round: 0,
+        }
+    }
+
+    /// Record an attestation from a slot
+    pub fn record_attestation(&mut self, slot: u64, round: u64) {
+        self.last_attestation.insert(slot, round);
+        if round > self.current_round {
+            self.current_round = round;
+        }
+    }
+
+    /// Advance to new round
+    pub fn advance_round(&mut self, round: u64) {
+        self.current_round = round;
+    }
+
+    /// Check if a slot is still live (has attested recently)
+    pub fn is_live(&self, slot: u64) -> bool {
+        if let Some(last) = self.last_attestation.get(&slot) {
+            self.current_round.saturating_sub(*last) <= SLOT_LIVENESS_THRESHOLD
+        } else {
+            // Never attested - give them a grace period
+            true
+        }
+    }
+
+    /// Get all stale slots that should be pruned
+    pub fn stale_slots(&self) -> Vec<u64> {
+        self.last_attestation
+            .iter()
+            .filter(|(_, last)| self.current_round.saturating_sub(**last) > SLOT_LIVENESS_THRESHOLD)
+            .map(|(slot, _)| *slot)
+            .collect()
+    }
+
+    /// Remove a slot from tracking
+    pub fn remove_slot(&mut self, slot: u64) {
+        self.last_attestation.remove(&slot);
+    }
 }
 
 /// Get current timestamp in milliseconds
@@ -482,7 +636,7 @@ impl CvdfChain {
         }
 
         // Verify genesis VDF
-        let expected_genesis_output = compute_cvdf(&genesis.washed_input, CVDF_ITERATIONS);
+        let expected_genesis_output = compute_cvdf(&genesis.washed_input, CVDF_ITERATIONS_BASE);
         if genesis.output != expected_genesis_output {
             return false;
         }
@@ -575,6 +729,10 @@ pub struct CvdfCoordinator {
     pending_attestations: BTreeMap<[u8; 32], RoundAttestation>,
     /// Known slot holders (for duty rotation)
     slot_holders: BTreeMap<u64, [u8; 32]>,
+    /// Slot liveness tracking - prunes inactive slots
+    slot_liveness: SlotLiveness,
+    /// Network health for difficulty adjustment
+    network_health: NetworkHealth,
 }
 
 impl CvdfCoordinator {
@@ -587,6 +745,8 @@ impl CvdfCoordinator {
             our_slot: None,
             pending_attestations: BTreeMap::new(),
             slot_holders: BTreeMap::new(),
+            slot_liveness: SlotLiveness::new(),
+            network_health: NetworkHealth::new(),
         }
     }
 
@@ -603,6 +763,8 @@ impl CvdfCoordinator {
             our_slot: None,
             pending_attestations: BTreeMap::new(),
             slot_holders: BTreeMap::new(),
+            slot_liveness: SlotLiveness::new(),
+            network_health: NetworkHealth::new(),
         })
     }
 

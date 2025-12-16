@@ -46,6 +46,27 @@ impl Storage {
         Ok(())
     }
 
+    /// Delete ALL releases (use with caution!).
+    pub fn delete_all_releases(&self) -> Result<usize> {
+        let prefix = b"release:";
+        let mut count = 0;
+
+        // Collect keys first to avoid iterator invalidation
+        let keys: Vec<Vec<u8>> = self.db.prefix_iterator(prefix)
+            .take_while(|item| {
+                item.as_ref().map(|(k, _)| k.starts_with(prefix)).unwrap_or(false)
+            })
+            .filter_map(|item| item.ok().map(|(k, _)| k.to_vec()))
+            .collect();
+
+        for key in keys {
+            self.db.delete(&key)?;
+            count += 1;
+        }
+
+        Ok(count)
+    }
+
     /// List all releases.
     pub fn list_releases(&self) -> Result<Vec<Release>> {
         let prefix = b"release:";

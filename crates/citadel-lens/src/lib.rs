@@ -37,6 +37,7 @@ pub mod vdf_race;
 pub mod proof_of_latency;
 pub mod pvdf;
 pub mod cvdf;
+pub mod accountability;
 #[cfg(test)]
 mod convergence_test;
 

@@ -27,6 +27,10 @@ pub struct LensConfig {
     /// P2P listen address (for mesh)
     pub p2p_addr: SocketAddr,
 
+    /// P2P announce address (public IP for other peers)
+    /// If not set, uses p2p_addr (which may be 0.0.0.0)
+    pub announce_addr: Option<SocketAddr>,
+
     /// Bootstrap peers
     pub bootstrap_peers: Vec<String>,
 
@@ -60,6 +64,13 @@ impl LensConfig {
             .parse()
             .expect("Invalid LENS_P2P_BIND");
 
+        // Optional announce address - the public IP:port that other peers should use
+        // If not set, we try to use p2p_addr, but that may be 0.0.0.0 which won't work
+        let announce_addr = std::env::var("LENS_ANNOUNCE_ADDR")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .and_then(|s| s.parse().ok());
+
         // Parse CITADEL_PEERS - accepts DNS names and portless entries (default 9000)
         let bootstrap_peers = std::env::var("CITADEL_PEERS")
             .map(|s| {
@@ -89,6 +100,7 @@ impl LensConfig {
             data_dir,
             api_addr,
             p2p_addr,
+            announce_addr,
             bootstrap_peers,
             admin_socket,
             admin_public_key,
@@ -122,12 +134,10 @@ impl LensNode {
         storage.init_default_categories()?;
 
         // Set initial admin public key(s) if provided via env var
-        // Supports comma-separated list and optional ed25519p/ prefix
+        // Supports comma-separated list, keeps ed25519p/ prefix as part of key
         if let Some(ref admin_keys) = config.admin_public_key {
             for key in admin_keys.split(',') {
                 let key = key.trim();
-                // Strip optional ed25519p/ prefix
-                let key = key.strip_prefix("ed25519p/").unwrap_or(key);
                 if !key.is_empty() {
                     storage.set_admin(key, true)?;
                     tracing::info!("Admin public key set: {}", key);
@@ -174,6 +184,7 @@ impl LensNode {
         let mesh_storage = self.storage().await;
         let mesh_service = Arc::new(MeshService::new(
             self.config.p2p_addr,
+            self.config.announce_addr,
             self.config.bootstrap_peers.clone(),
             mesh_storage,
         ));

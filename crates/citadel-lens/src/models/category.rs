@@ -3,7 +3,9 @@
 use serde::{Deserialize, Serialize};
 
 /// A category for organizing content.
+/// Compatible with lens-v2 ContentCategory format.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct Category {
     /// Unique identifier
     pub id: String,
@@ -11,25 +13,45 @@ pub struct Category {
     /// Human-readable name
     pub name: String,
 
-    /// Description
-    pub description: Option<String>,
+    /// URL-friendly slug
+    pub slug: String,
 
-    /// Parent category ID (for hierarchies)
-    pub parent_id: Option<String>,
+    /// Metadata schema for this category type
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata_schema: Option<serde_json::Value>,
 
-    /// Icon identifier
-    pub icon: Option<String>,
+    /// Site address (for lens-v2 compatibility)
+    pub site_address: String,
+
+    /// Whether this category is featured
+    #[serde(default)]
+    pub featured: bool,
 }
 
 impl Category {
     /// Create a new category.
     pub fn new(id: String, name: String) -> Self {
+        let slug = id.clone();
         Self {
             id,
             name,
-            description: None,
-            parent_id: None,
-            icon: None,
+            slug,
+            metadata_schema: None,
+            site_address: "zb2rhkfHMKY7nsrC6QYcuAi1imgAAUXwPM3WYCajL3Evxmq2w".to_string(),
+            featured: false,
+        }
+    }
+
+    /// Create a new category with full options
+    pub fn with_schema(id: String, name: String, featured: bool, schema: Option<serde_json::Value>) -> Self {
+        let slug = id.clone();
+        Self {
+            id,
+            name,
+            slug,
+            metadata_schema: schema,
+            site_address: "zb2rhkfHMKY7nsrC6QYcuAi1imgAAUXwPM3WYCajL3Evxmq2w".to_string(),
+            featured,
         }
     }
 
@@ -41,15 +63,71 @@ impl Category {
         citadel_dht::hash_prefixed_key(Self::DHT_PREFIX, &self.id)
     }
 
-    /// Default categories for common content types.
+    /// Default categories for common content types (matching lens-v2).
     pub fn defaults() -> Vec<Self> {
         vec![
-            Self::new("music".to_string(), "Music".to_string()),
-            Self::new("movies".to_string(), "Movies".to_string()),
-            Self::new("tv".to_string(), "TV Shows".to_string()),
-            Self::new("games".to_string(), "Games".to_string()),
-            Self::new("books".to_string(), "Books".to_string()),
-            Self::new("software".to_string(), "Software".to_string()),
+            Self::with_schema(
+                "music".to_string(),
+                "Music".to_string(),
+                true,
+                Some(serde_json::json!({
+                    "artist": "string",
+                    "album": "string",
+                    "trackMetadata": "string"
+                })),
+            ),
+            Self::with_schema(
+                "movies".to_string(),
+                "Movies".to_string(),
+                true,
+                Some(serde_json::json!({
+                    "director": "string",
+                    "releaseYear": "string",
+                    "duration": "string",
+                    "classification": "string"
+                })),
+            ),
+            Self::with_schema(
+                "tv-shows".to_string(),
+                "TV Shows".to_string(),
+                true,
+                Some(serde_json::json!({
+                    "seasons": "number",
+                    "episodes": "number",
+                    "releaseYear": "string"
+                })),
+            ),
+            Self::with_schema(
+                "books".to_string(),
+                "Books".to_string(),
+                false,
+                Some(serde_json::json!({
+                    "author": "string",
+                    "isbn": "string",
+                    "publisher": "string",
+                    "publicationYear": "string"
+                })),
+            ),
+            Self::with_schema(
+                "audiobooks".to_string(),
+                "Audiobooks".to_string(),
+                false,
+                Some(serde_json::json!({
+                    "narrator": "string",
+                    "author": "string",
+                    "duration": "string"
+                })),
+            ),
+            Self::with_schema(
+                "games".to_string(),
+                "Games".to_string(),
+                false,
+                Some(serde_json::json!({
+                    "platform": "string",
+                    "developer": "string",
+                    "releaseYear": "string"
+                })),
+            ),
         ]
     }
 }

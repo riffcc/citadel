@@ -10,6 +10,7 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tower_http::cors::{Any, CorsLayer};
@@ -46,6 +47,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/mesh/state", get(get_mesh_state))
         // WebSocket for real-time mesh updates
         .route("/api/v1/ws/mesh", get(ws_mesh_handler))
+        // Import/Export
+        .route("/api/v1/import", post(import_releases))
+        .route("/api/v1/export", get(export_releases))
+        .route("/api/v1/admin/releases", delete(delete_all_releases))
         .layer(cors)
         .with_state(state)
 }
@@ -248,12 +253,28 @@ struct HexSlot {
     z: i64,
 }
 
+/// Latency statistics over multiple time windows
+#[derive(Debug, Serialize, Clone, Default)]
+pub struct LatencyStats {
+    /// Average latency over last 1 second
+    pub last_1s_ms: Option<f64>,
+    /// Average latency over last 60 seconds
+    pub last_60s_ms: Option<f64>,
+    /// Average latency over last hour
+    pub last_1h_ms: Option<f64>,
+    /// Sample count in each window
+    pub samples_1s: u32,
+    pub samples_60s: u32,
+    pub samples_1h: u32,
+}
+
 #[derive(Debug, Serialize)]
 struct PeerEdge {
     from: String,
     to: String,
     connection_type: String,  // "neighbor" or "relay"
-    latency_ms: Option<u32>,
+    latency_ms: Option<u32>,  // Most recent measurement
+    latency_stats: LatencyStats,  // Multi-window averages for hover display
     bidirectional: bool,
 }
 
@@ -314,75 +335,89 @@ async fn get_network_map(
     if let Some(ref mesh_state) = state.mesh_state {
         let mesh = mesh_state.read().await;
 
-        // Add all connected peers as nodes
-        // Use peer_id (hashmap key) as authoritative ID - gets updated from hello
-        for (peer_id, peer) in &mesh.peers {
-            let short_id = short_peer_id(peer_id);
+        // Build a map of coordinates to node IDs for SPIRAL edge computation
+        use citadel_topology::{HexCoord, Neighbors};
+        let mut coord_to_node: HashMap<HexCoord, String> = HashMap::new();
 
-            // Pure SPIRAL - only use actual claimed slots from mesh state
-            let peer_slot = if let Some(ref claim) = peer.slot {
-                HexSlot {
-                    index: Some(claim.index),
-                    q: claim.coord.q,
-                    r: claim.coord.r,
-                    z: claim.coord.z,
-                }
-            } else if let Some(claim) = mesh.claimed_slots.values().find(|c| c.peer_id == *peer_id) {
-                // Check global claims for this peer
-                HexSlot {
-                    index: Some(claim.index),
-                    q: claim.coord.q,
-                    r: claim.coord.r,
-                    z: claim.coord.z,
-                }
+        // Add self to coord map if we have a slot
+        if let Some(ref claim) = self_slot_opt {
+            coord_to_node.insert(claim.coord, short_self_id.clone());
+        }
+
+        // First pass: collect all nodes from claimed_slots (the authoritative source)
+        for (slot_index, claim) in &mesh.claimed_slots {
+            let short_id = short_peer_id(&claim.peer_id);
+
+            // Skip self (already added)
+            if short_id == short_self_id {
+                continue;
+            }
+
+            // Check if we're directly connected to this peer
+            let (online, last_heartbeat) = if let Some(peer) = mesh.peers.get(&claim.peer_id) {
+                (true, peer.last_seen.elapsed().as_secs())
             } else {
-                // No slot claimed yet
-                HexSlot { index: None, q: 0, r: 0, z: 0 }
+                // Check by short ID prefix match
+                let connected = mesh.peers.keys().any(|k| short_peer_id(k) == short_id);
+                (connected, 0)
             };
 
             nodes.push(PeerNode {
                 id: short_id.clone(),
-                label: short_id.clone(),  // Use peer ID as label, not IP
-                slot: peer_slot,
+                label: short_id.clone(),
+                slot: HexSlot {
+                    index: Some(*slot_index),
+                    q: claim.coord.q,
+                    r: claim.coord.r,
+                    z: claim.coord.z,
+                },
                 peer_type: "server".to_string(),
-                last_heartbeat: peer.last_seen.elapsed().as_secs(),
+                last_heartbeat,
                 capabilities: vec!["storage".to_string(), "relay".to_string()],
-                online: true,
+                online,
             });
 
-            // Add edge from self to peer
-            // Note: latency_ms is None until we implement actual RTT measurement
-            // (last_seen.elapsed() is time since last message, NOT network latency)
-            edges.push(PeerEdge {
-                from: short_self_id.clone(),
-                to: short_id,
-                connection_type: if peer.coordinated { "neighbor" } else { "bootstrap" }.to_string(),
-                latency_ms: None,
-                bidirectional: true,
-            });
+            coord_to_node.insert(claim.coord, short_id);
         }
 
-        // Also add nodes from claimed_slots that we've learned about via SPORE flooding
-        // but aren't directly connected to (these are known but indirect peers)
-        let known_ids: std::collections::HashSet<String> = nodes.iter().map(|n| n.id.clone()).collect();
-        for (slot_index, claim) in &mesh.claimed_slots {
-            let short_id = short_peer_id(&claim.peer_id);
-            if !known_ids.contains(&short_id) {
-                // Add this node we've heard about through flooding
-                nodes.push(PeerNode {
-                    id: short_id.clone(),
-                    label: short_id.clone(),
-                    slot: HexSlot {
-                        index: Some(*slot_index),
-                        q: claim.coord.q,
-                        r: claim.coord.r,
-                        z: claim.coord.z,
-                    },
-                    peer_type: "server".to_string(),
-                    last_heartbeat: 0,  // Unknown - not directly connected
-                    capabilities: vec!["storage".to_string(), "relay".to_string()],
-                    online: true,  // Assume online since we received their claim
-                });
+        // Second pass: compute SPIRAL edges based on actual hex neighbor topology
+        // For each node, check which of its 20 theoretical neighbors exist in the mesh
+        let mut seen_edges: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+
+        for (coord, node_id) in &coord_to_node {
+            let neighbor_coords = Neighbors::of(*coord);
+
+            for neighbor_coord in neighbor_coords {
+                if let Some(neighbor_id) = coord_to_node.get(&neighbor_coord) {
+                    // Create canonical edge (smaller ID first to avoid duplicates)
+                    let (from, to) = if node_id < neighbor_id {
+                        (node_id.clone(), neighbor_id.clone())
+                    } else {
+                        (neighbor_id.clone(), node_id.clone())
+                    };
+
+                    if !seen_edges.contains(&(from.clone(), to.clone())) {
+                        seen_edges.insert((from.clone(), to.clone()));
+
+                        // Look up latency stats from accountability tracker if available
+                        let latency_stats = mesh.latency_history
+                            .get(node_id)
+                            .and_then(|history| history.get(neighbor_id))
+                            .map(|h| h.compute_stats())
+                            .unwrap_or_default();
+
+                        let latency_ms = latency_stats.last_1s_ms.map(|v| v as u32);
+
+                        edges.push(PeerEdge {
+                            from,
+                            to,
+                            connection_type: "neighbor".to_string(),
+                            latency_ms,
+                            latency_stats,
+                            bidirectional: true,
+                        });
+                    }
+                }
             }
         }
     }
@@ -408,8 +443,8 @@ async fn get_network_map(
     })
 }
 
-/// Extract short ID from peer ID (strips "b3b3/" prefix, shows first 12 chars)
-fn short_peer_id(id: &str) -> String {
+/// Shorten a peer ID for display (first 12 chars of hash)
+pub fn short_peer_id(id: &str) -> String {
     let hash = id.strip_prefix("b3b3/").unwrap_or(id);
     hash.chars().take(12).collect()
 }
@@ -500,5 +535,221 @@ async fn get_mesh_state(
         peers,
         tgp_sessions: 0, // TODO: expose TGP session count
     })
+}
+
+// --- Import/Export endpoints ---
+
+/// Legacy Lens SDK v1 export format
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LegacyExport {
+    version: String,
+    export_date: String,
+    releases: Vec<LegacyRelease>,
+}
+
+/// Legacy release format from Lens SDK v1
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LegacyRelease {
+    id: String,
+    posted_by: Option<LegacyPublicKey>,
+    site_address: Option<String>,
+    name: String,
+    category_id: String,
+    category_slug: Option<String>,
+    content_cid: Option<String>,
+    thumbnail_cid: Option<String>,
+    metadata: Option<serde_json::Value>,
+}
+
+/// Legacy public key format (byte array object)
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LegacyPublicKey {
+    public_key: Option<HashMap<String, u8>>,
+}
+
+/// Convert legacy public key bytes to ed25519 format
+fn convert_legacy_public_key(legacy_key: &Option<LegacyPublicKey>) -> Option<String> {
+    legacy_key.as_ref().and_then(|lpk| {
+        lpk.public_key.as_ref().map(|key_map| {
+            let mut bytes = Vec::new();
+            for i in 0..32 {
+                if let Some(&byte) = key_map.get(&i.to_string()) {
+                    bytes.push(byte);
+                }
+            }
+            let hex: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
+            format!("ed25519p/{}", hex)
+        })
+    })
+}
+
+/// Export data format
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExportData {
+    version: String,
+    export_date: String,
+    releases: Vec<Release>,
+}
+
+/// Import request with public key for authentication
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ImportRequest {
+    public_key: String,
+    data: serde_json::Value,
+}
+
+/// Import response
+#[derive(Debug, Serialize)]
+struct ImportResponse {
+    success: bool,
+    imported: usize,
+    skipped: usize,
+    errors: Vec<String>,
+}
+
+/// POST /api/v1/import - Import releases from legacy format
+async fn import_releases(
+    State(state): State<AppState>,
+    Json(req): Json<ImportRequest>,
+) -> Result<Json<ImportResponse>, StatusCode> {
+    let state = state.read().await;
+
+    // Check if requester is admin
+    if !state.storage.is_admin(&req.public_key).unwrap_or(false) {
+        return Ok(Json(ImportResponse {
+            success: false,
+            imported: 0,
+            skipped: 0,
+            errors: vec!["Admin permission required for import".to_string()],
+        }));
+    }
+
+    let mut imported = 0;
+    let mut skipped = 0;
+    let mut errors = Vec::new();
+
+    // Try to parse as legacy format
+    match serde_json::from_value::<LegacyExport>(req.data.clone()) {
+        Ok(legacy_export) => {
+            tracing::info!(
+                "Importing {} releases from legacy format v{}",
+                legacy_export.releases.len(),
+                legacy_export.version
+            );
+
+            for legacy_release in legacy_export.releases {
+                // Check if release already exists
+                if state.storage.get_release(&legacy_release.id).ok().flatten().is_some() {
+                    tracing::debug!("Skipping existing release: {}", legacy_release.id);
+                    skipped += 1;
+                    continue;
+                }
+
+                // Convert to new format
+                let creator = convert_legacy_public_key(&legacy_release.posted_by);
+
+                let mut release = Release::new(
+                    legacy_release.id.clone(),
+                    legacy_release.name,
+                    legacy_release.category_slug.unwrap_or(legacy_release.category_id),
+                );
+                release.creator = creator;
+                release.thumbnail_cid = legacy_release.thumbnail_cid;
+
+                // Extract metadata fields if available
+                if let Some(metadata) = &legacy_release.metadata {
+                    if let Some(year) = metadata.get("year").and_then(|y| y.as_u64()) {
+                        release.year = Some(year as u32);
+                    }
+                    if let Some(desc) = metadata.get("description").and_then(|d| d.as_str()) {
+                        release.description = Some(desc.to_string());
+                    }
+                }
+
+                // Save release
+                if let Err(e) = state.storage.put_release(&release) {
+                    errors.push(format!("Failed to save release {}: {}", legacy_release.id, e));
+                    continue;
+                }
+
+                imported += 1;
+            }
+
+            tracing::info!("Import complete: {} imported, {} skipped", imported, skipped);
+        }
+        Err(e) => {
+            let error_msg = format!("Failed to parse import data: {}", e);
+            tracing::error!("{}", error_msg);
+            errors.push(error_msg);
+        }
+    }
+
+    Ok(Json(ImportResponse {
+        success: errors.is_empty(),
+        imported,
+        skipped,
+        errors,
+    }))
+}
+
+/// GET /api/v1/export - Export all releases
+async fn export_releases(
+    State(state): State<AppState>,
+) -> Result<Json<ExportData>, StatusCode> {
+    let state = state.read().await;
+
+    let releases = state.storage
+        .list_releases()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    tracing::info!("Exporting {} releases", releases.len());
+
+    Ok(Json(ExportData {
+        version: "2.0".to_string(),
+        export_date: chrono::Utc::now().to_rfc3339(),
+        releases,
+    }))
+}
+
+/// Delete all releases request
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DeleteAllRequest {
+    public_key: String,
+}
+
+/// DELETE /api/v1/admin/releases - Delete ALL releases
+async fn delete_all_releases(
+    State(state): State<AppState>,
+    Json(req): Json<DeleteAllRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let state = state.read().await;
+
+    // Check if requester is admin
+    if !state.storage.is_admin(&req.public_key).unwrap_or(false) {
+        return Ok(Json(serde_json::json!({
+            "success": false,
+            "error": "Admin permission required"
+        })));
+    }
+
+    match state.storage.delete_all_releases() {
+        Ok(count) => {
+            tracing::warn!("Deleted {} releases by admin {}", count, req.public_key);
+            Ok(Json(serde_json::json!({
+                "success": true,
+                "deleted": count
+            })))
+        }
+        Err(e) => {
+            tracing::error!("Failed to delete releases: {}", e);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
 }
 

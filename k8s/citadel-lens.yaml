@@ -1,0 +1,113 @@
+---
+# Citadel Lens Mesh Deployment
+# Deploy: kubectl apply -f citadel-500.yaml
+# Scale:  kubectl scale deployment citadel-mesh --replicas=500
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: citadel
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: citadel-mesh
+  namespace: citadel
+spec:
+  clusterIP: None  # Headless for peer discovery
+  selector:
+    app: citadel-lens
+  ports:
+    - name: api
+      port: 8080
+      targetPort: 8080
+    - name: p2p-tcp
+      port: 9000
+      targetPort: 9000
+    - name: p2p-udp
+      port: 9000
+      targetPort: 9000
+      protocol: UDP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: citadel-mesh
+  namespace: citadel
+  labels:
+    app: citadel-lens
+spec:
+  replicas: 100
+  selector:
+    matchLabels:
+      app: citadel-lens
+  template:
+    metadata:
+      labels:
+        app: citadel-lens
+    spec:
+      terminationGracePeriodSeconds: 10
+      containers:
+        - name: lens-node
+          image: riffcc/lens-node:v0.1.15
+          ports:
+            - containerPort: 8080
+              name: api
+            - containerPort: 9000
+              name: p2p-tcp
+            - containerPort: 9000
+              name: p2p-udp
+              protocol: UDP
+          env:
+            - name: LENS_DATA_DIR
+              value: /data
+            - name: LENS_API_BIND
+              value: "0.0.0.0:8080"
+            - name: LENS_P2P_BIND
+              value: "0.0.0.0:9000"
+            - name: CITADEL_PEERS
+              value: "109.224.228.70:9000"
+            - name: ADMIN_PUBLIC_KEY
+              value: "ed25519p/4ca9ba8ac59d18a276bafd50a74a2b6ed83bd6d8a0066825b1eb9f98b3bcaa3a,ed25519p/b0955a489fc59c5e2eb3b3d01f908a4f56c1b9be6f42fbfdbf65459a1b3fe147"
+            - name: RUST_LOG
+              value: "citadel_lens=info,citadel_protocols=info"
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 20
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+# Optional: Expose one node for external API access
+apiVersion: v1
+kind: Service
+metadata:
+  name: citadel-api
+  namespace: citadel
+spec:
+  type: ClusterIP
+  selector:
+    app: citadel-lens
+  ports:
+    - name: api
+      port: 8080
+      targetPort: 8080
