@@ -38,7 +38,7 @@ pub const fn validation_threshold(existing_neighbors: usize) -> usize {
         return 0;
     }
     // ceil(n * 11 / 20) = (n * 11 + 19) / 20
-    (existing_neighbors * FULL_THRESHOLD + MAX_NEIGHBORS - 1) / MAX_NEIGHBORS
+    (existing_neighbors * FULL_THRESHOLD).div_ceil(MAX_NEIGHBORS)
 }
 
 /// Check if a connection count meets the threshold.
@@ -48,12 +48,7 @@ pub const fn meets_threshold(connections: usize, existing_neighbors: usize) -> b
 
 /// Calculate how many more connections are needed to meet threshold.
 pub const fn connections_needed(current: usize, existing_neighbors: usize) -> usize {
-    let threshold = validation_threshold(existing_neighbors);
-    if current >= threshold {
-        0
-    } else {
-        threshold - current
-    }
+    validation_threshold(existing_neighbors).saturating_sub(current)
 }
 
 #[cfg(test)]

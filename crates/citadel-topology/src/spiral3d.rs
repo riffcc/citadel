@@ -170,7 +170,7 @@ pub fn spiral3d_to_coord(index: Spiral3DIndex) -> HexCoord {
         let z = if z_index == 0 {
             0
         } else {
-            let half = (z_index + 1) / 2;
+            let half = z_index.div_ceil(2);
             if z_index % 2 == 1 {
                 half as i64
             } else {
@@ -204,7 +204,7 @@ pub fn coord_to_spiral3d(coord: HexCoord) -> Spiral3DIndex {
         return Spiral3DIndex::ORIGIN;
     }
 
-    let hex_dist = coord.hex_distance(&HexCoord::new(0, 0, coord.z)) as u64;
+    let hex_dist = coord.hex_distance(&HexCoord::new(0, 0, coord.z));
     let abs_z = coord.z.unsigned_abs();
     let shell = hex_dist.max(abs_z);
 
@@ -354,7 +354,7 @@ fn coord_to_disk_offset(max_ring: u64, coord: HexCoord) -> u64 {
         return 0;
     }
 
-    let ring = coord.hex_distance(&HexCoord::ORIGIN) as u64;
+    let ring = coord.hex_distance(&HexCoord::ORIGIN);
     assert!(ring <= max_ring, "Coordinate ring {} exceeds max {}", ring, max_ring);
 
     let base = if ring > 0 {

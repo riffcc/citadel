@@ -379,7 +379,7 @@ impl Renderer {
         }
 
         // Create or recreate buffer if needed
-        let buffer_size = (vertices.len() * std::mem::size_of::<LineVertex>()) as u64;
+        let buffer_size = std::mem::size_of_val(vertices) as u64;
         let needs_new_buffer = self.line_buffer.as_ref().map_or(true, |b| b.size() < buffer_size);
 
         if needs_new_buffer {
@@ -405,7 +405,7 @@ impl Renderer {
             return;
         }
 
-        let buffer_size = (vertices.len() * std::mem::size_of::<LineVertex>()) as u64;
+        let buffer_size = std::mem::size_of_val(vertices) as u64;
         let needs_new_buffer = self.traffic_point_buffer.as_ref().map_or(true, |b| b.size() < buffer_size);
 
         if needs_new_buffer {

@@ -116,11 +116,7 @@ pub const fn max_toward_n_bindings() -> usize {
 /// - 9 < 11 (threshold)
 /// - Therefore Y cannot occupy N
 pub const fn max_remaining_bindings_after(occupied_bindings: usize) -> usize {
-    if occupied_bindings > MAX_NEIGHBORS {
-        0
-    } else {
-        MAX_NEIGHBORS - occupied_bindings
-    }
+    MAX_NEIGHBORS.saturating_sub(occupied_bindings)
 }
 
 /// Check if exclusivity is violated (impossible if protocol followed).

@@ -200,7 +200,7 @@ impl SporeSync {
 
         // Find content blocks that fall within the to_send ranges
         self.pending_send.clear();
-        for (hash, _block) in &self.content {
+        for hash in self.content.keys() {
             let hash_u256 = U256::from_be_bytes(hash);
             if to_send.covers(&hash_u256) {
                 self.pending_send.push(*hash);
@@ -352,7 +352,7 @@ impl SporeSyncManager {
         self.peers.entry(peer_id).or_insert_with(|| {
             let mut sync = SporeSync::new(self.peer_id);
             // Copy existing content to new peer sync
-            for (_, block) in &self.content {
+            for block in self.content.values() {
                 sync.add_content(block.clone());
             }
             sync
