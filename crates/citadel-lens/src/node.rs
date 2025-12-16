@@ -121,10 +121,18 @@ impl LensNode {
         // Initialize default categories
         storage.init_default_categories()?;
 
-        // Set initial admin public key if provided via env var
-        if let Some(ref admin_key) = config.admin_public_key {
-            storage.set_admin(admin_key, true)?;
-            tracing::info!("Admin public key set: {}", admin_key);
+        // Set initial admin public key(s) if provided via env var
+        // Supports comma-separated list and optional ed25519p/ prefix
+        if let Some(ref admin_keys) = config.admin_public_key {
+            for key in admin_keys.split(',') {
+                let key = key.trim();
+                // Strip optional ed25519p/ prefix
+                let key = key.strip_prefix("ed25519p/").unwrap_or(key);
+                if !key.is_empty() {
+                    storage.set_admin(key, true)?;
+                    tracing::info!("Admin public key set: {}", key);
+                }
+            }
         }
 
         let state = Arc::new(RwLock::new(LensState {

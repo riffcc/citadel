@@ -1,0 +1,30 @@
+# Citadel Lens Node - Local Binary Dockerfile
+# Uses pre-built binaries from host instead of building in container
+
+FROM debian:trixie-slim
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libssl3 \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user
+RUN useradd -m -u 1000 lens
+
+# Copy pre-built binaries from host
+COPY target/release/lens-node /usr/local/bin/
+COPY target/release/lens-admin /usr/local/bin/
+
+# Create data directory
+RUN mkdir -p /data && chown lens:lens /data
+
+USER lens
+WORKDIR /data
+
+ENV LENS_DATA_DIR=/data
+ENV RUST_LOG=lens_node=info,citadel_lens=info
+
+EXPOSE 8080 9000 9000/udp
+
+CMD ["lens-node"]
