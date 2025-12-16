@@ -7,6 +7,7 @@
 //! - [`Release`] - Legacy model for albums, movies, TV series, etc.
 //! - [`ContentItem`] - Universal content item supporting all content types
 //! - [`Category`] - Content categorization
+//! - [`FeaturedRelease`] - Promotional featured content entries
 //!
 //! # Supporting Types
 //!
@@ -24,12 +25,14 @@
 mod category;
 mod content_item;
 mod content_types;
+mod featured_release;
 mod metadata;
 mod release;
 
 pub use category::Category;
 pub use content_item::ContentItem;
 pub use content_types::{ContentType, Creator, CreatorRole, License, Resource};
+pub use featured_release::FeaturedRelease;
 pub use metadata::{
     DataCiteCreator, DataCiteResourceType, DataCiteTitle, MetadataContainer, NameIdentifier,
     StandardMetadata,

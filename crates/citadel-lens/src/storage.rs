@@ -1,7 +1,7 @@
 //! Persistent storage using RocksDB.
 
 use crate::error::Result;
-use crate::models::{Category, ContentItem, Release};
+use crate::models::{Category, ContentItem, FeaturedRelease, Release};
 use ed25519_dalek::SigningKey;
 use rocksdb::{Options, DB};
 use std::path::Path;
@@ -244,6 +244,57 @@ impl Storage {
             self.db.put(key, signing_key.as_bytes())?;
             Ok(signing_key)
         }
+    }
+
+    // --- Featured Releases ---
+
+    /// Store a featured release.
+    pub fn put_featured_release(&self, featured: &FeaturedRelease) -> Result<()> {
+        let key = format!("featured:{}", featured.id);
+        let value = serde_json::to_vec(featured)?;
+        self.db.put(key.as_bytes(), value)?;
+        Ok(())
+    }
+
+    /// Get a featured release by ID.
+    pub fn get_featured_release(&self, id: &str) -> Result<Option<FeaturedRelease>> {
+        let key = format!("featured:{}", id);
+        match self.db.get(key.as_bytes())? {
+            Some(data) => Ok(Some(serde_json::from_slice(&data)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Delete a featured release.
+    pub fn delete_featured_release(&self, id: &str) -> Result<()> {
+        let key = format!("featured:{}", id);
+        self.db.delete(key.as_bytes())?;
+        Ok(())
+    }
+
+    /// List all featured releases.
+    pub fn list_featured_releases(&self) -> Result<Vec<FeaturedRelease>> {
+        let prefix = b"featured:";
+        let mut featured = Vec::new();
+
+        let iter = self.db.prefix_iterator(prefix);
+        for item in iter {
+            let (key, value) = item?;
+            if key.starts_with(prefix) {
+                let fr: FeaturedRelease = serde_json::from_slice(&value)?;
+                featured.push(fr);
+            } else {
+                break;
+            }
+        }
+
+        Ok(featured)
+    }
+
+    /// List only active featured releases (within time window).
+    pub fn list_active_featured_releases(&self) -> Result<Vec<FeaturedRelease>> {
+        let all = self.list_featured_releases()?;
+        Ok(all.into_iter().filter(|fr| fr.is_active()).collect())
     }
 }
 

@@ -1,7 +1,7 @@
 //! HTTP API for Lens.
 
 use crate::mesh::{double_hash_id, FloodMessage};
-use crate::models::{Category, Release};
+use crate::models::{Category, FeaturedRelease, Release};
 use crate::node::LensState;
 use crate::ws::ws_mesh_handler;
 use axum::{
@@ -45,6 +45,11 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/content-categories/:id", delete(delete_category))
         // Featured releases (for flagship home page)
         .route("/api/v1/featured-releases", get(list_featured_releases))
+        // Admin: Featured releases management
+        .route("/api/v1/admin/featured-releases", post(create_featured_release))
+        .route("/api/v1/admin/featured-releases/:id", get(get_featured_release))
+        .route("/api/v1/admin/featured-releases/:id", put(update_featured_release))
+        .route("/api/v1/admin/featured-releases/:id", delete(delete_featured_release))
         // Account (identity management)
         .route("/api/v1/account/:public_key", get(get_account))
         // Network mesh topology map
@@ -408,19 +413,170 @@ async fn delete_category(
 
 // --- Featured releases endpoints ---
 
+/// List all featured releases (returns all, client filters by time)
 async fn list_featured_releases(
     State(state): State<AppState>,
-) -> Result<Json<Vec<Release>>, StatusCode> {
+) -> Result<Json<Vec<FeaturedRelease>>, StatusCode> {
     let state = state.read().await;
-    // For now, featured releases are just the most recent releases
-    let releases = state
+    let featured = state
         .storage
-        .list_releases()
+        .list_featured_releases()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(featured))
+}
+
+/// Get a single featured release by ID
+async fn get_featured_release(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<FeaturedRelease>, StatusCode> {
+    let state = state.read().await;
+    state
+        .storage
+        .get_featured_release(&id)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .into_iter()
-        .map(|r| r.with_defaults())
-        .collect();
-    Ok(Json(releases))
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
+/// Request body for creating/updating a featured release
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FeaturedReleaseRequest {
+    release_id: String,
+    start_time: String,
+    end_time: String,
+    #[serde(default)]
+    promoted: bool,
+    #[serde(default = "default_priority")]
+    priority: u32,
+    #[serde(default)]
+    order: u32,
+    custom_title: Option<String>,
+    custom_description: Option<String>,
+    custom_thumbnail: Option<String>,
+    #[serde(default)]
+    regions: Vec<String>,
+    #[serde(default)]
+    languages: Vec<String>,
+    #[serde(default)]
+    tags: Vec<String>,
+    variant: Option<String>,
+    metadata: Option<serde_json::Value>,
+}
+
+fn default_priority() -> u32 {
+    500
+}
+
+/// Create a new featured release (admin only)
+async fn create_featured_release(
+    State(state): State<AppState>,
+    Json(req): Json<FeaturedReleaseRequest>,
+) -> Result<(StatusCode, Json<FeaturedRelease>), StatusCode> {
+    // Verify the release exists
+    {
+        let state = state.read().await;
+        if state.storage.get_release(&req.release_id).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?.is_none() {
+            return Err(StatusCode::BAD_REQUEST); // Release doesn't exist
+        }
+    }
+
+    let id = FeaturedRelease::generate_id();
+    let mut featured = FeaturedRelease::new(
+        id,
+        req.release_id,
+        req.start_time,
+        req.end_time,
+    );
+
+    // Apply optional fields
+    featured.promoted = req.promoted;
+    featured.priority = req.priority;
+    featured.order = req.order;
+    featured.custom_title = req.custom_title;
+    featured.custom_description = req.custom_description;
+    featured.custom_thumbnail = req.custom_thumbnail;
+    featured.regions = req.regions;
+    featured.languages = req.languages;
+    featured.tags = req.tags;
+    featured.variant = req.variant;
+    featured.metadata = req.metadata;
+
+    let state = state.read().await;
+    state
+        .storage
+        .put_featured_release(&featured)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok((StatusCode::CREATED, Json(featured)))
+}
+
+/// Update an existing featured release (admin only)
+async fn update_featured_release(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<FeaturedReleaseRequest>,
+) -> Result<Json<FeaturedRelease>, StatusCode> {
+    let state = state.read().await;
+
+    // Get existing featured release
+    let mut featured = state
+        .storage
+        .get_featured_release(&id)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    // Verify the release exists if changing releaseId
+    if featured.release_id != req.release_id {
+        if state.storage.get_release(&req.release_id).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?.is_none() {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    }
+
+    // Update fields
+    featured.release_id = req.release_id;
+    featured.start_time = req.start_time;
+    featured.end_time = req.end_time;
+    featured.promoted = req.promoted;
+    featured.priority = req.priority;
+    featured.order = req.order;
+    featured.custom_title = req.custom_title;
+    featured.custom_description = req.custom_description;
+    featured.custom_thumbnail = req.custom_thumbnail;
+    featured.regions = req.regions;
+    featured.languages = req.languages;
+    featured.tags = req.tags;
+    featured.variant = req.variant;
+    featured.metadata = req.metadata;
+
+    state
+        .storage
+        .put_featured_release(&featured)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(featured))
+}
+
+/// Delete a featured release (admin only)
+async fn delete_featured_release(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> StatusCode {
+    let state = state.read().await;
+
+    // Check if exists
+    match state.storage.get_featured_release(&id) {
+        Ok(Some(_)) => {
+            if state.storage.delete_featured_release(&id).is_ok() {
+                StatusCode::NO_CONTENT
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+        }
+        Ok(None) => StatusCode::NOT_FOUND,
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
 }
 
 // --- Account endpoints ---
