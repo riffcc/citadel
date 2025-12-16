@@ -150,6 +150,20 @@ async fn create_release(
         .as_millis());
     let id = Release::generate_id(content.as_bytes());
 
+    // BadBits: Check if this release is on the permanent blocklist
+    // (DMCA, abuse material, illegal content - prevents re-upload)
+    {
+        let state = state.read().await;
+        if let Some(ref mesh_state) = state.mesh_state {
+            let mesh = mesh_state.read().await;
+            let release_hash = double_hash_id(&id);
+            if mesh.bad_bits.contains(&release_hash) {
+                tracing::warn!("BadBits: Rejected upload of blocked content (hash matches blocklist)");
+                return Err(StatusCode::FORBIDDEN);
+            }
+        }
+    }
+
     let mut release = Release::new(id, req.title, req.category_id);
     release.creator = req.creator;
     release.year = req.year;

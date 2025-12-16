@@ -349,5 +349,7 @@ pub fn flood_to_event(msg: FloodMessage) -> Option<MeshEvent> {
         FloodMessage::Release { .. } => None,
         FloodMessage::DoNotWantList { .. } => None,
         FloodMessage::ErasureConfirmation { .. } => None,
+        // BadBits - internal moderation, not exposed to WebSocket
+        FloodMessage::BadBits { .. } => None,
     }
 }

@@ -385,6 +385,12 @@ pub struct MeshState {
     /// SPORE: Peers' erasure sync status (peer_id -> their_erasure_xor_with_ours == 0)
     /// When all peers are erasure_synced, we can garbage collect tombstones
     pub erasure_synced: HashMap<String, bool>,
+    /// BadBits: PERMANENT blocklist of double-hashed CIDs H(H(cid))
+    /// Unlike DoNotWantList (GDPR - GC'd after erasure), BadBits are forever
+    /// Used for: copyright violations (DMCA), abuse material, illegal content
+    /// Checked on upload - matching CIDs are rejected before storage
+    /// Can sync from external sources like https://badbits.dwebops.pub/
+    pub bad_bits: HashSet<[u8; 32]>,
     // NOTE: tgp_sessions moved to MeshService for contention-free access
 }
 
@@ -558,6 +564,11 @@ pub enum FloodMessage {
     /// SPORE: ErasureConfirmation - bilateral proof that a node has deleted content
     /// Used for GDPR-compliant "right to erasure" with cryptographic proof
     ErasureConfirmation { peer_id: String, tombstones: Vec<[u8; 32]> },
+    /// BadBits: PERMANENT blocklist of double-hashed CIDs H(H(cid))
+    /// Unlike DoNotWantList (GDPR), BadBits prevent future uploads forever
+    /// For: copyright violations, abuse material, illegal content
+    /// See: https://badbits.dwebops.pub/
+    BadBits { double_hashes: Vec<[u8; 32]> },
 }
 
 /// Citadel Mesh Service
@@ -652,6 +663,7 @@ impl MeshService {
                 do_not_want: HashSet::new(),  // SPORE: DoNotWantList for deletion sync
                 erasure_confirmed: HashSet::new(),  // SPORE: ErasureConfirmed for GDPR compliance
                 erasure_synced: HashMap::new(),  // SPORE: Peer erasure sync status
+                bad_bits: HashSet::new(),  // BadBits: permanent blocklist (DMCA, abuse, illegal)
             })),
             // Separate lock for TGP sessions - contention-free TGP operations
             tgp_sessions: Arc::new(RwLock::new(HashMap::new())),
@@ -2071,6 +2083,24 @@ impl MeshService {
             }
         }
 
+        // BadBits: Send PERMANENT blocklist (DMCA, abuse material, illegal content)
+        // Unlike GDPR tombstones, BadBits are never garbage collected
+        {
+            let state = self.state.read().await;
+            if !state.bad_bits.is_empty() {
+                let bad_bits_hex: Vec<String> = state.bad_bits.iter()
+                    .map(|h| hex::encode(h))
+                    .collect();
+                let bad_bits_msg = serde_json::json!({
+                    "type": "bad_bits",
+                    "double_hashes": bad_bits_hex,
+                });
+                writer.write_all(bad_bits_msg.to_string().as_bytes()).await?;
+                writer.write_all(b"\n").await?;
+                debug!("Sent BadBits with {} entries to peer {}", bad_bits_hex.len(), peer_id);
+            }
+        }
+
         // CVDF chain sync: Send our chain state so peer can adopt heavier chain
         // CRITICAL: This enables swarm merge during initial connection
         if let Some((rounds, slots)) = self.cvdf_chain_state().await {
@@ -2448,6 +2478,18 @@ impl MeshService {
                                 "type": "erasure_confirmation",
                                 "peer_id": peer_id,
                                 "tombstones": tombstones_hex,
+                            });
+                            let _ = writer.write_all(flood_msg.to_string().as_bytes()).await;
+                            let _ = writer.write_all(b"\n").await;
+                        }
+                        Ok(FloodMessage::BadBits { double_hashes }) => {
+                            // BadBits: PERMANENT blocklist (DMCA, abuse, illegal content)
+                            let hashes_hex: Vec<String> = double_hashes.iter()
+                                .map(|h| hex::encode(h))
+                                .collect();
+                            let flood_msg = serde_json::json!({
+                                "type": "bad_bits",
+                                "double_hashes": hashes_hex,
                             });
                             let _ = writer.write_all(flood_msg.to_string().as_bytes()).await;
                             let _ = writer.write_all(b"\n").await;
@@ -3358,6 +3400,55 @@ impl MeshService {
                             state.erasure_synced.clear();
                             info!("SPORE: GDPR erasure complete - garbage collected {} tombstones", gc_count);
                         }
+                    }
+                }
+            }
+            "bad_bits" => {
+                // BadBits: PERMANENT blocklist (DMCA, abuse material, illegal content)
+                // Unlike DoNotWantList (GDPR), these are NEVER garbage collected
+                // Also deletes any matching content we currently have
+                if let Some(hashes) = msg.get("double_hashes").and_then(|h| h.as_array()) {
+                    let mut state = self.state.write().await;
+                    let mut new_bad_bits = Vec::new();
+
+                    for hash_val in hashes {
+                        if let Some(hash_hex) = hash_val.as_str() {
+                            if let Ok(hash_bytes) = hex::decode(hash_hex) {
+                                if hash_bytes.len() == 32 {
+                                    let mut bad_bit = [0u8; 32];
+                                    bad_bit.copy_from_slice(&hash_bytes);
+                                    if state.bad_bits.insert(bad_bit) {
+                                        new_bad_bits.push(bad_bit);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if !new_bad_bits.is_empty() {
+                        info!("BadBits: Added {} new entries from peer {}", new_bad_bits.len(), peer_id);
+
+                        // Delete any releases that match new bad bits
+                        let self_id = state.self_id.clone();
+                        drop(state); // Release lock before storage operations
+
+                        if let Ok(releases) = self.storage.list_releases() {
+                            for release in releases {
+                                let release_hash = double_hash_id(&release.id);
+                                if new_bad_bits.contains(&release_hash) {
+                                    if let Err(e) = self.storage.delete_release(&release.id) {
+                                        warn!("BadBits: Failed to delete blocked release {}: {}", release.id, e);
+                                    } else {
+                                        info!("BadBits: Deleted blocked release {}", release.id);
+                                    }
+                                }
+                            }
+                        }
+
+                        // Re-flood the bad bits to propagate through mesh
+                        self.flood(FloodMessage::BadBits {
+                            double_hashes: new_bad_bits,
+                        });
                     }
                 }
             }
