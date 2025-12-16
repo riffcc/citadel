@@ -1280,20 +1280,50 @@ impl MeshService {
         }
     }
 
+    /// Extract the sender's public key from a TGP message payload.
+    /// The sender's commitment is always in the `own_*` field.
+    fn extract_sender_pubkey(msg: &TgpMessage) -> Option<[u8; 32]> {
+        match &msg.payload {
+            MessagePayload::Commitment(c) => Some(*c.public_key.as_bytes()),
+            MessagePayload::DoubleProof(d) => Some(*d.own_commitment.public_key.as_bytes()),
+            MessagePayload::TripleProof(t) => Some(*t.own_double.own_commitment.public_key.as_bytes()),
+            MessagePayload::QuadProof(q) => Some(*q.own_triple.own_double.own_commitment.public_key.as_bytes()),
+        }
+    }
+
     /// Handle incoming TGP message from UDP.
     /// Returns the peer_id if message was processed (for sending response).
     /// Uses symmetric TGP - party roles determined by public key comparison.
     async fn handle_tgp_message(&self, src_addr: SocketAddr, msg: TgpMessage) -> Option<String> {
-        // Find peer by address (brief state read lock)
+        // Extract sender's public key from the message itself (cryptographically authenticated)
+        let sender_pubkey = Self::extract_sender_pubkey(&msg)?;
+
+        // Find peer by public key (not by IP - multiple peers may share localhost IP)
         let (peer_id, my_keypair, counterparty_key) = {
             let state = self.state.read().await;
 
+            // Match by public key extracted from the TGP message (primary method)
             let peer = state.peers.iter()
-                .find(|(_, p)| p.addr.ip() == src_addr.ip());
+                .find(|(_, p)| {
+                    p.public_key.as_ref()
+                        .map(|pk| pk.as_slice() == sender_pubkey.as_slice())
+                        .unwrap_or(false)
+                });
 
-            let Some((id, peer)) = peer else {
-                info!("TGP: No peer found with IP {} - {} peers known", src_addr.ip(), state.peers.len());
-                return None;
+            // If pubkey match fails, fall back to full socket address match
+            let (id, peer) = match peer {
+                Some(found) => found,
+                None => {
+                    // Fallback: try matching by full socket address (IP + port)
+                    match state.peers.iter().find(|(_, p)| p.addr == src_addr) {
+                        Some(found) => found,
+                        None => {
+                            info!("TGP: No peer found with pubkey {} or addr {} - {} peers known",
+                                  hex::encode(&sender_pubkey[..6]), src_addr, state.peers.len());
+                            return None;
+                        }
+                    }
+                }
             };
 
             let Some(pubkey_bytes) = peer.public_key.as_ref() else {
@@ -1312,7 +1342,7 @@ impl MeshService {
             };
 
             let keypair = (*state.tgp_keypair).clone();
-            debug!("Found peer {} for TGP from {}", id, src_addr);
+            debug!("Found peer {} for TGP from {} (matched by pubkey)", id, src_addr);
             (id.clone(), keypair, counterparty)
         };
 
