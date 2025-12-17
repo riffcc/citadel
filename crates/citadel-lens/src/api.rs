@@ -5,16 +5,112 @@ use crate::models::{Category, FeaturedRelease, Release};
 use crate::node::LensState;
 use crate::ws::ws_mesh_handler;
 use axum::{
+    body::Bytes,
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     routing::{delete, get, post, put},
     Json, Router,
 };
+use ed25519_dalek::{Signature, VerifyingKey, Verifier};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tower_http::cors::{Any, CorsLayer};
+
+// ============================================================================
+// SIGNED REQUEST AUTHENTICATION
+// ============================================================================
+// All write endpoints require:
+// 1. A valid ed25519 public key (in "ed25519p/{hex}" format)
+// 2. A signature over the request body
+// 3. The public key must be in the admin list
+//
+// The signature must be over the exact JSON body bytes sent in the request.
+// This prevents replay attacks and ensures only the key holder can make writes.
+// ============================================================================
+
+/// Verify an ed25519 signature over a message.
+///
+/// # Arguments
+/// * `public_key` - The public key in "ed25519p/{hex}" format
+/// * `message` - The message that was signed (the request body)
+/// * `signature_hex` - The signature in hex format
+///
+/// # Returns
+/// * `Ok(())` if the signature is valid
+/// * `Err(String)` with an error message if verification fails
+fn verify_signature(public_key: &str, message: &[u8], signature_hex: &str) -> Result<(), String> {
+    // Parse public key (format: "ed25519p/{hex}")
+    let key_hex = public_key
+        .strip_prefix("ed25519p/")
+        .ok_or_else(|| "Invalid public key format: must start with 'ed25519p/'")?;
+
+    let key_bytes = hex::decode(key_hex)
+        .map_err(|e| format!("Invalid public key hex: {}", e))?;
+
+    if key_bytes.len() != 32 {
+        return Err(format!("Invalid public key length: expected 32 bytes, got {}", key_bytes.len()));
+    }
+
+    let key_array: [u8; 32] = key_bytes.try_into()
+        .map_err(|_| "Failed to convert public key to array")?;
+
+    let verifying_key = VerifyingKey::from_bytes(&key_array)
+        .map_err(|e| format!("Invalid public key: {}", e))?;
+
+    // Parse signature
+    let sig_bytes = hex::decode(signature_hex)
+        .map_err(|e| format!("Invalid signature hex: {}", e))?;
+
+    if sig_bytes.len() != 64 {
+        return Err(format!("Invalid signature length: expected 64 bytes, got {}", sig_bytes.len()));
+    }
+
+    let sig_array: [u8; 64] = sig_bytes.try_into()
+        .map_err(|_| "Failed to convert signature to array")?;
+
+    let signature = Signature::from_bytes(&sig_array);
+
+    // Verify
+    verifying_key.verify(message, &signature)
+        .map_err(|e| format!("Signature verification failed: {}", e))?;
+
+    Ok(())
+}
+
+/// Helper to check if a request is properly signed by an admin.
+///
+/// This is the main authentication function for write endpoints.
+/// It verifies:
+/// 1. The signature is valid for the given public key and message
+/// 2. The public key is in the admin list
+///
+/// # Arguments
+/// * `storage` - The storage backend to check admin status
+/// * `public_key` - The public key claiming to sign the request
+/// * `signature` - The hex-encoded signature
+/// * `body` - The request body bytes that were signed
+///
+/// # Returns
+/// * `Ok(())` if authenticated as admin
+/// * `Err(String)` with error message if not
+fn require_admin_signature(
+    storage: &crate::storage::Storage,
+    public_key: &str,
+    signature: &str,
+    body: &[u8],
+) -> Result<(), String> {
+    // First verify the signature
+    verify_signature(public_key, body, signature)?;
+
+    // Then check if the key is an admin
+    if !storage.is_admin(public_key).unwrap_or(false) {
+        return Err(format!("Public key {} is not an admin", public_key));
+    }
+
+    Ok(())
+}
 
 type AppState = Arc<RwLock<LensState>>;
 
@@ -167,8 +263,41 @@ struct CreateReleaseRequest {
 
 async fn create_release(
     State(state): State<AppState>,
-    Json(req): Json<CreateReleaseRequest>,
-) -> Result<(StatusCode, Json<Release>), StatusCode> {
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<(StatusCode, Json<Release>), (StatusCode, Json<serde_json::Value>)> {
+    // Extract authentication headers
+    let public_key = headers
+        .get("X-Public-Key")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
+            "error": "Missing X-Public-Key header"
+        }))))?;
+
+    let signature = headers
+        .get("X-Signature")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
+            "error": "Missing X-Signature header"
+        }))))?;
+
+    // Verify signature and admin status
+    {
+        let state = state.read().await;
+        if let Err(e) = require_admin_signature(&state.storage, public_key, signature, &body) {
+            tracing::warn!("Auth failed for create_release: {}", e);
+            return Err((StatusCode::FORBIDDEN, Json(serde_json::json!({
+                "error": e
+            }))));
+        }
+    }
+
+    // Parse the request body
+    let req: CreateReleaseRequest = serde_json::from_slice(&body)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": format!("Invalid request body: {}", e)
+        }))))?;
+
     // Generate ID from name + timestamp
     let content = format!("{}:{}", req.name, std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -185,7 +314,9 @@ async fn create_release(
             let release_hash = double_hash_id(&id);
             if mesh.bad_bits.contains(&release_hash) {
                 tracing::warn!("BadBits: Rejected upload of blocked content (hash matches blocklist)");
-                return Err(StatusCode::FORBIDDEN);
+                return Err((StatusCode::FORBIDDEN, Json(serde_json::json!({
+                    "error": "Content is on blocklist"
+                }))));
             }
         }
     }
@@ -203,7 +334,9 @@ async fn create_release(
     state
         .storage
         .put_release(&release)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": "Failed to save release"
+        }))))?;
 
     // SPORE: Flood the release to propagate across mesh
     if let Some(ref flood_tx) = state.flood_tx {
@@ -272,15 +405,52 @@ struct UpdateReleaseRequest {
 async fn update_release(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    Json(req): Json<UpdateReleaseRequest>,
-) -> Result<Json<Release>, StatusCode> {
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<Release>, (StatusCode, Json<serde_json::Value>)> {
+    // Extract authentication headers
+    let public_key = headers
+        .get("X-Public-Key")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
+            "error": "Missing X-Public-Key header"
+        }))))?;
+
+    let signature = headers
+        .get("X-Signature")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
+            "error": "Missing X-Signature header"
+        }))))?;
+
+    // Verify signature and admin status
+    {
+        let state = state.read().await;
+        if let Err(e) = require_admin_signature(&state.storage, public_key, signature, &body) {
+            tracing::warn!("Auth failed for update_release: {}", e);
+            return Err((StatusCode::FORBIDDEN, Json(serde_json::json!({
+                "error": e
+            }))));
+        }
+    }
+
+    // Parse the request body
+    let req: UpdateReleaseRequest = serde_json::from_slice(&body)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": format!("Invalid request body: {}", e)
+        }))))?;
+
     let state = state.read().await;
 
     // Get existing release
     let mut release = match state.storage.get_release(&id) {
         Ok(Some(r)) => r,
-        Ok(None) => return Err(StatusCode::NOT_FOUND),
-        Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
+        Ok(None) => return Err((StatusCode::NOT_FOUND, Json(serde_json::json!({
+            "error": "Release not found"
+        })))),
+        Err(_) => return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": "Failed to get release"
+        })))),
     };
 
     // Update fields if provided
@@ -332,7 +502,9 @@ async fn update_release(
     state
         .storage
         .put_release(&release)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": "Failed to save release"
+        }))))?;
 
     // SPORE: Flood the updated release to propagate across mesh
     if let Some(ref flood_tx) = state.flood_tx {
@@ -348,12 +520,44 @@ async fn update_release(
 async fn delete_release(
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> StatusCode {
+    headers: HeaderMap,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    // Extract authentication headers
+    let public_key = headers
+        .get("X-Public-Key")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
+            "error": "Missing X-Public-Key header"
+        }))))?;
+
+    let signature = headers
+        .get("X-Signature")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
+            "error": "Missing X-Signature header"
+        }))))?;
+
+    // For DELETE, sign the release ID
+    let message = id.as_bytes();
+
+    // Verify signature and admin status
+    {
+        let state = state.read().await;
+        if let Err(e) = require_admin_signature(&state.storage, public_key, signature, message) {
+            tracing::warn!("Auth failed for delete_release: {}", e);
+            return Err((StatusCode::FORBIDDEN, Json(serde_json::json!({
+                "error": e
+            }))));
+        }
+    }
+
     let state = state.read().await;
 
     // Delete from storage
     if let Err(_) = state.storage.delete_release(&id) {
-        return StatusCode::INTERNAL_SERVER_ERROR;
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": "Failed to delete release"
+        }))));
     }
 
     // SPORE: Compute double-hash tombstone and add to DoNotWantList
@@ -376,7 +580,7 @@ async fn delete_release(
         }
     }
 
-    StatusCode::NO_CONTENT
+    Ok(StatusCode::NO_CONTENT)
 }
 
 // --- Category endpoints ---
