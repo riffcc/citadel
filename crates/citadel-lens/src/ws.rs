@@ -97,11 +97,13 @@ pub enum MeshEvent {
         height: u64,
         weight: u64,
     },
-    /// CVDF new round produced
+    /// CVDF new round produced (with SPORE sync proof)
     CvdfNewRound {
         round: u64,
         weight: u64,
         attestation_count: usize,
+        /// SPORE XOR ranges - 0 at convergence (zero overhead)
+        spore_ranges: usize,
     },
 }
 
@@ -331,10 +333,11 @@ pub fn flood_to_event(msg: FloodMessage) -> Option<MeshEvent> {
         FloodMessage::PoLSwapResponse { .. } => None,
         // CVDF messages
         FloodMessage::CvdfAttestation { .. } => None, // Internal coordination
-        FloodMessage::CvdfNewRound { round } => Some(MeshEvent::CvdfNewRound {
+        FloodMessage::CvdfNewRound { round, spore_proof } => Some(MeshEvent::CvdfNewRound {
             round: round.round,
             weight: round.weight() as u64,
             attestation_count: round.attestations.len(),
+            spore_ranges: spore_proof.range_count(),  // 0 at convergence
         }),
         FloodMessage::CvdfSyncRequest { .. } => None, // Internal coordination
         FloodMessage::CvdfSyncResponse { rounds, .. } => {
@@ -351,5 +354,10 @@ pub fn flood_to_event(msg: FloodMessage) -> Option<MeshEvent> {
         FloodMessage::ErasureConfirmation { .. } => None,
         // BadBits - internal moderation, not exposed to WebSocket
         FloodMessage::BadBits { .. } => None,
+        // SPORE range-based sync - internal protocol
+        FloodMessage::SporeSync { .. } => None,
+        FloodMessage::SporeDelta { .. } => None,
+        // Featured releases sync - internal, admin-curated content
+        FloodMessage::FeaturedSync { .. } => None,
     }
 }

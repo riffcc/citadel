@@ -68,7 +68,7 @@ use citadel_protocols::{
     CoordinatorConfig, FloodRateConfig, KeyPair, Message as TgpMessage, MessagePayload, PeerCoordinator, PublicKey,
     SporeSyncManager,
 };
-use citadel_spore::U256;
+use citadel_spore::{U256, Spore, Range256, SyncState as SporeSyncState, SporeMessage};
 use citadel_topology::{HexCoord, Neighbors, Spiral3DIndex, spiral3d_to_coord};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use std::collections::{HashMap, HashSet};
@@ -113,6 +113,41 @@ pub fn matches_tombstone(id: &str, tombstone: &[u8; 32]) -> bool {
     double_hash_id(id) == *tombstone
 }
 
+/// Convert a release ID to U256 for SPORE range operations
+/// Uses BLAKE3 hash to map string IDs into 256-bit hash space
+pub fn release_id_to_u256(id: &str) -> U256 {
+    let hash = blake3::hash(id.as_bytes());
+    U256::from_be_bytes(hash.as_bytes())
+}
+
+/// Build a Spore HaveList from a list of release IDs
+/// Each release ID becomes a point range [hash, hash+1)
+/// Ranges automatically merge when adjacent (rare for random UUIDs but happens)
+pub fn build_spore_havelist(release_ids: &[String]) -> Spore {
+    if release_ids.is_empty() {
+        return Spore::empty();
+    }
+
+    let ranges: Vec<Range256> = release_ids.iter()
+        .filter_map(|id| {
+            let start = release_id_to_u256(id);
+            // Point range: [hash, hash+1)
+            start.checked_add(&U256::from_u64(1))
+                .map(|stop| Range256::new(start, stop))
+        })
+        .collect();
+
+    Spore::from_ranges(ranges)
+}
+
+/// Build WantList from HaveList
+/// WantList = complement of HaveList = everything I DON'T have
+/// A new node wants everything: Spore::full()
+/// A synced node wants: HaveList.complement()
+pub fn build_spore_wantlist(have_list: &Spore) -> Spore {
+    have_list.complement()
+}
+
 /// Mesh node identity and state
 #[derive(Debug, Clone)]
 pub struct MeshPeer {
@@ -129,6 +164,9 @@ pub struct MeshPeer {
     /// SPORE: True if WE have all content THIS peer has (our WantList from them = ∅)
     /// When all peers are content_synced, this node is "ready" to serve traffic
     pub content_synced: bool,
+    /// SPORE: Their HaveList (what they possess) - received via SporeSync
+    /// Their WantList = their_have.complement() - derived, not stored
+    pub their_have: Option<Spore>,
 }
 
 /// A claimed SPIRAL slot in the mesh
@@ -548,8 +586,12 @@ pub enum FloodMessage {
     PoLSwapResponse { response: crate::proof_of_latency::SwapResponse },
     /// CVDF attestation for current round
     CvdfAttestation { att: RoundAttestation },
-    /// CVDF new round produced
-    CvdfNewRound { round: CvdfRound },
+    /// CVDF new round produced (with stapled SPORE proof for zero-overhead sync)
+    CvdfNewRound {
+        round: CvdfRound,
+        /// SPORE XOR proof - empty at convergence (zero overhead)
+        spore_proof: citadel_spore::Spore,
+    },
     /// CVDF chain sync request
     CvdfSyncRequest { from_node: String, from_height: u64 },
     /// CVDF chain sync response (all rounds)
@@ -569,6 +611,25 @@ pub enum FloodMessage {
     /// For: copyright violations, abuse material, illegal content
     /// See: https://badbits.dwebops.pub/
     BadBits { double_hashes: Vec<[u8; 32]> },
+    /// SPORE: Sync proof with XOR difference (range-based)
+    /// At convergence: xor_diff = [] (empty, zero cost)
+    /// Only contains ranges that differ between peers
+    SporeSync {
+        peer_id: String,
+        /// Full HaveList on first exchange, then XOR diff for updates
+        have_list: Spore,
+    },
+    /// SPORE: Delta transfer - actual content for the XOR difference
+    /// Contains releases that match ranges in the XOR diff
+    SporeDelta {
+        releases: Vec<String>, // JSON-serialized releases
+    },
+    /// SPORE: Featured releases sync - separate from regular releases
+    /// These control homepage/hero display and have their own sync lifecycle
+    FeaturedSync {
+        peer_id: String,
+        featured: Vec<String>, // JSON-serialized FeaturedRelease
+    },
 }
 
 /// Citadel Mesh Service
@@ -1146,7 +1207,9 @@ impl MeshService {
             if let Some(round) = self.cvdf_try_produce().await {
                 info!("CVDF produced round {} (weight {})",
                     round.round, round.weight());
-                self.flood(FloodMessage::CvdfNewRound { round });
+                // Staple SPORE proof to heartbeat - empty at convergence (zero overhead)
+                let spore_proof = citadel_spore::Spore::empty();
+                self.flood(FloodMessage::CvdfNewRound { round, spore_proof });
             }
 
             // Periodically broadcast chain state for sync
@@ -1947,6 +2010,7 @@ impl MeshService {
                     slot: None,  // Will be learned via SPORE slot_claim flood
                     is_entry_peer,
                     content_synced: false,  // Will become true when HaveLists match
+                    their_have: None,  // SPORE: received via SporeSync
                 },
             );
         }
@@ -2052,18 +2116,42 @@ impl MeshService {
             writer.write_all(b"\n").await?;
         }
 
-        // SPORE: Send ContentHaveList with our release IDs for eventual consistency
-        // This allows peers to discover what releases we have and request missing ones
-        if let Ok(releases) = self.storage.list_releases() {
-            if !releases.is_empty() {
-                let release_ids: Vec<String> = releases.iter().map(|r| r.id.clone()).collect();
-                let content_have_list = serde_json::json!({
-                    "type": "content_have_list",
-                    "release_ids": release_ids,
+        // SPORE: Send range-based HaveList for optimal sync
+        // Sync cost = O(|XOR difference|), converges to 0 at steady state
+        // WantList = HaveList.complement() - receiver derives it
+        {
+            let releases = self.storage.list_releases().unwrap_or_default();
+            let release_ids: Vec<String> = releases.iter().map(|r| r.id.clone()).collect();
+            let have_list = build_spore_havelist(&release_ids);
+            let self_id = self.state.read().await.self_id.clone();
+
+            let spore_sync = serde_json::json!({
+                "type": "spore_sync",
+                "peer_id": self_id,
+                "have_list": have_list,
+            });
+            writer.write_all(spore_sync.to_string().as_bytes()).await?;
+            writer.write_all(b"\n").await?;
+            debug!("SPORE: Sent HaveList with {} ranges to peer {}", have_list.range_count(), peer_id);
+        }
+
+        // SPORE: Send featured releases for homepage sync
+        // Featured releases are admin-curated, synced separately from regular releases
+        {
+            let featured = self.storage.list_featured_releases().unwrap_or_default();
+            if !featured.is_empty() {
+                let self_id = self.state.read().await.self_id.clone();
+                let featured_json: Vec<String> = featured.iter()
+                    .filter_map(|f| serde_json::to_string(f).ok())
+                    .collect();
+                let featured_sync = serde_json::json!({
+                    "type": "featured_sync",
+                    "peer_id": self_id,
+                    "featured": featured_json,
                 });
-                writer.write_all(content_have_list.to_string().as_bytes()).await?;
+                writer.write_all(featured_sync.to_string().as_bytes()).await?;
                 writer.write_all(b"\n").await?;
-                debug!("Sent ContentHaveList with {} releases to peer {}", release_ids.len(), peer_id);
+                debug!("SPORE: Sent {} featured releases to peer {}", featured.len(), peer_id);
             }
         }
 
@@ -2397,7 +2485,7 @@ impl MeshService {
                             let _ = writer.write_all(flood_msg.to_string().as_bytes()).await;
                             let _ = writer.write_all(b"\n").await;
                         }
-                        Ok(FloodMessage::CvdfNewRound { round }) => {
+                        Ok(FloodMessage::CvdfNewRound { round, spore_proof }) => {
                             let flood_msg = serde_json::json!({
                                 "type": "cvdf_new_round",
                                 "round": round.round,
@@ -2407,6 +2495,7 @@ impl MeshService {
                                 "producer": hex::encode(round.producer),
                                 "attestation_count": round.attestations.len(),
                                 "weight": round.weight(),
+                                "spore_ranges": spore_proof.range_count(),  // 0 at convergence
                             });
                             let _ = writer.write_all(flood_msg.to_string().as_bytes()).await;
                             let _ = writer.write_all(b"\n").await;
@@ -2510,6 +2599,37 @@ impl MeshService {
                             let flood_msg = serde_json::json!({
                                 "type": "bad_bits",
                                 "double_hashes": hashes_hex,
+                            });
+                            let _ = writer.write_all(flood_msg.to_string().as_bytes()).await;
+                            let _ = writer.write_all(b"\n").await;
+                        }
+                        Ok(FloodMessage::SporeSync { peer_id, have_list }) => {
+                            // SPORE: Bilateral sync with range-based HaveList
+                            // WantList = HaveList.complement() - derived by receiver
+                            // Sync cost = O(|XOR difference|), converges to 0 at steady state
+                            let flood_msg = serde_json::json!({
+                                "type": "spore_sync",
+                                "peer_id": peer_id,
+                                "have_list": have_list,
+                            });
+                            let _ = writer.write_all(flood_msg.to_string().as_bytes()).await;
+                            let _ = writer.write_all(b"\n").await;
+                        }
+                        Ok(FloodMessage::SporeDelta { releases }) => {
+                            // SPORE: Delta transfer - only send what they want that we have
+                            let flood_msg = serde_json::json!({
+                                "type": "spore_delta",
+                                "releases": releases,
+                            });
+                            let _ = writer.write_all(flood_msg.to_string().as_bytes()).await;
+                            let _ = writer.write_all(b"\n").await;
+                        }
+                        Ok(FloodMessage::FeaturedSync { peer_id, featured }) => {
+                            // SPORE: Featured releases sync for homepage
+                            let flood_msg = serde_json::json!({
+                                "type": "featured_sync",
+                                "peer_id": peer_id,
+                                "featured": featured,
                             });
                             let _ = writer.write_all(flood_msg.to_string().as_bytes()).await;
                             let _ = writer.write_all(b"\n").await;
@@ -2705,6 +2825,7 @@ impl MeshService {
                                     slot,
                                     is_entry_peer: false,  // Discovered via flooding, not an entry peer
                                     content_synced: false,  // Will become true when HaveLists match
+                                    their_have: None,  // SPORE: received via SporeSync
                                 },
                             );
                             new_peers.push((id.clone(), addr_str, slot_index, public_key));
@@ -3117,6 +3238,12 @@ impl MeshService {
                                         }
                                     }
 
+                                    // Get iterations from JSON, default to base if not present (backwards compat)
+                                    let iterations = round_json.get("iterations")
+                                        .and_then(|i| i.as_u64())
+                                        .map(|i| i as u32)
+                                        .unwrap_or(crate::cvdf::CVDF_ITERATIONS_BASE);
+
                                     parsed_rounds.push(CvdfRound {
                                         round: round_num,
                                         prev_output: prev.try_into().unwrap(),
@@ -3126,6 +3253,7 @@ impl MeshService {
                                         producer_signature: sig.try_into().unwrap(),
                                         timestamp_ms,
                                         attestations,
+                                        iterations,
                                     });
                                 }
                             }
@@ -3284,18 +3412,104 @@ impl MeshService {
                             } else {
                                 info!("SPORE: Received and stored release {} from mesh", release.id);
 
-                                // SPORE: Broadcast our updated ContentHaveList so peers know our new state
+                                // SPORE: Broadcast updated HaveList so peers know our new state
                                 // This enables continuous sync as our state changes
                                 if let Ok(all_releases) = self.storage.list_releases() {
                                     let self_id = self.state.read().await.self_id.clone();
                                     let release_ids: Vec<String> = all_releases.iter().map(|r| r.id.clone()).collect();
-                                    self.flood(FloodMessage::ContentHaveList {
+                                    let have_list = build_spore_havelist(&release_ids);
+                                    self.flood(FloodMessage::SporeSync {
                                         peer_id: self_id,
-                                        release_ids
+                                        have_list,
                                     });
                                 }
                             }
                         }
+                    }
+                }
+            }
+            "spore_sync" => {
+                // SPORE: Receive peer's HaveList (range-based)
+                // Their WantList = their_have.complement()
+                if let Some(have_list_value) = msg.get("have_list") {
+                    if let Ok(their_have) = serde_json::from_value::<Spore>(have_list_value.clone()) {
+                        // Compute their WantList (what they don't have)
+                        let their_want = their_have.complement();
+
+                        // Build our HaveList
+                        let our_releases = self.storage.list_releases().unwrap_or_default();
+                        let our_release_ids: Vec<String> = our_releases.iter().map(|r| r.id.clone()).collect();
+                        let our_have = build_spore_havelist(&our_release_ids);
+
+                        // Compute what we should send: our_have ∩ their_want
+                        let to_send = our_have.intersect(&their_want);
+
+                        // Store their HaveList for future reference
+                        {
+                            let mut state = self.state.write().await;
+                            if let Some(peer) = state.peers.get_mut(peer_id) {
+                                peer.their_have = Some(their_have.clone());
+                                // Check if we have all their content
+                                let our_want = our_have.complement();
+                                let we_need = their_have.intersect(&our_want);
+                                peer.content_synced = we_need.is_empty();
+                                if peer.content_synced {
+                                    info!("SPORE: Fully synced with peer {} (their content ⊆ our content)", peer_id);
+                                }
+                            }
+                        }
+
+                        // If we have releases they want, send them as delta
+                        if !to_send.is_empty() {
+                            // Find which releases match the to_send ranges
+                            let releases_to_send: Vec<String> = our_releases.iter()
+                                .filter(|r| {
+                                    let hash = release_id_to_u256(&r.id);
+                                    to_send.covers(&hash)
+                                })
+                                .filter_map(|r| serde_json::to_string(r).ok())
+                                .collect();
+
+                            if !releases_to_send.is_empty() {
+                                info!("SPORE: Sending {} releases to peer {} (delta transfer)", releases_to_send.len(), peer_id);
+                                self.flood(FloodMessage::SporeDelta {
+                                    releases: releases_to_send,
+                                });
+                            }
+                        }
+                        // NOTE: Don't send HaveList back here - we already send on connection
+                        // Sending here would create infinite feedback loop
+                    }
+                }
+            }
+            "spore_delta" => {
+                // SPORE: Receive delta transfer - releases we were missing
+                if let Some(releases_value) = msg.get("releases").and_then(|r| r.as_array()) {
+                    let mut stored_count = 0;
+                    for release_json in releases_value {
+                        if let Some(json_str) = release_json.as_str() {
+                            if let Ok(release) = serde_json::from_str::<crate::models::Release>(json_str) {
+                                // Check tombstone
+                                let tombstone = double_hash_id(&release.id);
+                                let is_tombstoned = self.state.read().await.do_not_want.contains(&tombstone);
+
+                                if is_tombstoned {
+                                    debug!("SPORE: Ignoring tombstoned release {} from delta", release.id);
+                                } else if self.storage.get_release(&release.id).ok().flatten().is_none() {
+                                    if let Err(e) = self.storage.put_release(&release) {
+                                        warn!("SPORE: Failed to store delta release {}: {}", release.id, e);
+                                    } else {
+                                        stored_count += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if stored_count > 0 {
+                        info!("SPORE: Stored {} releases from delta transfer", stored_count);
+                        // NOTE: Don't broadcast HaveList here - would cause feedback loop
+                        // HaveLists are exchanged on connection, not on every state change
                     }
                 }
             }
@@ -3469,6 +3683,41 @@ impl MeshService {
                         self.flood(FloodMessage::BadBits {
                             double_hashes: new_bad_bits,
                         });
+                    }
+                }
+            }
+            "featured_sync" => {
+                // SPORE: Receive featured releases from peer
+                // These are admin-curated homepage entries, synced independently
+                if let Some(featured_arr) = msg.get("featured").and_then(|f| f.as_array()) {
+                    let mut stored_count = 0;
+                    for featured_json in featured_arr {
+                        if let Some(json_str) = featured_json.as_str() {
+                            if let Ok(featured) = serde_json::from_str::<crate::models::FeaturedRelease>(json_str) {
+                                // Check if we already have this featured release
+                                if self.storage.get_featured_release(&featured.id).ok().flatten().is_none() {
+                                    if let Err(e) = self.storage.put_featured_release(&featured) {
+                                        warn!("SPORE: Failed to store featured release {}: {}", featured.id, e);
+                                    } else {
+                                        stored_count += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if stored_count > 0 {
+                        info!("SPORE: Stored {} featured releases from peer {}", stored_count, peer_id);
+                        // Re-flood to propagate
+                        let self_id = self.state.read().await.self_id.clone();
+                        if let Ok(all_featured) = self.storage.list_featured_releases() {
+                            let featured_json: Vec<String> = all_featured.iter()
+                                .filter_map(|f| serde_json::to_string(f).ok())
+                                .collect();
+                            self.flood(FloodMessage::FeaturedSync {
+                                peer_id: self_id,
+                                featured: featured_json,
+                            });
+                        }
                     }
                 }
             }

@@ -1361,7 +1361,9 @@ struct LegacyExport {
 #[serde(rename_all = "camelCase")]
 struct LegacyRelease {
     id: String,
-    posted_by: Option<LegacyPublicKey>,
+    /// Can be either a string ("ed25519p/...") or legacy byte array object
+    #[serde(deserialize_with = "deserialize_posted_by")]
+    posted_by: Option<String>,
     site_address: Option<String>,
     name: String,
     category_id: String,
@@ -1380,20 +1382,48 @@ struct LegacyPublicKey {
     public_key: Option<HashMap<String, u8>>,
 }
 
-/// Convert legacy public key bytes to ed25519 format
-fn convert_legacy_public_key(legacy_key: &Option<LegacyPublicKey>) -> Option<String> {
-    legacy_key.as_ref().and_then(|lpk| {
-        lpk.public_key.as_ref().map(|key_map| {
-            let mut bytes = Vec::new();
-            for i in 0..32 {
-                if let Some(&byte) = key_map.get(&i.to_string()) {
-                    bytes.push(byte);
+/// Custom deserializer for posted_by that handles both string and legacy object formats
+fn deserialize_posted_by<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+
+    let value: Option<serde_json::Value> = Option::deserialize(deserializer)?;
+
+    match value {
+        None => Ok(None),
+        Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(s)) => {
+            // Already a string like "ed25519p/..."
+            if s.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(s))
+            }
+        }
+        Some(serde_json::Value::Object(obj)) => {
+            // Legacy format: { "publicKey": { "0": 123, "1": 45, ... } }
+            if let Some(public_key_val) = obj.get("publicKey").or(obj.get("public_key")) {
+                if let Some(key_map) = public_key_val.as_object() {
+                    let mut bytes = Vec::new();
+                    for i in 0..32 {
+                        if let Some(byte_val) = key_map.get(&i.to_string()) {
+                            if let Some(byte) = byte_val.as_u64() {
+                                bytes.push(byte as u8);
+                            }
+                        }
+                    }
+                    if bytes.len() == 32 {
+                        let hex: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
+                        return Ok(Some(format!("ed25519p/{}", hex)));
+                    }
                 }
             }
-            let hex: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
-            format!("ed25519p/{}", hex)
-        })
-    })
+            Ok(None)
+        }
+        _ => Ok(None),
+    }
 }
 
 /// Export data format
@@ -1406,14 +1436,6 @@ struct ExportData {
     featured_releases: Vec<FeaturedRelease>,
 }
 
-/// Import request with public key for authentication
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ImportRequest {
-    public_key: String,
-    data: serde_json::Value,
-}
-
 /// Import response
 #[derive(Debug, Serialize)]
 struct ImportResponse {
@@ -1424,129 +1446,150 @@ struct ImportResponse {
 }
 
 /// POST /api/v1/import - Import releases from legacy format
+/// Requires admin signature authentication via X-Public-Key, X-Signature, X-Timestamp headers
 async fn import_releases(
     State(state): State<AppState>,
-    Json(req): Json<ImportRequest>,
-) -> Result<Json<ImportResponse>, StatusCode> {
-    let state = state.read().await;
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<ImportResponse>, (StatusCode, Json<serde_json::Value>)> {
+    // Extract authentication headers
+    let public_key = headers
+        .get("X-Public-Key")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
+            "error": "Missing X-Public-Key header"
+        }))))?;
 
-    // Check if requester is admin
-    if !state.storage.is_admin(&req.public_key).unwrap_or(false) {
-        return Ok(Json(ImportResponse {
-            success: false,
-            imported: 0,
-            skipped: 0,
-            errors: vec!["Admin permission required for import".to_string()],
-        }));
+    let signature = headers
+        .get("X-Signature")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
+            "error": "Missing X-Signature header"
+        }))))?;
+
+    let timestamp = headers
+        .get("X-Timestamp")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
+            "error": "Missing X-Timestamp header"
+        }))))?;
+
+    // Verify signature and admin status
+    {
+        let state = state.read().await;
+        if let Err(e) = require_admin_signature(&state.storage, public_key, signature, timestamp, &body) {
+            tracing::warn!("Auth failed for import_releases: {}", e);
+            return Err((StatusCode::FORBIDDEN, Json(serde_json::json!({
+                "error": e
+            }))));
+        }
     }
+
+    // Parse the import data (body is the legacy export JSON directly)
+    let legacy_export: LegacyExport = serde_json::from_slice(&body)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": format!("Failed to parse import data: {}", e)
+        }))))?;
+
+    let state = state.read().await;
 
     let mut imported = 0;
     let mut skipped = 0;
     let mut errors = Vec::new();
 
-    // Try to parse as legacy format
-    match serde_json::from_value::<LegacyExport>(req.data.clone()) {
-        Ok(legacy_export) => {
-            tracing::info!(
-                "Importing {} releases from legacy format v{}",
-                legacy_export.releases.len(),
-                legacy_export.version
-            );
+    tracing::info!(
+        "Importing {} releases from legacy format v{}",
+        legacy_export.releases.len(),
+        legacy_export.version
+    );
 
-            for legacy_release in legacy_export.releases {
-                // Check if release already exists
-                if state.storage.get_release(&legacy_release.id).ok().flatten().is_some() {
-                    tracing::debug!("Skipping existing release: {}", legacy_release.id);
-                    skipped += 1;
-                    continue;
-                }
+    for legacy_release in legacy_export.releases {
+        // Check if release already exists
+        if state.storage.get_release(&legacy_release.id).ok().flatten().is_some() {
+            tracing::debug!("Skipping existing release: {}", legacy_release.id);
+            skipped += 1;
+            continue;
+        }
 
-                // Convert to new format
-                let creator = convert_legacy_public_key(&legacy_release.posted_by);
+        // Use posted_by directly (already converted by deserializer)
+        let creator = legacy_release.posted_by.clone();
 
-                let mut release = Release::new(
-                    legacy_release.id.clone(),
-                    legacy_release.name,
-                    legacy_release.category_slug.unwrap_or(legacy_release.category_id),
-                );
-                release.creator = creator;
-                release.thumbnail_cid = legacy_release.thumbnail_cid;
-                release.content_cid = legacy_release.content_cid;
-                release.site_address = legacy_release.site_address;
-                // Store raw metadata for Flagship compatibility
-                release.metadata = legacy_release.metadata.clone();
+        let mut release = Release::new(
+            legacy_release.id.clone(),
+            legacy_release.name,
+            legacy_release.category_slug.unwrap_or(legacy_release.category_id),
+        );
+        release.creator = creator;
+        release.thumbnail_cid = legacy_release.thumbnail_cid;
+        release.content_cid = legacy_release.content_cid;
+        release.site_address = legacy_release.site_address;
+        // Store raw metadata for Flagship compatibility
+        release.metadata = legacy_release.metadata.clone();
 
-                // Extract metadata fields if available
-                if let Some(metadata) = &legacy_release.metadata {
-                    if let Some(year) = metadata.get("year").and_then(|y| y.as_u64()) {
-                        release.year = Some(year as u32);
-                    }
-                    if let Some(desc) = metadata.get("description").and_then(|d| d.as_str()) {
-                        release.description = Some(desc.to_string());
-                    }
-                }
-
-                // Save release
-                if let Err(e) = state.storage.put_release(&release) {
-                    errors.push(format!("Failed to save release {}: {}", legacy_release.id, e));
-                    continue;
-                }
-
-                // SPORE: Flood the release to propagate across mesh
-                if let Some(ref flood_tx) = state.flood_tx {
-                    if let Ok(json) = serde_json::to_string(&release) {
-                        let _ = flood_tx.send(FloodMessage::Release { release_json: json });
-                        tracing::debug!("SPORE: Flooding imported release {}", release.id);
-                    }
-                }
-
-                imported += 1;
+        // Extract metadata fields if available
+        if let Some(metadata) = &legacy_release.metadata {
+            if let Some(year) = metadata.get("year").and_then(|y| y.as_u64()) {
+                release.year = Some(year as u32);
             }
-
-            tracing::info!("Releases import complete: {} imported, {} skipped", imported, skipped);
-
-            // Import featured releases if present
-            let mut featured_imported = 0;
-            let mut featured_skipped = 0;
-            for featured in legacy_export.featured_releases {
-                // Check if featured release already exists
-                if state.storage.get_featured_release(&featured.id).ok().flatten().is_some() {
-                    tracing::debug!("Skipping existing featured release: {}", featured.id);
-                    featured_skipped += 1;
-                    continue;
-                }
-
-                // Save featured release
-                if let Err(e) = state.storage.put_featured_release(&featured) {
-                    errors.push(format!("Failed to save featured release {}: {}", featured.id, e));
-                    continue;
-                }
-
-                featured_imported += 1;
-            }
-
-            if featured_imported > 0 || featured_skipped > 0 {
-                tracing::info!("Featured releases import: {} imported, {} skipped", featured_imported, featured_skipped);
-            }
-
-            // SPORE: Broadcast our updated ContentHaveList so peers know our complete state
-            if imported > 0 {
-                if let Some(ref flood_tx) = state.flood_tx {
-                    if let Ok(all_releases) = state.storage.list_releases() {
-                        let release_ids: Vec<String> = all_releases.iter().map(|r| r.id.clone()).collect();
-                        let _ = flood_tx.send(FloodMessage::ContentHaveList {
-                            peer_id: "api-import".to_string(), // API doesn't have mesh identity
-                            release_ids,
-                        });
-                        tracing::info!("SPORE: Broadcast ContentHaveList with {} releases after import", all_releases.len());
-                    }
-                }
+            if let Some(desc) = metadata.get("description").and_then(|d| d.as_str()) {
+                release.description = Some(desc.to_string());
             }
         }
-        Err(e) => {
-            let error_msg = format!("Failed to parse import data: {}", e);
-            tracing::error!("{}", error_msg);
-            errors.push(error_msg);
+
+        // Save release
+        if let Err(e) = state.storage.put_release(&release) {
+            errors.push(format!("Failed to save release {}: {}", legacy_release.id, e));
+            continue;
+        }
+
+        // SPORE: Flood the release to propagate across mesh
+        if let Some(ref flood_tx) = state.flood_tx {
+            if let Ok(json) = serde_json::to_string(&release) {
+                let _ = flood_tx.send(FloodMessage::Release { release_json: json });
+                tracing::debug!("SPORE: Flooding imported release {}", release.id);
+            }
+        }
+
+        imported += 1;
+    }
+
+    tracing::info!("Releases import complete: {} imported, {} skipped", imported, skipped);
+
+    // Import featured releases if present
+    let mut featured_imported = 0;
+    let mut featured_skipped = 0;
+    for featured in legacy_export.featured_releases {
+        // Check if featured release already exists
+        if state.storage.get_featured_release(&featured.id).ok().flatten().is_some() {
+            tracing::debug!("Skipping existing featured release: {}", featured.id);
+            featured_skipped += 1;
+            continue;
+        }
+
+        // Save featured release
+        if let Err(e) = state.storage.put_featured_release(&featured) {
+            errors.push(format!("Failed to save featured release {}: {}", featured.id, e));
+            continue;
+        }
+
+        featured_imported += 1;
+    }
+
+    if featured_imported > 0 || featured_skipped > 0 {
+        tracing::info!("Featured releases import: {} imported, {} skipped", featured_imported, featured_skipped);
+    }
+
+    // SPORE: Broadcast our updated ContentHaveList so peers know our complete state
+    if imported > 0 {
+        if let Some(ref flood_tx) = state.flood_tx {
+            if let Ok(all_releases) = state.storage.list_releases() {
+                let release_ids: Vec<String> = all_releases.iter().map(|r| r.id.clone()).collect();
+                let _ = flood_tx.send(FloodMessage::ContentHaveList {
+                    peer_id: "api-import".to_string(), // API doesn't have mesh identity
+                    release_ids,
+                });
+                tracing::info!("SPORE: Broadcast ContentHaveList with {} releases after import", all_releases.len());
+            }
         }
     }
 
