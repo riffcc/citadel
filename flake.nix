@@ -26,8 +26,11 @@
             pkg-config
             udev
             libclang.lib
+            sccache
+
           ];
           LIBCLANG_PATH = "${pkgs.libclang.lib}/lib";
+          RUSTC_WRAPPER="${pkgs.sccache}/bin/sccache";
 
           shellHook = ''
             echo "in rust dev shell";
