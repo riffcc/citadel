@@ -370,6 +370,15 @@ async fn create_release(
     release.thumbnail_cid = req.thumbnail_cid;
     release.metadata = req.metadata;
 
+    // CRDT: Initialize version_info with node_id from signing key
+    let node_id: [u8; 8] = {
+        let hash = blake3::hash(public_key.as_bytes());
+        let mut arr = [0u8; 8];
+        arr.copy_from_slice(&hash.as_bytes()[..8]);
+        arr
+    };
+    release.init_version(node_id);
+
     let state = state.read().await;
     state
         .storage
@@ -544,6 +553,15 @@ async fn update_release(
             release.metadata = Some(new_metadata);
         }
     }
+
+    // CRDT: Update version_info (increments lamport, sets replaces pointer)
+    let node_id: [u8; 8] = {
+        let hash = blake3::hash(public_key.as_bytes());
+        let mut arr = [0u8; 8];
+        arr.copy_from_slice(&hash.as_bytes()[..8]);
+        arr
+    };
+    release.update_version(node_id);
 
     // Save updated release
     state

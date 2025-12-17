@@ -113,16 +113,44 @@ pub fn matches_tombstone(id: &str, tombstone: &[u8; 32]) -> bool {
     double_hash_id(id) == *tombstone
 }
 
-/// Convert a release ID to U256 for SPORE range operations
+/// Convert a release ID to U256 for SPORE range operations (legacy, ID-only)
 /// Uses BLAKE3 hash to map string IDs into 256-bit hash space
+/// DEPRECATED: Use release_to_u256() for version-aware positioning
 pub fn release_id_to_u256(id: &str) -> U256 {
     let hash = blake3::hash(id.as_bytes());
     U256::from_be_bytes(hash.as_bytes())
 }
 
-/// Build a Spore HaveList from a list of release IDs
+/// Convert a Release to U256 for SPORE range operations (version-aware)
+/// Uses release.spore_position() which includes content_hash for update detection
+pub fn release_to_u256(release: &crate::models::Release) -> U256 {
+    let pos = release.spore_position();
+    U256::from_be_bytes(&pos)
+}
+
+/// Build a Spore HaveList from releases (version-aware)
+/// Position = hash(id || content_hash), so updates create new positions
+pub fn build_spore_havelist_from_releases(releases: &[crate::models::Release]) -> Spore {
+    if releases.is_empty() {
+        return Spore::empty();
+    }
+
+    let ranges: Vec<Range256> = releases.iter()
+        .filter_map(|r| {
+            let start = release_to_u256(r);
+            // Point range: [hash, hash+1)
+            start.checked_add(&U256::from_u64(1))
+                .map(|stop| Range256::new(start, stop))
+        })
+        .collect();
+
+    Spore::from_ranges(ranges)
+}
+
+/// Build a Spore HaveList from a list of release IDs (legacy, ID-only)
 /// Each release ID becomes a point range [hash, hash+1)
 /// Ranges automatically merge when adjacent (rare for random UUIDs but happens)
+/// DEPRECATED: Use build_spore_havelist_from_releases() for version-aware sync
 pub fn build_spore_havelist(release_ids: &[String]) -> Spore {
     if release_ids.is_empty() {
         return Spore::empty();
@@ -3035,8 +3063,9 @@ impl MeshService {
         // WantList = HaveList.complement() - receiver derives it
         {
             let releases = self.storage.list_releases().unwrap_or_default();
-            let release_ids: Vec<String> = releases.iter().map(|r| r.id.clone()).collect();
-            let have_list = build_spore_havelist(&release_ids);
+            // Version-aware HaveList: position = hash(id || content_hash)
+            // Updates create new positions, enabling SPORE to detect changes
+            let have_list = build_spore_havelist_from_releases(&releases);
             let self_id = self.state.read().await.self_id.clone();
 
             let spore_sync = serde_json::json!({
@@ -4312,48 +4341,62 @@ impl MeshService {
                 // Receive a release flooded through the mesh
                 if let Some(release_data) = msg.get("release") {
                     // Try to parse as Release
-                    if let Ok(release) = serde_json::from_value::<crate::models::Release>(release_data.clone()) {
+                    if let Ok(incoming) = serde_json::from_value::<crate::models::Release>(release_data.clone()) {
                         // SPORE: Check if this release is in our DoNotWantList (tombstoned)
-                        let tombstone = double_hash_id(&release.id);
+                        let tombstone = double_hash_id(&incoming.id);
                         let is_tombstoned = self.state.read().await.do_not_want.contains(&tombstone);
 
                         if is_tombstoned {
-                            debug!("SPORE: Ignoring tombstoned release {} (in DoNotWantList)", release.id);
-                        } else if self.storage.get_release(&release.id).ok().flatten().is_none() {
-                            // Store it
-                            if let Err(e) = self.storage.put_release(&release) {
-                                warn!("Failed to store flooded release {}: {}", release.id, e);
-                            } else {
-                                info!("SPORE: Received and stored release {} from mesh", release.id);
-
-                                // SPORE: Broadcast updated HaveList so peers know our new state
-                                // This enables continuous sync as our state changes
-                                if let Ok(all_releases) = self.storage.list_releases() {
-                                    let self_id = self.state.read().await.self_id.clone();
-                                    let release_ids: Vec<String> = all_releases.iter().map(|r| r.id.clone()).collect();
-                                    let have_list = build_spore_havelist(&release_ids);
-                                    self.flood(FloodMessage::SporeSync {
-                                        peer_id: self_id,
-                                        have_list,
-                                    });
+                            debug!("SPORE: Ignoring tombstoned release {} (in DoNotWantList)", incoming.id);
+                        } else {
+                            // CRDT merge: check if we should store/replace
+                            let existing = self.storage.get_release(&incoming.id).ok().flatten();
+                            let should_store = match &existing {
+                                None => true, // New release
+                                Some(existing_release) => {
+                                    // Use CRDT merge logic
+                                    existing_release.should_replace_with(&incoming)
                                 }
+                            };
+
+                            if should_store {
+                                if let Err(e) = self.storage.put_release(&incoming) {
+                                    warn!("Failed to store flooded release {}: {}", incoming.id, e);
+                                } else {
+                                    let action = if existing.is_some() { "updated" } else { "stored" };
+                                    info!("SPORE: {} release {} (lamport: {:?})",
+                                        action, incoming.id,
+                                        incoming.version_info.as_ref().map(|v| v.lamport));
+
+                                    // SPORE: Broadcast updated HaveList so peers know our new state
+                                    // Version-aware: new content hash = new position in range
+                                    if let Ok(all_releases) = self.storage.list_releases() {
+                                        let self_id = self.state.read().await.self_id.clone();
+                                        let have_list = build_spore_havelist_from_releases(&all_releases);
+                                        self.flood(FloodMessage::SporeSync {
+                                            peer_id: self_id,
+                                            have_list,
+                                        });
+                                    }
+                                }
+                            } else {
+                                debug!("SPORE: Ignoring older version of release {} (CRDT merge)", incoming.id);
                             }
                         }
                     }
                 }
             }
             "spore_sync" => {
-                // SPORE: Receive peer's HaveList (range-based)
+                // SPORE: Receive peer's HaveList (range-based, version-aware)
                 // Their WantList = their_have.complement()
                 if let Some(have_list_value) = msg.get("have_list") {
                     if let Ok(their_have) = serde_json::from_value::<Spore>(have_list_value.clone()) {
                         // Compute their WantList (what they don't have)
                         let their_want = their_have.complement();
 
-                        // Build our HaveList
+                        // Build our HaveList (version-aware: position includes content hash)
                         let our_releases = self.storage.list_releases().unwrap_or_default();
-                        let our_release_ids: Vec<String> = our_releases.iter().map(|r| r.id.clone()).collect();
-                        let our_have = build_spore_havelist(&our_release_ids);
+                        let our_have = build_spore_havelist_from_releases(&our_releases);
 
                         // Compute what we should send: our_have ∩ their_want
                         let to_send = our_have.intersect(&their_want);
@@ -4375,10 +4418,10 @@ impl MeshService {
 
                         // If we have releases they want, send them as delta
                         if !to_send.is_empty() {
-                            // Find which releases match the to_send ranges
+                            // Find which releases match the to_send ranges (version-aware)
                             let releases_to_send: Vec<String> = our_releases.iter()
                                 .filter(|r| {
-                                    let hash = release_id_to_u256(&r.id);
+                                    let hash = release_to_u256(r);
                                     to_send.covers(&hash)
                                 })
                                 .filter_map(|r| serde_json::to_string(r).ok())
@@ -4397,31 +4440,45 @@ impl MeshService {
                 }
             }
             "spore_delta" => {
-                // SPORE: Receive delta transfer - releases we were missing
+                // SPORE: Receive delta transfer - releases we were missing (with CRDT merge)
                 if let Some(releases_value) = msg.get("releases").and_then(|r| r.as_array()) {
                     let mut stored_count = 0;
+                    let mut updated_count = 0;
                     for release_json in releases_value {
                         if let Some(json_str) = release_json.as_str() {
-                            if let Ok(release) = serde_json::from_str::<crate::models::Release>(json_str) {
+                            if let Ok(incoming) = serde_json::from_str::<crate::models::Release>(json_str) {
                                 // Check tombstone
-                                let tombstone = double_hash_id(&release.id);
+                                let tombstone = double_hash_id(&incoming.id);
                                 let is_tombstoned = self.state.read().await.do_not_want.contains(&tombstone);
 
                                 if is_tombstoned {
-                                    debug!("SPORE: Ignoring tombstoned release {} from delta", release.id);
-                                } else if self.storage.get_release(&release.id).ok().flatten().is_none() {
-                                    if let Err(e) = self.storage.put_release(&release) {
-                                        warn!("SPORE: Failed to store delta release {}: {}", release.id, e);
-                                    } else {
-                                        stored_count += 1;
+                                    debug!("SPORE: Ignoring tombstoned release {} from delta", incoming.id);
+                                } else {
+                                    // CRDT merge: check if we should store/replace
+                                    let existing = self.storage.get_release(&incoming.id).ok().flatten();
+                                    let should_store = match &existing {
+                                        None => true,
+                                        Some(existing_release) => existing_release.should_replace_with(&incoming),
+                                    };
+
+                                    if should_store {
+                                        if let Err(e) = self.storage.put_release(&incoming) {
+                                            warn!("SPORE: Failed to store delta release {}: {}", incoming.id, e);
+                                        } else {
+                                            if existing.is_some() {
+                                                updated_count += 1;
+                                            } else {
+                                                stored_count += 1;
+                                            }
+                                        }
                                     }
                                 }
                             }
                         }
                     }
 
-                    if stored_count > 0 {
-                        info!("SPORE: Stored {} releases from delta transfer", stored_count);
+                    if stored_count > 0 || updated_count > 0 {
+                        info!("SPORE: Delta transfer: {} new, {} updated", stored_count, updated_count);
                         // NOTE: Don't broadcast HaveList here - would cause feedback loop
                         // HaveLists are exchanged on connection, not on every state change
                     }

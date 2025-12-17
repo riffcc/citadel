@@ -2,6 +2,151 @@
 
 use serde::{Deserialize, Serialize};
 
+/// CRDT-ready version info for SPORE sync.
+///
+/// Designed for Last-Writer-Wins Register (LWWRegister) CRDT semantics:
+/// - Lamport timestamp for causal ordering
+/// - Node ID for deterministic tiebreaking
+/// - Content hash for SPORE range positioning
+/// - Replaces field for automatic garbage collection
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct VersionInfo {
+    /// Lamport timestamp - logical clock for causal ordering
+    /// Incremented on each update, max(local, received) + 1 on merge
+    #[serde(default)]
+    pub lamport: u64,
+
+    /// Node ID that last modified this release (first 8 bytes of pubkey hash)
+    /// Used for deterministic tiebreaking when lamport timestamps are equal
+    #[serde(default, with = "hex_bytes")]
+    pub node_id: [u8; 8],
+
+    /// Blake3 hash of serialized content (excludes version_info itself)
+    /// Determines position in SPORE range: hash(id || content_hash)
+    #[serde(default, with = "hex_bytes_32")]
+    pub content_hash: [u8; 32],
+
+    /// Hash of the previous version this replaces (for automatic GC)
+    /// When receiving, if replaces matches our version, replace it
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "option_hex_bytes_32")]
+    pub replaces: Option<[u8; 32]>,
+}
+
+impl VersionInfo {
+    /// Create new version info for initial release
+    pub fn new(node_id: [u8; 8], content_hash: [u8; 32]) -> Self {
+        Self {
+            lamport: 1,
+            node_id,
+            content_hash,
+            replaces: None,
+        }
+    }
+
+    /// Create updated version info (increments lamport, sets replaces)
+    pub fn update(&self, node_id: [u8; 8], new_content_hash: [u8; 32]) -> Self {
+        Self {
+            lamport: self.lamport + 1,
+            node_id,
+            content_hash: new_content_hash,
+            replaces: Some(self.content_hash),
+        }
+    }
+
+    /// CRDT merge: returns true if other wins (should replace self)
+    pub fn should_replace_with(&self, other: &VersionInfo) -> bool {
+        if other.lamport > self.lamport {
+            return true;
+        }
+        if other.lamport == self.lamport {
+            // Deterministic tiebreak: higher content_hash wins
+            return other.content_hash > self.content_hash;
+        }
+        false
+    }
+
+    /// Compute SPORE position from release ID and content hash
+    pub fn spore_position(&self, release_id: &str) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(release_id.as_bytes());
+        hasher.update(&self.content_hash);
+        *hasher.finalize().as_bytes()
+    }
+}
+
+// Hex serialization helpers for byte arrays
+mod hex_bytes {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(bytes: &[u8; 8], serializer: S) -> Result<S::Ok, S::Error>
+    where S: Serializer {
+        serializer.serialize_str(&hex::encode(bytes))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 8], D::Error>
+    where D: Deserializer<'de> {
+        let s = String::deserialize(deserializer)?;
+        let bytes = hex::decode(&s).map_err(serde::de::Error::custom)?;
+        if bytes.len() != 8 {
+            return Err(serde::de::Error::custom("expected 8 bytes"));
+        }
+        let mut arr = [0u8; 8];
+        arr.copy_from_slice(&bytes);
+        Ok(arr)
+    }
+}
+
+mod hex_bytes_32 {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(bytes: &[u8; 32], serializer: S) -> Result<S::Ok, S::Error>
+    where S: Serializer {
+        serializer.serialize_str(&hex::encode(bytes))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 32], D::Error>
+    where D: Deserializer<'de> {
+        let s = String::deserialize(deserializer)?;
+        let bytes = hex::decode(&s).map_err(serde::de::Error::custom)?;
+        if bytes.len() != 32 {
+            return Err(serde::de::Error::custom("expected 32 bytes"));
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&bytes);
+        Ok(arr)
+    }
+}
+
+mod option_hex_bytes_32 {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(opt: &Option<[u8; 32]>, serializer: S) -> Result<S::Ok, S::Error>
+    where S: Serializer {
+        match opt {
+            Some(bytes) => serializer.serialize_some(&hex::encode(bytes)),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<[u8; 32]>, D::Error>
+    where D: Deserializer<'de> {
+        let opt: Option<String> = Option::deserialize(deserializer)?;
+        match opt {
+            Some(s) => {
+                let bytes = hex::decode(&s).map_err(serde::de::Error::custom)?;
+                if bytes.len() != 32 {
+                    return Err(serde::de::Error::custom("expected 32 bytes"));
+                }
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&bytes);
+                Ok(Some(arr))
+            }
+            None => Ok(None),
+        }
+    }
+}
+
 /// A release in the Lens ecosystem.
 ///
 /// Represents any distributable content unit: music album, movie, TV series,
@@ -63,6 +208,11 @@ pub struct Release {
     /// Metadata (arbitrary key-value pairs)
     #[serde(default)]
     pub metadata: Option<serde_json::Value>,
+
+    /// CRDT version info for SPORE sync (managed by Citadel, not clients)
+    /// Contains lamport timestamp, node ID, content hash, and replaces pointer
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_info: Option<VersionInfo>,
 }
 
 fn default_schema_version() -> String {
@@ -88,6 +238,7 @@ impl Release {
             site_address: None,
             created_at: None,
             metadata: None,
+            version_info: None,
         }
     }
 
@@ -112,6 +263,78 @@ impl Release {
             self.category_slug = Some(self.category_id.clone());
         }
         self
+    }
+
+    /// Compute content hash (excludes version_info to avoid circular dependency)
+    pub fn compute_content_hash(&self) -> [u8; 32] {
+        // Create a copy without version_info for hashing
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(self.id.as_bytes());
+        hasher.update(self.title.as_bytes());
+        if let Some(ref creator) = self.creator {
+            hasher.update(creator.as_bytes());
+        }
+        if let Some(year) = self.year {
+            hasher.update(&year.to_le_bytes());
+        }
+        hasher.update(self.category_id.as_bytes());
+        if let Some(ref thumb) = self.thumbnail_cid {
+            hasher.update(thumb.as_bytes());
+        }
+        if let Some(ref content) = self.content_cid {
+            hasher.update(content.as_bytes());
+        }
+        if let Some(ref desc) = self.description {
+            hasher.update(desc.as_bytes());
+        }
+        for tag in &self.tags {
+            hasher.update(tag.as_bytes());
+        }
+        if let Some(ref meta) = self.metadata {
+            hasher.update(meta.to_string().as_bytes());
+        }
+        *hasher.finalize().as_bytes()
+    }
+
+    /// Get SPORE position for this release (uses version_info if available, else computes)
+    pub fn spore_position(&self) -> [u8; 32] {
+        if let Some(ref vi) = self.version_info {
+            vi.spore_position(&self.id)
+        } else {
+            // Fallback: hash(id || content_hash)
+            let content_hash = self.compute_content_hash();
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(self.id.as_bytes());
+            hasher.update(&content_hash);
+            *hasher.finalize().as_bytes()
+        }
+    }
+
+    /// Initialize version_info for a new release (call before first save)
+    pub fn init_version(&mut self, node_id: [u8; 8]) {
+        let content_hash = self.compute_content_hash();
+        self.version_info = Some(VersionInfo::new(node_id, content_hash));
+    }
+
+    /// Update version_info for an edited release (call before save)
+    pub fn update_version(&mut self, node_id: [u8; 8]) {
+        let new_content_hash = self.compute_content_hash();
+        if let Some(ref old_vi) = self.version_info {
+            self.version_info = Some(old_vi.update(node_id, new_content_hash));
+        } else {
+            // No previous version, initialize
+            self.version_info = Some(VersionInfo::new(node_id, new_content_hash));
+        }
+    }
+
+    /// CRDT merge: returns true if incoming release should replace this one
+    pub fn should_replace_with(&self, other: &Release) -> bool {
+        match (&self.version_info, &other.version_info) {
+            (Some(self_vi), Some(other_vi)) => self_vi.should_replace_with(other_vi),
+            (None, Some(_)) => true,  // We have no version, incoming does - accept
+            (Some(_), None) => false, // We have version, incoming doesn't - keep ours
+            (None, None) => false,    // Neither has version - keep existing
+        }
     }
 }
 
