@@ -998,11 +998,7 @@ impl CvdfCoordinator {
         if round.iterations != expected_difficulty {
             // Difficulty mismatch - could be attack or fork
             // Allow some tolerance for transition periods
-            let diff = if round.iterations > expected_difficulty {
-                round.iterations - expected_difficulty
-            } else {
-                expected_difficulty - round.iterations
-            };
+            let diff = round.iterations.abs_diff(expected_difficulty);
             // Allow up to 25% difference during transitions
             if diff > expected_difficulty / 4 {
                 self.network_health.record_fork();

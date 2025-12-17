@@ -275,9 +275,9 @@ impl FailureProof {
         // Consensus tier determines required witnesses
         match total_neighbors {
             0 | 1 => true, // Genesis/solo - any witness counts
-            2 => self.witnesses.len() >= 1, // Two-party - 1 witness
+            2 => !self.witnesses.is_empty(), // Two-party - 1 witness
             3 => self.witnesses.len() >= 2, // Three-party - 2 witnesses
-            _ => self.witnesses.len() >= (total_neighbors / 2) + 1, // BFT majority
+            _ => self.witnesses.len() > (total_neighbors / 2), // BFT majority
         }
     }
 
@@ -418,9 +418,9 @@ impl SlotValidity {
         match self.expected_neighbors {
             0 => true, // Genesis
             1 => !self.vouches.is_empty(), // 1 vouch needed
-            2 => self.vouches.len() >= 1, // 1 of 2
+            2 => !self.vouches.is_empty(), // 1 of 2
             3 => self.vouches.len() >= 2, // 2 of 3
-            n => self.vouches.len() >= (n / 2) + 1, // BFT majority
+            n => self.vouches.len() > (n / 2), // BFT majority
         }
     }
 

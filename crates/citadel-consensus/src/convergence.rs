@@ -203,7 +203,7 @@ mod tests {
     fn exclusivity_math() {
         // If X has 11 bindings, Y can have at most 9
         assert_eq!(max_remaining_bindings_after(11), 9);
-        assert!(9 < FULL_THRESHOLD);
+        const { assert!(9 < FULL_THRESHOLD); }
 
         // If X has 15 bindings, Y can have at most 5
         assert_eq!(max_remaining_bindings_after(15), 5);

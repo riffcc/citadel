@@ -216,7 +216,7 @@ async fn handle_mesh_socket(mut socket: WebSocket, state: Arc<RwLock<LensState>>
                     // If counts changed, send full snapshot
                     if peer_count != last_peer_count || slot_count != last_slot_count {
                         drop(mesh);
-                        let snapshot = create_snapshot(&mesh_state.as_ref().unwrap()).await;
+                        let snapshot = create_snapshot(mesh_state.as_ref().unwrap()).await;
                         if let Err(e) = send_event(&mut socket, snapshot).await {
                             warn!("Failed to send snapshot update: {}", e);
                             break;
@@ -279,7 +279,7 @@ async fn send_event(socket: &mut WebSocket, event: MeshEvent) -> Result<(), axum
     socket
         .send(Message::Text(json))
         .await
-        .map_err(|e| axum::Error::new(e))
+        .map_err(axum::Error::new)
 }
 
 /// Convert FloodMessage to MeshEvent
@@ -335,13 +335,13 @@ pub fn flood_to_event(msg: FloodMessage) -> Option<MeshEvent> {
         FloodMessage::CvdfAttestation { .. } => None, // Internal coordination
         FloodMessage::CvdfNewRound { round, spore_proof } => Some(MeshEvent::CvdfNewRound {
             round: round.round,
-            weight: round.weight() as u64,
+            weight: round.weight(),
             attestation_count: round.attestations.len(),
             spore_ranges: spore_proof.range_count(),  // 0 at convergence
         }),
         FloodMessage::CvdfSyncRequest { .. } => None, // Internal coordination
         FloodMessage::CvdfSyncResponse { rounds, .. } => {
-            let total_weight: u64 = rounds.iter().map(|r| r.weight() as u64).sum();
+            let total_weight: u64 = rounds.iter().map(|r| r.weight()).sum();
             Some(MeshEvent::CvdfChainUpdate {
                 height: rounds.last().map(|r| r.round).unwrap_or(0),
                 weight: total_weight,

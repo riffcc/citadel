@@ -45,7 +45,7 @@ fn verify_signature(public_key: &str, message: &[u8], signature_hex: &str) -> Re
     // Parse public key (format: "ed25519p/{hex}")
     let key_hex = public_key
         .strip_prefix("ed25519p/")
-        .ok_or_else(|| "Invalid public key format: must start with 'ed25519p/'")?;
+        .ok_or("Invalid public key format: must start with 'ed25519p/'")?;
 
     let key_bytes = hex::decode(key_hex)
         .map_err(|e| format!("Invalid public key hex: {}", e))?;
@@ -608,10 +608,10 @@ async fn delete_release(
     let state = state.read().await;
 
     // Delete from storage
-    if let Err(_) = state.storage.delete_release(&id) {
+    if state.storage.delete_release(&id).is_err() {
         return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
             "error": "Failed to delete release"
-        }))));
+       }))));
     }
 
     // SPORE: Compute double-hash tombstone and add to DoNotWantList
@@ -918,11 +918,10 @@ async fn update_featured_release(
         .ok_or(StatusCode::NOT_FOUND)?;
 
     // Verify the release exists if changing releaseId
-    if featured.release_id != req.release_id {
-        if state.storage.get_release(&req.release_id).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?.is_none() {
+    if featured.release_id != req.release_id
+        && state.storage.get_release(&req.release_id).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?.is_none() {
             return Err(StatusCode::BAD_REQUEST);
         }
-    }
 
     // Update fields
     featured.release_id = req.release_id;

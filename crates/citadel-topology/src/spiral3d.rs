@@ -442,7 +442,7 @@ mod tests {
 
         // All should have shell_radius = 1
         for coord in &shell_1 {
-            let radius = (coord.hex_distance(&HexCoord::new(0, 0, coord.z)) as u64)
+            let radius = (coord.hex_distance(&HexCoord::new(0, 0, coord.z)))
                 .max(coord.z.unsigned_abs());
             assert_eq!(radius, 1, "Coord {:?} has wrong radius", coord);
         }
