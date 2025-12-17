@@ -23,11 +23,12 @@ use tower_http::cors::{Any, CorsLayer};
 // ============================================================================
 // All write endpoints require:
 // 1. A valid ed25519 public key (in "ed25519p/{hex}" format)
-// 2. A signature over the request body
+// 2. A signature over the message (format: "{timestamp}:{body}" or "{timestamp}:{method}:{path}")
 // 3. The public key must be in the admin list
 //
-// The signature must be over the exact JSON body bytes sent in the request.
-// This prevents replay attacks and ensures only the key holder can make writes.
+// For POST/PUT: signature is over "{timestamp}:{json_body}"
+// For DELETE: signature is over "{timestamp}:DELETE:{path}"
+// The timestamp header (X-Timestamp) must be provided to reconstruct the signed message.
 // ============================================================================
 
 /// Verify an ed25519 signature over a message.
@@ -90,7 +91,8 @@ fn verify_signature(public_key: &str, message: &[u8], signature_hex: &str) -> Re
 /// * `storage` - The storage backend to check admin status
 /// * `public_key` - The public key claiming to sign the request
 /// * `signature` - The hex-encoded signature
-/// * `body` - The request body bytes that were signed
+/// * `timestamp` - The timestamp from X-Timestamp header
+/// * `body` - The request body bytes (for POST/PUT)
 ///
 /// # Returns
 /// * `Ok(())` if authenticated as admin
@@ -99,10 +101,41 @@ fn require_admin_signature(
     storage: &crate::storage::Storage,
     public_key: &str,
     signature: &str,
+    timestamp: &str,
     body: &[u8],
 ) -> Result<(), String> {
-    // First verify the signature
-    verify_signature(public_key, body, signature)?;
+    // Reconstruct the signed message: "{timestamp}:{body}"
+    // This matches what Flagship signs
+    let body_str = std::str::from_utf8(body)
+        .map_err(|e| format!("Invalid UTF-8 in request body: {}", e))?;
+    let message = format!("{}:{}", timestamp, body_str);
+
+    // Verify the signature
+    verify_signature(public_key, message.as_bytes(), signature)?;
+
+    // Then check if the key is an admin
+    if !storage.is_admin(public_key).unwrap_or(false) {
+        return Err(format!("Public key {} is not an admin", public_key));
+    }
+
+    Ok(())
+}
+
+/// Helper to check if a DELETE request is properly signed by an admin.
+///
+/// For DELETE requests, the message format is "{timestamp}:DELETE:{path}"
+fn require_admin_signature_delete(
+    storage: &crate::storage::Storage,
+    public_key: &str,
+    signature: &str,
+    timestamp: &str,
+    path: &str,
+) -> Result<(), String> {
+    // Reconstruct the signed message: "{timestamp}:DELETE:{path}"
+    let message = format!("{}:DELETE:{}", timestamp, path);
+
+    // Verify the signature
+    verify_signature(public_key, message.as_bytes(), signature)?;
 
     // Then check if the key is an admin
     if !storage.is_admin(public_key).unwrap_or(false) {
@@ -281,10 +314,17 @@ async fn create_release(
             "error": "Missing X-Signature header"
         }))))?;
 
+    let timestamp = headers
+        .get("X-Timestamp")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
+            "error": "Missing X-Timestamp header"
+        }))))?;
+
     // Verify signature and admin status
     {
         let state = state.read().await;
-        if let Err(e) = require_admin_signature(&state.storage, public_key, signature, &body) {
+        if let Err(e) = require_admin_signature(&state.storage, public_key, signature, timestamp, &body) {
             tracing::warn!("Auth failed for create_release: {}", e);
             return Err((StatusCode::FORBIDDEN, Json(serde_json::json!({
                 "error": e
@@ -423,10 +463,17 @@ async fn update_release(
             "error": "Missing X-Signature header"
         }))))?;
 
+    let timestamp = headers
+        .get("X-Timestamp")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
+            "error": "Missing X-Timestamp header"
+        }))))?;
+
     // Verify signature and admin status
     {
         let state = state.read().await;
-        if let Err(e) = require_admin_signature(&state.storage, public_key, signature, &body) {
+        if let Err(e) = require_admin_signature(&state.storage, public_key, signature, timestamp, &body) {
             tracing::warn!("Auth failed for update_release: {}", e);
             return Err((StatusCode::FORBIDDEN, Json(serde_json::json!({
                 "error": e
@@ -537,13 +584,20 @@ async fn delete_release(
             "error": "Missing X-Signature header"
         }))))?;
 
-    // For DELETE, sign the release ID
-    let message = id.as_bytes();
+    let timestamp = headers
+        .get("X-Timestamp")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
+            "error": "Missing X-Timestamp header"
+        }))))?;
+
+    // For DELETE, signature is over "{timestamp}:DELETE:/releases/{id}"
+    let path = format!("/releases/{}", id);
 
     // Verify signature and admin status
     {
         let state = state.read().await;
-        if let Err(e) = require_admin_signature(&state.storage, public_key, signature, message) {
+        if let Err(e) = require_admin_signature_delete(&state.storage, public_key, signature, timestamp, &path) {
             tracing::warn!("Auth failed for delete_release: {}", e);
             return Err((StatusCode::FORBIDDEN, Json(serde_json::json!({
                 "error": e
