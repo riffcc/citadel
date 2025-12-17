@@ -36,6 +36,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/releases", get(list_releases))
         .route("/api/v1/releases", post(create_release))
         .route("/api/v1/releases/:id", get(get_release))
+        .route("/api/v1/releases/:id", put(update_release))
         .route("/api/v1/releases/:id", delete(delete_release))
         // Categories
         .route("/api/v1/content-categories", get(list_categories))
@@ -134,22 +135,42 @@ async fn list_releases(
     Ok(Json(releases))
 }
 
+/// Request for creating a release.
+/// Accepts both camelCase (Flagship) and snake_case field names.
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct CreateReleaseRequest {
-    title: String,
+    /// Title/name of the release
+    #[serde(alias = "title")]
+    name: String,
+    /// Category ID
+    #[serde(alias = "category_id")]
     category_id: String,
+    /// Creator/artist (optional)
+    #[serde(alias = "postedBy")]
     creator: Option<String>,
+    /// Release year (optional)
     year: Option<u32>,
+    /// Description (optional)
     description: Option<String>,
+    /// Tags (optional)
     tags: Option<Vec<String>>,
+    /// Content CID (optional)
+    #[serde(alias = "content_cid")]
+    content_cid: Option<String>,
+    /// Thumbnail CID (optional)
+    #[serde(alias = "thumbnail_cid")]
+    thumbnail_cid: Option<String>,
+    /// Arbitrary metadata (optional) - for artist type, series, etc.
+    metadata: Option<serde_json::Value>,
 }
 
 async fn create_release(
     State(state): State<AppState>,
     Json(req): Json<CreateReleaseRequest>,
 ) -> Result<(StatusCode, Json<Release>), StatusCode> {
-    // Generate ID from title + timestamp
-    let content = format!("{}:{}", req.title, std::time::SystemTime::now()
+    // Generate ID from name + timestamp
+    let content = format!("{}:{}", req.name, std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis());
@@ -169,11 +190,14 @@ async fn create_release(
         }
     }
 
-    let mut release = Release::new(id, req.title, req.category_id);
+    let mut release = Release::new(id, req.name, req.category_id);
     release.creator = req.creator;
     release.year = req.year;
     release.description = req.description;
     release.tags = req.tags.unwrap_or_default();
+    release.content_cid = req.content_cid;
+    release.thumbnail_cid = req.thumbnail_cid;
+    release.metadata = req.metadata;
 
     let state = state.read().await;
     state
@@ -211,6 +235,114 @@ async fn get_release(
         Ok(None) => Err(StatusCode::NOT_FOUND),
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
+}
+
+/// Request for updating a release (same fields as create, all optional except what's changing)
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateReleaseRequest {
+    /// Title/name of the release
+    #[serde(alias = "title")]
+    name: Option<String>,
+    /// Category ID (frontend sends categoryId)
+    #[serde(alias = "categoryId")]
+    category_id: Option<String>,
+    /// Creator/artist (optional) - frontend may send postedBy
+    #[serde(alias = "postedBy")]
+    creator: Option<String>,
+    /// Release year (optional)
+    year: Option<u32>,
+    /// Description (optional)
+    description: Option<String>,
+    /// Tags (optional)
+    tags: Option<Vec<String>>,
+    /// Content CID (frontend sends contentCID)
+    #[serde(alias = "contentCID")]
+    content_cid: Option<String>,
+    /// Thumbnail CID (frontend sends thumbnailCID)
+    #[serde(alias = "thumbnailCID")]
+    thumbnail_cid: Option<String>,
+    /// Site address (frontend sends siteAddress)
+    #[serde(alias = "siteAddress")]
+    site_address: Option<String>,
+    /// Arbitrary metadata (optional)
+    metadata: Option<serde_json::Value>,
+}
+
+async fn update_release(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<UpdateReleaseRequest>,
+) -> Result<Json<Release>, StatusCode> {
+    let state = state.read().await;
+
+    // Get existing release
+    let mut release = match state.storage.get_release(&id) {
+        Ok(Some(r)) => r,
+        Ok(None) => return Err(StatusCode::NOT_FOUND),
+        Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
+    };
+
+    // Update fields if provided
+    if let Some(name) = req.name {
+        release.title = name;
+    }
+    if let Some(category_id) = req.category_id {
+        release.category_id = category_id.clone();
+        release.category_slug = Some(category_id);
+    }
+    if let Some(creator) = req.creator {
+        release.creator = Some(creator);
+    }
+    if let Some(year) = req.year {
+        release.year = Some(year);
+    }
+    if let Some(description) = req.description {
+        release.description = Some(description);
+    }
+    if let Some(tags) = req.tags {
+        release.tags = tags;
+    }
+    if let Some(content_cid) = req.content_cid {
+        release.content_cid = Some(content_cid);
+    }
+    if let Some(thumbnail_cid) = req.thumbnail_cid {
+        release.thumbnail_cid = Some(thumbnail_cid);
+    }
+    if let Some(site_address) = req.site_address {
+        release.site_address = Some(site_address);
+    }
+    if let Some(new_metadata) = req.metadata {
+        // Merge new metadata with existing metadata instead of replacing
+        if let Some(existing) = release.metadata.as_mut() {
+            if let (Some(existing_obj), Some(new_obj)) = (existing.as_object_mut(), new_metadata.as_object()) {
+                for (key, value) in new_obj {
+                    existing_obj.insert(key.clone(), value.clone());
+                }
+            } else {
+                // If not both objects, just replace
+                release.metadata = Some(new_metadata);
+            }
+        } else {
+            release.metadata = Some(new_metadata);
+        }
+    }
+
+    // Save updated release
+    state
+        .storage
+        .put_release(&release)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // SPORE: Flood the updated release to propagate across mesh
+    if let Some(ref flood_tx) = state.flood_tx {
+        if let Ok(json) = serde_json::to_string(&release) {
+            let _ = flood_tx.send(FloodMessage::Release { release_json: json });
+            tracing::debug!("SPORE: Flooding updated release {}", release.id);
+        }
+    }
+
+    Ok(Json(release.with_defaults()))
 }
 
 async fn delete_release(
