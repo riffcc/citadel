@@ -1158,12 +1158,13 @@ async fn get_network_map(
                 continue;
             }
 
-            // Check if we're directly connected to this peer
-            let (online, last_heartbeat) = if let Some(peer) = mesh.peers.get(&claim.peer_id) {
-                (true, peer.last_seen.elapsed().as_secs())
+            // TGP-NATIVE: Check authorized_peers (QuadProof-verified), not TCP peers
+            let (online, last_heartbeat) = if let Some(auth_peer) = mesh.authorized_peers.get(&claim.peer_id) {
+                // Authorized via QuadProof - definitely connected
+                (true, auth_peer.established.elapsed().as_secs())
             } else {
-                // Check by short ID prefix match
-                let connected = mesh.peers.keys().any(|k| short_peer_id(k) == short_id);
+                // Check by short ID prefix match in authorized_peers
+                let connected = mesh.authorized_peers.keys().any(|k| short_peer_id(k) == short_id);
                 (connected, 0)
             };
 
@@ -1317,17 +1318,18 @@ async fn get_mesh_state(
             })
             .collect();
 
-        let peers: Vec<PeerSummary> = mesh.peers.iter()
-            .map(|(id, peer)| PeerSummary {
+        // TGP-NATIVE: Use authorized_peers (QuadProof-verified) instead of TCP peers
+        let peers: Vec<PeerSummary> = mesh.authorized_peers.iter()
+            .map(|(id, auth_peer)| PeerSummary {
                 id: short_peer_id(id),
-                addr: peer.addr.to_string(),
-                slot: peer.slot.as_ref().map(|s| s.index),
-                coordinated: peer.coordinated,
-                last_seen_ms: peer.last_seen.elapsed().as_millis() as u64,
+                addr: auth_peer.last_addr.to_string(),
+                slot: auth_peer.slot.as_ref().map(|s| s.index),
+                coordinated: true, // Always true - only QuadProof-verified peers are in authorized_peers
+                last_seen_ms: auth_peer.established.elapsed().as_millis() as u64,
             })
             .collect();
 
-        (mesh.self_id.clone(), our_slot, mesh.peers.len(), slot_claims, peers)
+        (mesh.self_id.clone(), our_slot, mesh.authorized_peers.len(), slot_claims, peers)
     } else {
         (String::new(), None, 0, Vec::new(), Vec::new())
     };

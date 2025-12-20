@@ -65,8 +65,8 @@ use crate::storage::Storage;
 use crate::vdf_race::{VdfRace, VdfLink, AnchoredSlotClaim, claim_has_priority};
 use crate::cvdf::{CvdfCoordinator, CvdfRound, RoundAttestation};
 use citadel_protocols::{
-    CoordinatorConfig, FloodRateConfig, KeyPair, Message as TgpMessage, MessagePayload, PeerCoordinator, PublicKey,
-    QuadProof, SporeSyncManager,
+    CoordinatorConfig, FloodRateConfig, KeyPair, LightweightPacket, LightweightPhase, LightweightState,
+    Message as TgpMessage, MessagePayload, PeerCoordinator, PublicKey, QuadProof, SporeSyncManager,
 };
 use citadel_spore::{U256, Spore, Range256, SyncState as SporeSyncState, SporeMessage};
 use citadel_topology::{HexCoord, Neighbors, Spiral3DIndex, spiral3d_to_coord};
@@ -437,6 +437,109 @@ impl AuthorizedPeer {
     }
 }
 
+/// Phase of entry peer discovery handshake.
+///
+/// Two-phase protocol:
+/// 1. Lightweight TGP: Establish reliable comms (no keys needed)
+/// 2. Key Exchange: Send public keys over reliable channel
+/// 3. Full TGP: Complete with QuadProof authorization
+#[derive(Debug)]
+pub enum EntryHandshakePhase {
+    /// Phase 1: Lightweight TGP handshake (8-bit protocol, no keys)
+    Lightweight(LightweightState),
+    /// Phase 2: Exchanging public keys (reliable channel established)
+    KeyExchange {
+        /// Their public key (once received)
+        their_pubkey: Option<[u8; 32]>,
+        /// Have we sent our public key?
+        sent_our_key: bool,
+    },
+    /// Phase 3: Full TGP with QuadProof
+    FullTgp(PeerCoordinator),
+}
+
+/// Pending TGP handshake with an entry peer.
+///
+/// Uses a two-phase approach:
+/// 1. **Lightweight TGP**: 8-bit protocol to establish reliable comms
+///    (no pre-shared keys needed, just flooding)
+/// 2. **Full TGP**: Once keys are exchanged, complete with QuadProof
+///
+/// This solves the chicken-and-egg problem: TGP needs public keys,
+/// but we learn keys via communication, which needs TGP to be reliable.
+#[derive(Debug)]
+pub struct PendingEntryHandshake {
+    /// The entry peer's address (hostname:port or IP:port)
+    pub peer_addr: String,
+    /// Resolved socket address for UDP
+    pub socket_addr: SocketAddr,
+    /// Current handshake phase
+    pub phase: EntryHandshakePhase,
+    /// When this handshake was initiated
+    pub started: std::time::Instant,
+    /// Last time we sent a message (for flooding rate control)
+    pub last_send: std::time::Instant,
+}
+
+impl PendingEntryHandshake {
+    /// Create a new pending handshake for an entry peer.
+    /// Starts with Lightweight TGP to establish reliable comms.
+    pub fn new(peer_addr: String, socket_addr: SocketAddr) -> Self {
+        let now = std::time::Instant::now();
+        // Start with Lightweight TGP - no keys needed!
+        let mut lightweight = LightweightState::new("initiator");
+        lightweight.advance(); // Move to Commit phase
+        Self {
+            peer_addr,
+            socket_addr,
+            phase: EntryHandshakePhase::Lightweight(lightweight),
+            started: now,
+            last_send: now,
+        }
+    }
+
+    /// Check if lightweight phase is complete (both at Ready).
+    pub fn is_lightweight_complete(&self) -> bool {
+        match &self.phase {
+            EntryHandshakePhase::Lightweight(state) => state.my_phase == LightweightPhase::Ready,
+            _ => true, // Already past lightweight phase
+        }
+    }
+
+    /// Check if full handshake is complete (QuadProof achieved).
+    pub fn is_complete(&self) -> bool {
+        match &self.phase {
+            EntryHandshakePhase::FullTgp(coordinator) => coordinator.is_coordinated(),
+            _ => false,
+        }
+    }
+
+    /// Transition from Lightweight to KeyExchange phase.
+    pub fn advance_to_key_exchange(&mut self) {
+        if matches!(self.phase, EntryHandshakePhase::Lightweight(_)) {
+            self.phase = EntryHandshakePhase::KeyExchange {
+                their_pubkey: None,
+                sent_our_key: false,
+            };
+        }
+    }
+
+    /// Transition from KeyExchange to FullTgp phase.
+    pub fn advance_to_full_tgp(&mut self, our_keypair: KeyPair, their_pubkey: PublicKey) {
+        if matches!(self.phase, EntryHandshakePhase::KeyExchange { .. }) {
+            let mut coordinator = PeerCoordinator::symmetric(
+                our_keypair,
+                their_pubkey,
+                CoordinatorConfig::default()
+                    .with_timeout(std::time::Duration::from_secs(30))
+                    .with_flood_rate(FloodRateConfig::fast()),
+            );
+            coordinator.set_active(true);
+            self.phase = EntryHandshakePhase::FullTgp(coordinator);
+        }
+    }
+}
+
 /// Mesh service state
 pub struct MeshState {
     /// Our node ID (PeerID)
@@ -454,6 +557,14 @@ pub struct MeshState {
     /// A peer exists in this map iff we have completed bilateral TGP coordination.
     /// Unlike TCP `peers` map, there are no "phantom" or "connecting" states.
     pub authorized_peers: HashMap<String, AuthorizedPeer>,
+    /// TGP-native: Pending handshakes with entry peers (addr -> handshake state)
+    ///
+    /// Entry peer discovery via UDP TGP flooding:
+    /// 1. Send TGP commitment to entry peer address
+    /// 2. Track handshake state here until QuadProof achieved
+    /// 3. On completion, move to authorized_peers
+    /// 4. Flooding loop keeps sending until handshake completes (no explicit retry)
+    pub pending_entry_handshakes: HashMap<String, PendingEntryHandshake>,
     /// Our claimed slot in the mesh
     pub self_slot: Option<SlotClaim>,
     /// Known peers in the mesh (by PeerID)
@@ -781,6 +892,7 @@ impl MeshService {
                 tgp_keypair,
                 udp_socket: None,  // Set when run() is called
                 authorized_peers: HashMap::new(),  // TGP-native: QuadProof-authorized peers
+                pending_entry_handshakes: HashMap::new(),  // TGP-native: pending entry peer handshakes
                 self_slot: None,
                 peers: HashMap::new(),
                 claimed_slots: HashMap::new(),
@@ -1642,7 +1754,25 @@ impl MeshService {
             match socket.recv_from(&mut buf).await {
                 Ok((len, src_addr)) => {
                     info!("UDP recv {} bytes from {}", len, src_addr);
-                    // Deserialize TGP message
+
+                    // Try to parse as JSON first to check message type
+                    if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&buf[..len]) {
+                        if let Some(msg_type) = json.get("type").and_then(|t| t.as_str()) {
+                            match msg_type {
+                                "lightweight_tgp" => {
+                                    self.handle_lightweight_tgp_message(src_addr, &json, &socket).await;
+                                    continue;
+                                }
+                                "key_exchange" => {
+                                    self.handle_key_exchange_message(src_addr, &json, &socket).await;
+                                    continue;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+
+                    // Try to deserialize as full TGP message
                     match serde_json::from_slice::<TgpMessage>(&buf[..len]) {
                         Ok(tgp_msg) => {
                             // Handle message and immediately send response (event-driven)
@@ -1672,6 +1802,394 @@ impl MeshService {
             MessagePayload::DoubleProof(d) => Some(*d.own_commitment.public_key.as_bytes()),
             MessagePayload::TripleProof(t) => Some(*t.own_double.own_commitment.public_key.as_bytes()),
             MessagePayload::QuadProof(q) => Some(*q.own_triple.own_double.own_commitment.public_key.as_bytes()),
+        }
+    }
+
+    /// Handle incoming Lightweight TGP message during entry peer handshake.
+    /// Advances the handshake state and transitions to key exchange when Ready.
+    async fn handle_lightweight_tgp_message(
+        &self,
+        src_addr: SocketAddr,
+        json: &serde_json::Value,
+        socket: &UdpSocket,
+    ) {
+        // Parse the packet byte
+        let Some(packet_byte) = json.get("packet").and_then(|p| p.as_u64()).map(|p| p as u8) else {
+            warn!("Lightweight TGP from {}: missing packet byte", src_addr);
+            return;
+        };
+
+        let packet = LightweightPacket::from_u8(packet_byte);
+        let peer_key = src_addr.to_string();
+
+        // Process the packet and determine next actions
+        let (response_bytes, transition_to_key_exchange, our_pubkey) = {
+            let mut state = self.state.write().await;
+
+            // Get our public key first (before mutable borrow)
+            let our_pubkey = *state.tgp_keypair.public_key().as_bytes();
+
+            // Find or create the pending handshake for this peer
+            // If we don't have a handshake, create one as the responder
+            if !state.pending_entry_handshakes.contains_key(&peer_key) {
+                // Check by socket address
+                let found_by_addr = state.pending_entry_handshakes.iter()
+                    .any(|(_, h)| h.socket_addr == src_addr);
+                if !found_by_addr {
+                    info!("Creating handshake for incoming Lightweight TGP from {}", src_addr);
+                    let now = std::time::Instant::now();
+                    // Responder starts at Init phase (will advance based on received packet)
+                    let handshake = PendingEntryHandshake {
+                        peer_addr: peer_key.clone(),
+                        socket_addr: src_addr,
+                        phase: EntryHandshakePhase::Lightweight(LightweightState::new("responder")),
+                        started: now,
+                        last_send: now,
+                    };
+                    state.pending_entry_handshakes.insert(peer_key.clone(), handshake);
+                }
+            }
+
+            let handshake = match state.pending_entry_handshakes.get_mut(&peer_key) {
+                Some(h) => h,
+                None => {
+                    // Check if peer is in entry peers list by socket address
+                    let found = state.pending_entry_handshakes.iter_mut()
+                        .find(|(_, h)| h.socket_addr == src_addr);
+                    match found {
+                        Some((_, h)) => h,
+                        None => {
+                            warn!("Failed to find handshake for {} after creation", src_addr);
+                            return;
+                        }
+                    }
+                }
+            };
+
+            // Must be in Lightweight phase
+            let lightweight_state = match &mut handshake.phase {
+                EntryHandshakePhase::Lightweight(state) => state,
+                _ => {
+                    info!("Lightweight TGP from {} but not in Lightweight phase", src_addr);
+                    return;
+                }
+            };
+
+            // Process the packet
+            lightweight_state.receive(packet);
+            lightweight_state.advance();
+
+            info!("Lightweight TGP from {}: my_phase={:?}, saw_their={:?}",
+                src_addr, lightweight_state.my_phase, lightweight_state.saw_their_phase);
+
+            // Create response packet
+            let response_packet = lightweight_state.make_packet();
+            let response = serde_json::json!({
+                "type": "lightweight_tgp",
+                "packet": response_packet.to_u8(),
+            });
+            let response_bytes = serde_json::to_vec(&response).ok();
+
+            // Check if we've reached Ready phase
+            let transition = lightweight_state.my_phase == LightweightPhase::Ready;
+            if transition {
+                info!("Lightweight TGP complete with {} - transitioning to key exchange", src_addr);
+                handshake.phase = EntryHandshakePhase::KeyExchange {
+                    their_pubkey: None,
+                    sent_our_key: false,
+                };
+                handshake.last_send = std::time::Instant::now();
+            }
+
+            (response_bytes, transition, our_pubkey)
+        };
+
+        // Send response (lock released)
+        if let Some(bytes) = response_bytes {
+            if let Err(e) = socket.send_to(&bytes, src_addr).await {
+                warn!("Failed to send Lightweight TGP response to {}: {}", src_addr, e);
+            }
+        }
+
+        // Send key exchange if transitioning
+        if transition_to_key_exchange {
+            let key_msg = serde_json::json!({
+                "type": "key_exchange",
+                "pubkey": hex::encode(&our_pubkey),
+            });
+            if let Ok(bytes) = serde_json::to_vec(&key_msg) {
+                if let Err(e) = socket.send_to(&bytes, src_addr).await {
+                    warn!("Failed to send key exchange to {}: {}", src_addr, e);
+                }
+            }
+        }
+    }
+
+    /// Handle incoming key exchange message during entry peer handshake.
+    /// Stores the peer's public key and transitions to full TGP when complete.
+    async fn handle_key_exchange_message(
+        &self,
+        src_addr: SocketAddr,
+        json: &serde_json::Value,
+        socket: &UdpSocket,
+    ) {
+        // Parse their public key
+        let Some(pubkey_hex) = json.get("pubkey").and_then(|p| p.as_str()) else {
+            warn!("Key exchange from {}: missing pubkey", src_addr);
+            return;
+        };
+
+        let their_pubkey = match hex::decode(pubkey_hex) {
+            Ok(bytes) if bytes.len() == 32 => {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&bytes);
+                arr
+            }
+            _ => {
+                warn!("Key exchange from {}: invalid pubkey format", src_addr);
+                return;
+            }
+        };
+
+        let peer_key = src_addr.to_string();
+
+        // Process the key exchange and collect actions
+        enum KeyExchangeAction {
+            SendOurKey([u8; 32]),
+            TransitionToTgp { their_key: [u8; 32], my_keypair: KeyPair },
+            None,
+        }
+
+        let action = {
+            let mut state = self.state.write().await;
+
+            // Get our keypair first
+            let my_keypair = (*state.tgp_keypair).clone();
+            let our_pubkey = *state.tgp_keypair.public_key().as_bytes();
+
+            // Find handshake
+            let handshake = match state.pending_entry_handshakes.get_mut(&peer_key) {
+                Some(h) => h,
+                None => {
+                    let found = state.pending_entry_handshakes.iter_mut()
+                        .find(|(_, h)| h.socket_addr == src_addr);
+                    match found {
+                        Some((_, h)) => h,
+                        None => {
+                            info!("Key exchange from unknown peer {}", src_addr);
+                            return;
+                        }
+                    }
+                }
+            };
+
+            // Must be in KeyExchange phase
+            match &mut handshake.phase {
+                EntryHandshakePhase::KeyExchange { their_pubkey: stored_key, sent_our_key } => {
+                    info!("Key exchange from {}: received pubkey {}", src_addr, &pubkey_hex[..12]);
+
+                    // Store their key
+                    *stored_key = Some(their_pubkey);
+
+                    // Determine action
+                    if !*sent_our_key {
+                        *sent_our_key = true;
+                        KeyExchangeAction::SendOurKey(our_pubkey)
+                    } else {
+                        // Both keys exchanged - transition to full TGP
+                        KeyExchangeAction::TransitionToTgp {
+                            their_key: their_pubkey,
+                            my_keypair,
+                        }
+                    }
+                }
+                _ => {
+                    info!("Key exchange from {} but not in KeyExchange phase", src_addr);
+                    return;
+                }
+            }
+        };
+
+        // Execute actions outside the lock
+        match action {
+            KeyExchangeAction::SendOurKey(our_pubkey) => {
+                let key_msg = serde_json::json!({
+                    "type": "key_exchange",
+                    "pubkey": hex::encode(&our_pubkey),
+                });
+                if let Ok(bytes) = serde_json::to_vec(&key_msg) {
+                    if let Err(e) = socket.send_to(&bytes, src_addr).await {
+                        warn!("Failed to send key exchange to {}: {}", src_addr, e);
+                    }
+                }
+
+                // Now check if we should also transition (we just received their key too)
+                let mut state = self.state.write().await;
+
+                // Get keypair first (before mutable borrow of handshake)
+                let my_keypair = (*state.tgp_keypair).clone();
+
+                let handshake = match state.pending_entry_handshakes.get_mut(&peer_key) {
+                    Some(h) => h,
+                    None => {
+                        let found = state.pending_entry_handshakes.iter_mut()
+                            .find(|(_, h)| h.socket_addr == src_addr);
+                        match found {
+                            Some((_, h)) => h,
+                            None => return,
+                        }
+                    }
+                };
+
+                if let EntryHandshakePhase::KeyExchange { their_pubkey: Some(their_key), sent_our_key: true } = &handshake.phase {
+                    let their_key = *their_key;
+
+                    info!("Key exchange complete with {} - transitioning to full TGP", src_addr);
+
+                    let counterparty = match PublicKey::from_bytes(&their_key) {
+                        Ok(pk) => pk,
+                        Err(e) => {
+                            warn!("Failed to create PublicKey from bytes: {}", e);
+                            return;
+                        }
+                    };
+
+                    let mut coordinator = PeerCoordinator::symmetric(
+                        my_keypair,
+                        counterparty.clone(),
+                        CoordinatorConfig::default()
+                            .with_flood_rate(FloodRateConfig::fast())
+                    );
+                    coordinator.set_active(true);
+
+                    // Register peer in state.peers so handle_tgp_message can find it
+                    let peer_id = format!("peer-{}", src_addr);
+                    state.peers.insert(
+                        peer_id.clone(),
+                        MeshPeer {
+                            id: peer_id.clone(),
+                            addr: src_addr,
+                            public_key: Some(their_key.to_vec()),
+                            last_seen: std::time::Instant::now(),
+                            coordinated: false,
+                            slot: None,
+                            is_entry_peer: false, // Discovered via TGP
+                            content_synced: false,
+                            their_have: None,
+                        },
+                    );
+
+                    // Remove from pending_entry_handshakes - TGP is now handled by tgp_sessions
+                    state.pending_entry_handshakes.remove(&peer_key);
+                    // Also try to remove by socket address in case key differs
+                    let addr_key = state.pending_entry_handshakes.iter()
+                        .find(|(_, h)| h.socket_addr == src_addr)
+                        .map(|(k, _)| k.clone());
+                    if let Some(k) = addr_key {
+                        state.pending_entry_handshakes.remove(&k);
+                    }
+
+                    // Add session to tgp_sessions so handle_tgp_message uses the same coordinator
+                    // Get socket before releasing state lock
+                    let socket = state.udp_socket.clone();
+                    drop(state); // Release state lock before acquiring tgp_sessions lock
+                    {
+                        let mut sessions = self.tgp_sessions.write().await;
+                        sessions.insert(
+                            peer_id.clone(),
+                            TgpSession {
+                                coordinator,
+                                commitment: String::new(),
+                                result_tx: None,
+                                peer_tgp_addr: src_addr,
+                            },
+                        );
+                    }
+
+                    info!("Started full TGP coordination with entry peer {} (registered as {})", src_addr, peer_id);
+
+                    // Send initial TGP messages to start the coordination
+                    if let Some(socket) = socket {
+                        self.send_tgp_messages(&socket, &peer_id).await;
+                    }
+                }
+            }
+            KeyExchangeAction::TransitionToTgp { their_key, my_keypair } => {
+                info!("Key exchange complete with {} - transitioning to full TGP", src_addr);
+
+                let counterparty = match PublicKey::from_bytes(&their_key) {
+                    Ok(pk) => pk,
+                    Err(e) => {
+                        warn!("Failed to create PublicKey from bytes: {}", e);
+                        return;
+                    }
+                };
+
+                let mut coordinator = PeerCoordinator::symmetric(
+                    my_keypair,
+                    counterparty,
+                    CoordinatorConfig::default()
+                        .with_flood_rate(FloodRateConfig::fast())
+                );
+                coordinator.set_active(true);
+
+                // Register peer in state.peers so handle_tgp_message can find it
+                let peer_id = format!("peer-{}", src_addr);
+                {
+                    let mut state = self.state.write().await;
+                    state.peers.insert(
+                        peer_id.clone(),
+                        MeshPeer {
+                            id: peer_id.clone(),
+                            addr: src_addr,
+                            public_key: Some(their_key.to_vec()),
+                            last_seen: std::time::Instant::now(),
+                            coordinated: false,
+                            slot: None,
+                            is_entry_peer: false, // Discovered via TGP
+                            content_synced: false,
+                            their_have: None,
+                        },
+                    );
+
+                    // Remove from pending_entry_handshakes - TGP is now handled by tgp_sessions
+                    state.pending_entry_handshakes.remove(&peer_key);
+                    // Also try to remove by socket address in case key differs
+                    let addr_key = state.pending_entry_handshakes.iter()
+                        .find(|(_, h)| h.socket_addr == src_addr)
+                        .map(|(k, _)| k.clone());
+                    if let Some(k) = addr_key {
+                        state.pending_entry_handshakes.remove(&k);
+                    }
+
+                    // Get socket before releasing state lock
+                    let socket = state.udp_socket.clone();
+                    drop(state);
+
+                    // Add session to tgp_sessions so handle_tgp_message uses the same coordinator
+                    {
+                        let mut sessions = self.tgp_sessions.write().await;
+                        sessions.insert(
+                            peer_id.clone(),
+                            TgpSession {
+                                coordinator,
+                                commitment: String::new(),
+                                result_tx: None,
+                                peer_tgp_addr: src_addr,
+                            },
+                        );
+                    }
+
+                    info!("Started full TGP coordination with entry peer {} (registered as {})", src_addr, peer_id);
+
+                    // Send initial TGP messages to start the coordination
+                    if let Some(socket) = socket {
+                        self.send_tgp_messages(&socket, &peer_id).await;
+                    }
+                    return;  // Early return since we dropped state
+                }
+            }
+            KeyExchangeAction::None => {}
         }
     }
 
@@ -1929,11 +2447,13 @@ impl MeshService {
             self_clone.init_cvdf_genesis().await;
             self_clone.init_vdf_genesis().await;
 
-            // Connect to entry peers (if any)
-            // When connected, we'll exchange chain states and adopt heavier chains
-            let connected = self_clone.connect_to_entry_peers().await;
-            if connected > 0 {
-                info!("Connected to {} peer(s), exchanging chain states", connected);
+            // TGP-NATIVE MODE: Connect to entry peers via UDP TGP ONLY
+            // "Connection isn't a socket—it's a proof" (QuadProof)
+            // TCP is GONE. All peer authorization is via cryptographic coordination.
+            let tgp_initiated = self_clone.discover_entry_peers_tgp().await;
+
+            if tgp_initiated > 0 {
+                info!("TGP-NATIVE: {} handshakes initiated (connection = proof)", tgp_initiated);
             } else if self_clone.entry_peers.is_empty() {
                 info!("No peers configured - running as standalone genesis");
             } else {
@@ -1981,21 +2501,73 @@ impl MeshService {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(retry_secs)).await;
 
-                // Only retry if we have no peers and have entry peers configured
-                let peer_count = self_clone.state.read().await.peers.len();
-                if peer_count == 0 && !self_clone.entry_peers.is_empty() {
-                    info!("Isolated (0 peers) - retrying entry peers (backoff {}s)", retry_secs);
-                    let connected = self_clone.connect_to_entry_peers().await;
-                    if connected > 0 {
-                        info!("Reconnected to {} entry peer(s)", connected);
-                        retry_secs = MIN_RETRY_SECS; // Reset backoff on success
+                // TGP-NATIVE: Check authorized_peers (QuadProof holders), not TCP peers
+                let authorized_count = self_clone.state.read().await.authorized_peers.len();
+                if authorized_count == 0 && !self_clone.entry_peers.is_empty() {
+                    info!("Isolated (0 authorized peers) - retrying TGP discovery (backoff {}s)", retry_secs);
+                    let initiated = self_clone.discover_entry_peers_tgp().await;
+                    if initiated > 0 {
+                        info!("Re-initiated {} TGP handshakes", initiated);
+                        retry_secs = MIN_RETRY_SECS; // Reset backoff
                     } else {
                         // Exponential backoff on failure
                         retry_secs = std::cmp::min(retry_secs * 2, MAX_RETRY_SECS);
                     }
-                } else if peer_count > 0 {
-                    // Have peers - reset backoff for when we next become isolated
+                } else if authorized_count > 0 {
+                    // Have authorized peers - reset backoff
                     retry_secs = MIN_RETRY_SECS;
+                }
+            }
+        });
+
+        // Spawn TGP handshake flooding loop with ADAPTIVE RATE MODULATION
+        // Per AdaptiveBilateral.lean: rate-independent bilateral construction
+        // Primary responses are event-driven (on recv). This loop handles:
+        // 1. Burst mode: active handshake advancement
+        // 2. Drip mode: keepalive/retransmit for packet loss
+        let self_clone = Arc::clone(&self);
+        tokio::spawn(async move {
+            // Adaptive rate controller (per AdaptiveBilateral.lean modulate_rate)
+            const MIN_RATE_PPS: u64 = 1;     // 1 pkt/sec drip mode (keepalive)
+            const MAX_RATE_PPS: u64 = 100;   // 100 pkt/sec burst mode
+            const RAMP_UP: u64 = 10;         // +10 pkt/sec² acceleration
+            const RAMP_DOWN: u64 = 5;        // -5 pkt/sec² deceleration
+
+            let mut current_rate = MIN_RATE_PPS;
+
+            loop {
+                // Calculate interval from current rate (pkt/sec → ms/pkt)
+                let interval_ms = 1000 / current_rate.max(1);
+                tokio::time::sleep(std::time::Duration::from_millis(interval_ms)).await;
+
+                // Check if we have pending handshakes that need advancement
+                let state = self_clone.state.read().await;
+                let data_needed = state.pending_entry_handshakes.iter().any(|(_, h)| {
+                    match &h.phase {
+                        EntryHandshakePhase::Lightweight(ls) => {
+                            // Need to advance if peer saw less than our phase
+                            ls.saw_their_phase < ls.my_phase
+                        }
+                        EntryHandshakePhase::KeyExchange { their_pubkey, sent_our_key } => {
+                            // Need to send if we haven't or haven't received theirs
+                            !*sent_our_key || their_pubkey.is_none()
+                        }
+                        EntryHandshakePhase::FullTgp(_) => false, // Handled by coordinator
+                    }
+                });
+                let has_pending = !state.pending_entry_handshakes.is_empty();
+                drop(state);
+
+                // Adaptive rate modulation (from AdaptiveBilateral.lean modulate_rate)
+                if data_needed && current_rate < MAX_RATE_PPS {
+                    current_rate = (current_rate + RAMP_UP).min(MAX_RATE_PPS);
+                } else if !data_needed && current_rate > MIN_RATE_PPS {
+                    current_rate = current_rate.saturating_sub(RAMP_DOWN).max(MIN_RATE_PPS);
+                }
+
+                // Only flood if we have pending handshakes
+                if has_pending {
+                    self_clone.flood_entry_handshakes().await;
                 }
             }
         });
@@ -2106,6 +2678,230 @@ impl MeshService {
         }
 
         connected
+    }
+
+    /// TGP-NATIVE: Initiate entry peer discovery via UDP Lightweight TGP.
+    ///
+    /// This is the TGP-native replacement for TCP-based `connect_to_entry_peers()`.
+    /// Uses a two-phase protocol:
+    /// 1. Lightweight TGP (8-bit) to establish reliable comms
+    /// 2. Key exchange over the reliable channel
+    /// 3. Full TGP for QuadProof authorization
+    ///
+    /// Returns the number of handshakes initiated.
+    async fn discover_entry_peers_tgp(self: &Arc<Self>) -> usize {
+        let mut initiated = 0;
+
+        // Check which peers already have pending, in-progress, or completed handshakes
+        let (already_pending, already_authorized, already_in_tgp_sessions): (
+            std::collections::HashSet<_>,
+            std::collections::HashSet<_>,
+            std::collections::HashSet<_>,
+        ) = {
+            let state = self.state.read().await;
+            let sessions = self.tgp_sessions.read().await;
+            (
+                state.pending_entry_handshakes.keys().cloned().collect(),
+                // Check by socket address in authorized_peers
+                state.authorized_peers.values()
+                    .map(|p| p.last_addr.to_string().split(':').next().unwrap_or("").to_string())
+                    .collect(),
+                // Check by socket address in tgp_sessions (full TGP in progress)
+                sessions.values()
+                    .map(|s| s.peer_tgp_addr.ip().to_string())
+                    .collect(),
+            )
+        };
+
+        for peer_addr in &self.entry_peers {
+            // Skip if we already have a pending handshake
+            if already_pending.contains(peer_addr) {
+                debug!("TGP-NATIVE: Handshake already pending for {}", peer_addr);
+                continue;
+            }
+
+            // Skip if we're already authorized (check by hostname)
+            let hostname = peer_addr.split(':').next().unwrap_or(peer_addr);
+            if already_authorized.iter().any(|addr| addr.contains(hostname)) {
+                debug!("TGP-NATIVE: Already authorized with {}", peer_addr);
+                continue;
+            }
+
+            // Skip if we already have a full TGP session in progress
+            if already_in_tgp_sessions.iter().any(|addr| addr.contains(hostname)) {
+                debug!("TGP-NATIVE: Full TGP already in progress for {}", peer_addr);
+                continue;
+            }
+
+            info!("TGP-NATIVE: Initiating discovery for {}", peer_addr);
+
+            // Resolve DNS
+            let resolved_addrs: Vec<SocketAddr> = match tokio::net::lookup_host(peer_addr).await {
+                Ok(addrs) => addrs.collect(),
+                Err(e) => {
+                    warn!("TGP-NATIVE: DNS resolution failed for {}: {}", peer_addr, e);
+                    continue;
+                }
+            };
+
+            if resolved_addrs.is_empty() {
+                warn!("TGP-NATIVE: No addresses found for {}", peer_addr);
+                continue;
+            }
+
+            // Use first resolved address (prefer IPv4 if available)
+            let socket_addr = resolved_addrs
+                .iter()
+                .find(|a| a.is_ipv4())
+                .or(resolved_addrs.first())
+                .copied()
+                .unwrap();
+
+            // Create pending handshake (starts in Lightweight phase)
+            let handshake = PendingEntryHandshake::new(peer_addr.clone(), socket_addr);
+
+            // Store in state
+            {
+                let mut state = self.state.write().await;
+                state.pending_entry_handshakes.insert(peer_addr.clone(), handshake);
+            }
+
+            info!("TGP-NATIVE: Started Lightweight TGP handshake with {} at {}", peer_addr, socket_addr);
+            initiated += 1;
+        }
+
+        // Send initial Lightweight TGP packets
+        if initiated > 0 {
+            self.flood_entry_handshakes().await;
+        }
+
+        initiated
+    }
+
+    /// TGP-NATIVE: Flood messages to pending entry peer handshakes.
+    ///
+    /// Called periodically to advance handshakes. Lightweight TGP uses
+    /// continuous flooding - no explicit retry logic needed.
+    async fn flood_entry_handshakes(self: &Arc<Self>) {
+        let socket = {
+            let state = self.state.read().await;
+            state.udp_socket.clone()
+        };
+
+        let Some(socket) = socket else {
+            debug!("TGP-NATIVE: UDP socket not ready for flooding");
+            return;
+        };
+
+        let our_keypair = {
+            let state = self.state.read().await;
+            (*state.tgp_keypair).clone()
+        };
+
+        // Collect pending handshakes and their messages
+        let mut messages_to_send: Vec<(SocketAddr, Vec<u8>)> = Vec::new();
+        let mut completed_handshakes: Vec<String> = Vec::new();
+
+        {
+            let mut state = self.state.write().await;
+            for (peer_addr, handshake) in state.pending_entry_handshakes.iter_mut() {
+                match &mut handshake.phase {
+                    EntryHandshakePhase::Lightweight(lightweight) => {
+                        // Advance phase if possible
+                        lightweight.advance();
+
+                        // Create and send Lightweight packet
+                        let packet = lightweight.make_packet();
+                        let msg = serde_json::json!({
+                            "type": "lightweight_tgp",
+                            "packet": packet.to_u8(),
+                            "pubkey": hex::encode(our_keypair.public_key().as_bytes()),
+                        });
+                        if let Ok(data) = serde_json::to_vec(&msg) {
+                            messages_to_send.push((handshake.socket_addr, data));
+                        }
+
+                        // Check if ready to advance to key exchange
+                        if lightweight.my_phase == LightweightPhase::Ready
+                            && lightweight.saw_their_phase >= LightweightPhase::Double
+                        {
+                            info!("TGP-NATIVE: Lightweight complete with {}, moving to key exchange", peer_addr);
+                            handshake.advance_to_key_exchange();
+                        }
+                    }
+                    EntryHandshakePhase::KeyExchange { their_pubkey, sent_our_key } => {
+                        // Send our public key if not yet sent
+                        if !*sent_our_key {
+                            let msg = serde_json::json!({
+                                "type": "key_exchange",
+                                "pubkey": hex::encode(our_keypair.public_key().as_bytes()),
+                            });
+                            if let Ok(data) = serde_json::to_vec(&msg) {
+                                messages_to_send.push((handshake.socket_addr, data));
+                            }
+                            *sent_our_key = true;
+                        }
+
+                        // If we have their key, advance to full TGP
+                        if let Some(their_key_bytes) = their_pubkey {
+                            if let Ok(their_key) = PublicKey::from_bytes(their_key_bytes) {
+                                info!("TGP-NATIVE: Got peer key for {}, starting full TGP", peer_addr);
+                                handshake.advance_to_full_tgp(our_keypair.clone(), their_key);
+                            }
+                        }
+                    }
+                    EntryHandshakePhase::FullTgp(coordinator) => {
+                        // Check if complete
+                        if coordinator.is_coordinated() {
+                            info!("TGP-NATIVE: QuadProof achieved with {}!", peer_addr);
+                            completed_handshakes.push(peer_addr.clone());
+                        } else {
+                            // Poll for messages
+                            if let Ok(Some(tgp_messages)) = coordinator.poll() {
+                                for tgp_msg in tgp_messages {
+                                    if let Ok(data) = serde_json::to_vec(&tgp_msg) {
+                                        messages_to_send.push((handshake.socket_addr, data));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                handshake.last_send = std::time::Instant::now();
+            }
+        }
+
+        // Send messages outside of lock
+        for (addr, data) in messages_to_send {
+            if let Err(e) = socket.send_to(&data, addr).await {
+                debug!("TGP-NATIVE: Failed to send to {}: {}", addr, e);
+            }
+        }
+
+        // Move completed handshakes to authorized_peers
+        if !completed_handshakes.is_empty() {
+            let mut state = self.state.write().await;
+            for peer_addr in completed_handshakes {
+                if let Some(handshake) = state.pending_entry_handshakes.remove(&peer_addr) {
+                    if let EntryHandshakePhase::FullTgp(coordinator) = handshake.phase {
+                        if let Some((our_quad, their_quad)) = coordinator.get_bilateral_receipt() {
+                            let peer_id = format!("tgp-{}", peer_addr);
+                            // Note: We'd need to extract the actual peer ID from the coordinator
+                            // For now, use the address as peer ID
+                            let authorized = AuthorizedPeer::new(
+                                peer_id.clone(),
+                                [0u8; 32], // TODO: Extract actual public key
+                                our_quad.clone(),
+                                their_quad.clone(),
+                                handshake.socket_addr,
+                            );
+                            state.authorized_peers.insert(peer_id, authorized);
+                            info!("TGP-NATIVE: {} added to authorized_peers", peer_addr);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Handle a peer connection
