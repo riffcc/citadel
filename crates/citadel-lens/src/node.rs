@@ -48,6 +48,67 @@ impl Default for LensConfig {
 }
 
 impl LensConfig {
+    /// Create config from CLI arguments with defaults.
+    /// CLI arguments take precedence (clap already handles env var fallback).
+    pub fn from_cli(
+        data_dir: Option<String>,
+        api_bind: Option<String>,
+        p2p_bind: Option<String>,
+        announce_addr: Option<String>,
+        peers: Option<Vec<String>>,
+        admin_socket: Option<String>,
+        admin_key: Option<String>,
+    ) -> Self {
+        let data_dir = PathBuf::from(data_dir.unwrap_or_else(|| "./lens-data".to_string()));
+
+        let api_addr = api_bind
+            .unwrap_or_else(|| "0.0.0.0:8080".to_string())
+            .parse()
+            .expect("Invalid api-bind address");
+
+        let p2p_addr = p2p_bind
+            .unwrap_or_else(|| "0.0.0.0:9000".to_string())
+            .parse()
+            .expect("Invalid p2p-bind address");
+
+        let announce_addr = announce_addr
+            .filter(|s| !s.is_empty())
+            .and_then(|s| s.parse().ok());
+
+        // Normalize peers - add default port if missing
+        let bootstrap_peers = peers
+            .map(|v| {
+                v.into_iter()
+                    .map(|p| p.trim().to_string())
+                    .filter(|p| !p.is_empty())
+                    .map(|p| {
+                        if p.contains(':') {
+                            p
+                        } else {
+                            format!("{}:9000", p)
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let admin_socket = admin_socket
+            .map(PathBuf::from)
+            .unwrap_or_else(|| data_dir.join("admin.sock"));
+
+        let admin_public_key = admin_key.filter(|s| !s.is_empty());
+
+        Self {
+            data_dir,
+            api_addr,
+            p2p_addr,
+            announce_addr,
+            bootstrap_peers,
+            admin_socket,
+            admin_public_key,
+        }
+    }
+
     /// Create config from environment variables with sensible defaults.
     pub fn from_env() -> Self {
         let data_dir = PathBuf::from(
