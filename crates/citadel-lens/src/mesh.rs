@@ -1868,21 +1868,32 @@ impl MeshService {
         });
 
         // Spawn entry peer retry loop - keeps trying to connect when isolated
+        // Uses exponential backoff: 1s -> 2s -> 4s -> 8s -> ... -> 60s max
         // All peers are equal - CITADEL_PEERS are just entry points, not "bootstrap" nodes
         let self_clone = Arc::clone(&self);
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+            const MIN_RETRY_SECS: u64 = 1;
+            const MAX_RETRY_SECS: u64 = 60;
+            let mut retry_secs = MIN_RETRY_SECS;
+
             loop {
-                interval.tick().await;
+                tokio::time::sleep(std::time::Duration::from_secs(retry_secs)).await;
 
                 // Only retry if we have no peers and have entry peers configured
                 let peer_count = self_clone.state.read().await.peers.len();
                 if peer_count == 0 && !self_clone.entry_peers.is_empty() {
-                    info!("Isolated (0 peers) - retrying entry peers");
+                    info!("Isolated (0 peers) - retrying entry peers (backoff {}s)", retry_secs);
                     let connected = self_clone.connect_to_entry_peers().await;
                     if connected > 0 {
                         info!("Reconnected to {} entry peer(s)", connected);
+                        retry_secs = MIN_RETRY_SECS; // Reset backoff on success
+                    } else {
+                        // Exponential backoff on failure
+                        retry_secs = std::cmp::min(retry_secs * 2, MAX_RETRY_SECS);
                     }
+                } else if peer_count > 0 {
+                    // Have peers - reset backoff for when we next become isolated
+                    retry_secs = MIN_RETRY_SECS;
                 }
             }
         });
@@ -1953,14 +1964,16 @@ impl MeshService {
                 continue;
             }
 
-            // Try each resolved address (IPv4 preferred)
+            // Try each resolved address (IPv4 preferred) with 5s timeout
             let mut peer_connected = false;
             let addr_count = resolved_addrs.len();
+            let connect_timeout = std::time::Duration::from_secs(5);
+
             for resolved_addr in resolved_addrs {
                 debug!("Trying {} -> {}", peer_addr, resolved_addr);
 
-                match TcpStream::connect(resolved_addr).await {
-                    Ok(stream) => {
+                match tokio::time::timeout(connect_timeout, TcpStream::connect(resolved_addr)).await {
+                    Ok(Ok(stream)) => {
                         info!("Connected to entry peer {} at {}", peer_addr, resolved_addr);
                         connected += 1;
                         peer_connected = true;
@@ -1976,8 +1989,11 @@ impl MeshService {
                         });
                         break; // Connected successfully, don't try other addresses
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         debug!("Failed to connect to {} ({}): {}", peer_addr, resolved_addr, e);
+                    }
+                    Err(_) => {
+                        debug!("Timeout connecting to {} ({})", peer_addr, resolved_addr);
                     }
                 }
             }
