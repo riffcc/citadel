@@ -66,7 +66,7 @@ use crate::vdf_race::{VdfRace, VdfLink, AnchoredSlotClaim, claim_has_priority};
 use crate::cvdf::{CvdfCoordinator, CvdfRound, RoundAttestation};
 use citadel_protocols::{
     CoordinatorConfig, FloodRateConfig, KeyPair, Message as TgpMessage, MessagePayload, PeerCoordinator, PublicKey,
-    SporeSyncManager,
+    QuadProof, SporeSyncManager,
 };
 use citadel_spore::{U256, Spore, Range256, SyncState as SporeSyncState, SporeMessage};
 use citadel_topology::{HexCoord, Neighbors, Spiral3DIndex, spiral3d_to_coord};
@@ -372,6 +372,71 @@ pub struct TgpSession {
     pub peer_tgp_addr: SocketAddr,
 }
 
+/// A peer authorized via TGP QuadProof.
+///
+/// # TGP-Native Architecture
+///
+/// In TGP-native mesh, **connection isn't a socket—it's a proof**.
+/// Once two peers complete the TGP handshake (C→D→T→Q), they have
+/// bilateral QuadProofs that serve as permanent authorization.
+///
+/// Benefits over TCP connection state:
+/// - **No phantom peers**: A peer exists iff QuadProof exists
+/// - **No reconnection logic**: Proofs are permanent, UDP can retry freely
+/// - **No keepalive**: Proof validity doesn't depend on connection liveness
+/// - **No half-open state**: QuadProof is bilateral—both have it or neither does
+#[derive(Debug, Clone)]
+pub struct AuthorizedPeer {
+    /// The peer's unique identifier (b3b3/{double-blake3})
+    pub peer_id: String,
+    /// The peer's Ed25519 public key (for signature verification)
+    pub public_key: [u8; 32],
+    /// Our QuadProof for this peer (proves we completed TGP with them)
+    pub our_quad: QuadProof,
+    /// Their QuadProof for us (proves they completed TGP with us)
+    /// Both proofs must exist—this is the bilateral construction property
+    pub their_quad: QuadProof,
+    /// Last known UDP address for this peer (can change, doesn't affect authorization)
+    pub last_addr: SocketAddr,
+    /// The SPIRAL slot this peer has claimed (if known)
+    pub slot: Option<SlotClaim>,
+    /// When this authorization was established
+    pub established: std::time::Instant,
+}
+
+impl AuthorizedPeer {
+    /// Create a new authorized peer from bilateral QuadProofs.
+    ///
+    /// Both QuadProofs must exist—this is enforced by TGP's bilateral construction property.
+    pub fn new(
+        peer_id: String,
+        public_key: [u8; 32],
+        our_quad: QuadProof,
+        their_quad: QuadProof,
+        last_addr: SocketAddr,
+    ) -> Self {
+        Self {
+            peer_id,
+            public_key,
+            our_quad,
+            their_quad,
+            last_addr,
+            slot: None,
+            established: std::time::Instant::now(),
+        }
+    }
+
+    /// Check if this peer is authorized (always true if struct exists).
+    ///
+    /// This is a no-op that documents the TGP-native invariant:
+    /// existence of AuthorizedPeer IS authorization.
+    #[inline]
+    pub const fn is_authorized(&self) -> bool {
+        // Existence is authorization. No connection state to check.
+        true
+    }
+}
+
 /// Mesh service state
 pub struct MeshState {
     /// Our node ID (PeerID)
@@ -383,6 +448,12 @@ pub struct MeshState {
     pub tgp_keypair: Arc<KeyPair>,
     /// UDP socket for TGP (set when run() is called)
     pub udp_socket: Option<Arc<UdpSocket>>,
+    /// TGP-native: Peers authorized via completed QuadProof (PeerId -> AuthorizedPeer)
+    ///
+    /// This is the TGP-native source of truth for peer authorization.
+    /// A peer exists in this map iff we have completed bilateral TGP coordination.
+    /// Unlike TCP `peers` map, there are no "phantom" or "connecting" states.
+    pub authorized_peers: HashMap<String, AuthorizedPeer>,
     /// Our claimed slot in the mesh
     pub self_slot: Option<SlotClaim>,
     /// Known peers in the mesh (by PeerID)
@@ -709,6 +780,7 @@ impl MeshService {
                 signing_key,
                 tgp_keypair,
                 udp_socket: None,  // Set when run() is called
+                authorized_peers: HashMap::new(),  // TGP-native: QuadProof-authorized peers
                 self_slot: None,
                 peers: HashMap::new(),
                 claimed_slots: HashMap::new(),
@@ -1686,7 +1758,8 @@ impl MeshService {
         }
 
         // Process the message (separate lock)
-        {
+        // If coordination completes, extract receipt for AuthorizedPeer storage
+        let completed_auth: Option<(QuadProof, QuadProof, [u8; 32], SocketAddr)> = {
             let mut sessions = self.tgp_sessions.write().await;
             if let Some(session) = sessions.get_mut(&peer_id) {
                 let old_state = session.coordinator.tgp_state();
@@ -1711,15 +1784,44 @@ impl MeshService {
                             if let Some(tx) = session.result_tx.take() {
                                 let _ = tx.send(true);
                             }
+                            // Extract bilateral receipt for AuthorizedPeer storage
+                            if let Some((our_quad, their_quad)) = session.coordinator.get_bilateral_receipt() {
+                                // Get peer's public key from message
+                                let pubkey = Self::extract_sender_pubkey(&msg).unwrap_or([0u8; 32]);
+                                Some((our_quad.clone(), their_quad.clone(), pubkey, session.peer_tgp_addr))
+                            } else {
+                                warn!("TGP coordinated but no bilateral receipt - should never happen");
+                                None
+                            }
+                        } else {
+                            None
                         }
                     }
                     Err(e) => {
                         info!("TGP message from {} rejected (state: {:?}): {:?}", peer_id, old_state, e);
+                        None
                     }
                 }
             } else {
                 info!("TGP recv: no session for {} (sessions: {:?})", peer_id, sessions.keys().collect::<Vec<_>>());
+                None
             }
+        };
+
+        // If coordination completed, store in authorized_peers (TGP-native)
+        // This is done outside the sessions lock to avoid deadlock
+        if let Some((our_quad, their_quad, pubkey, addr)) = completed_auth {
+            info!("TGP-NATIVE: Adding {} to authorized_peers (QuadProof stored)", peer_id);
+            let authorized = AuthorizedPeer::new(
+                peer_id.clone(),
+                pubkey,
+                our_quad,
+                their_quad,
+                addr,
+            );
+            let mut state = self.state.write().await;
+            state.authorized_peers.insert(peer_id.clone(), authorized);
+            info!("TGP-NATIVE: {} authorized peers total", state.authorized_peers.len());
         }
 
         Some(peer_id)
@@ -4529,5 +4631,161 @@ mod tests {
         println!("  ✓ State propagation prevents races");
 
         println!("\n=== 50-Node Mesh Test PASSED ===\n");
+    }
+
+    /// Test TGP-native AuthorizedPeer struct creation and storage
+    #[test]
+    fn test_authorized_peer_creation() {
+        let kp_a = keypair_from_seed(1);
+        let kp_b = keypair_from_seed(2);
+
+        // Complete TGP handshake to get QuadProofs
+        let mut peer_a = PeerCoordinator::symmetric(
+            kp_a.clone(),
+            kp_b.public_key().clone(),
+            CoordinatorConfig::default()
+                .without_timeout()
+                .with_flood_rate(FloodRateConfig::fast()),
+        );
+
+        let mut peer_b = PeerCoordinator::symmetric(
+            kp_b.clone(),
+            kp_a.public_key().clone(),
+            CoordinatorConfig::default()
+                .without_timeout()
+                .with_flood_rate(FloodRateConfig::fast()),
+        );
+
+        peer_a.set_active(true);
+        peer_b.set_active(true);
+
+        // Run handshake to completion
+        for _ in 0..100 {
+            if let Ok(Some(msgs)) = peer_a.poll() {
+                for msg in msgs {
+                    let _ = peer_b.receive(&msg);
+                }
+            }
+            if let Ok(Some(msgs)) = peer_b.poll() {
+                for msg in msgs {
+                    let _ = peer_a.receive(&msg);
+                }
+            }
+            if peer_a.is_coordinated() && peer_b.is_coordinated() {
+                break;
+            }
+            sleep(Duration::from_micros(100));
+        }
+
+        assert!(peer_a.is_coordinated(), "Peer A should be coordinated");
+        assert!(peer_b.is_coordinated(), "Peer B should be coordinated");
+
+        // Get bilateral receipts
+        let (a_our, a_their) = peer_a.get_bilateral_receipt().expect("Should have bilateral receipt");
+        let (b_our, b_their) = peer_b.get_bilateral_receipt().expect("Should have bilateral receipt");
+
+        // Create AuthorizedPeer from A's perspective
+        let peer_id = compute_peer_id_from_bytes(kp_b.public_key().as_bytes());
+        let addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+
+        let authorized = AuthorizedPeer::new(
+            peer_id.clone(),
+            *kp_b.public_key().as_bytes(),
+            a_our.clone(),
+            a_their.clone(),
+            addr,
+        );
+
+        // Verify AuthorizedPeer properties
+        assert_eq!(authorized.peer_id, peer_id);
+        assert_eq!(authorized.public_key, *kp_b.public_key().as_bytes());
+        assert!(authorized.is_authorized(), "AuthorizedPeer should always be authorized");
+        assert!(authorized.slot.is_none(), "New AuthorizedPeer has no slot");
+        assert_eq!(authorized.last_addr, addr);
+
+        // Verify bilateral construction property:
+        // If A has QuadProof, B must also have it (and vice versa)
+        // This is TGP's core invariant: ∃QA ⇔ ∃QB
+        assert!(peer_b.get_bilateral_receipt().is_some(),
+            "Bilateral construction: if A has Q, B must have Q");
+
+        println!("AuthorizedPeer created successfully:");
+        println!("  peer_id: {}...", &peer_id[..20]);
+        println!("  addr: {}", authorized.last_addr);
+        println!("  established: {:?} ago", authorized.established.elapsed());
+    }
+
+    /// Test that authorized_peers HashMap can store and retrieve peers
+    #[test]
+    fn test_authorized_peers_hashmap() {
+        use std::collections::HashMap;
+
+        let kp_a = keypair_from_seed(10);
+        let kp_b = keypair_from_seed(20);
+        let kp_c = keypair_from_seed(30);
+
+        // Create mock QuadProofs (using coordinated handshake)
+        let mut create_auth_peer = |our_kp: &citadel_protocols::KeyPair, their_kp: &citadel_protocols::KeyPair| {
+            let mut peer_a = PeerCoordinator::symmetric(
+                our_kp.clone(),
+                their_kp.public_key().clone(),
+                CoordinatorConfig::default().without_timeout().with_flood_rate(FloodRateConfig::fast()),
+            );
+            let mut peer_b = PeerCoordinator::symmetric(
+                their_kp.clone(),
+                our_kp.public_key().clone(),
+                CoordinatorConfig::default().without_timeout().with_flood_rate(FloodRateConfig::fast()),
+            );
+            peer_a.set_active(true);
+            peer_b.set_active(true);
+
+            for _ in 0..100 {
+                if let Ok(Some(msgs)) = peer_a.poll() {
+                    for msg in msgs { let _ = peer_b.receive(&msg); }
+                }
+                if let Ok(Some(msgs)) = peer_b.poll() {
+                    for msg in msgs { let _ = peer_a.receive(&msg); }
+                }
+                if peer_a.is_coordinated() && peer_b.is_coordinated() { break; }
+                sleep(Duration::from_micros(100));
+            }
+
+            let (our_q, their_q) = peer_a.get_bilateral_receipt().unwrap();
+            let peer_id = compute_peer_id_from_bytes(their_kp.public_key().as_bytes());
+            AuthorizedPeer::new(
+                peer_id,
+                *their_kp.public_key().as_bytes(),
+                our_q.clone(),
+                their_q.clone(),
+                "127.0.0.1:9000".parse().unwrap(),
+            )
+        };
+
+        // Create authorized peers
+        let auth_b = create_auth_peer(&kp_a, &kp_b);
+        let auth_c = create_auth_peer(&kp_a, &kp_c);
+
+        // Store in HashMap (mimics MeshState.authorized_peers)
+        let mut authorized_peers: HashMap<String, AuthorizedPeer> = HashMap::new();
+
+        authorized_peers.insert(auth_b.peer_id.clone(), auth_b);
+        authorized_peers.insert(auth_c.peer_id.clone(), auth_c);
+
+        assert_eq!(authorized_peers.len(), 2, "Should have 2 authorized peers");
+
+        // Verify lookup
+        let peer_b_id = compute_peer_id_from_bytes(kp_b.public_key().as_bytes());
+        let peer_c_id = compute_peer_id_from_bytes(kp_c.public_key().as_bytes());
+
+        assert!(authorized_peers.contains_key(&peer_b_id), "Should find peer B");
+        assert!(authorized_peers.contains_key(&peer_c_id), "Should find peer C");
+
+        // Verify authorization check
+        for (id, peer) in &authorized_peers {
+            assert!(peer.is_authorized(), "Peer {} should be authorized", id);
+        }
+
+        println!("authorized_peers HashMap test passed:");
+        println!("  Stored {} peers", authorized_peers.len());
     }
 }
