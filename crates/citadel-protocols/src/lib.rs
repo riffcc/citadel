@@ -72,13 +72,3 @@ pub use two_generals::{
     crypto::{KeyPair, PublicKey, Signature},
     Commitment, Decision, DoubleProof, Message, MessagePayload, Party, ProtocolState as TgpState, QuadProof, TripleProof,
 };
-
-// Re-export Lightweight TGP for bootstrapping peer discovery
-// Lightweight TGP is an 8-bit protocol that establishes reliable comms
-// without needing pre-shared keys. Used before full TGP key exchange.
-pub use two_generals::lightweight::{
-    Decision as LightweightDecision,
-    LightweightPacket,
-    PartyState as LightweightState,
-    Phase as LightweightPhase,
-};

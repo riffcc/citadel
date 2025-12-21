@@ -332,6 +332,199 @@ Packets from authorized peer: O(1) HashMap hit + process
 
 ---
 
+## Progressive TGP Scaling
+
+TGP scales from bilateral (2-party) coordination to full Byzantine Fault Tolerant consensus as the mesh grows. **The same core mechanism extends seamlessly.**
+
+### The Scaling Ladder
+
+```
+NODES    MECHANISM              THRESHOLD    HOW IT WORKS
+─────────────────────────────────────────────────────────────────────────────
+  1      Genesis                0/0          Origin node—void accepts you
+  2      Bilateral TGP          1/1          Both agree or neither does
+  3      TGP Triad              2/3          Pairwise TGP, majority wins
+ 4-6     BFT Emergence          ⌈n/2⌉+1      TGP pairs + deterministic tiebreaker
+ 7-11    Full BFT               2f+1         Threshold signatures (n=3f+1)
+ 12-20   Neighbor Validation    scaled       Growing toward 11/20
+ 20+     Full SPIRAL            11/20        Mature mesh, all 20 neighbors exist
+```
+
+### Stage 1: Genesis (1 Node)
+
+The origin. No neighbors to validate against—the void accepts you.
+
+```
+┌─────┐
+│  0  │  ← Slot 0, the origin
+└─────┘
+   Threshold: 0/0 (automatic)
+```
+
+### Stage 2: Bilateral TGP (2 Nodes)
+
+Classic Two Generals. Both must agree or neither acts.
+
+```
+┌─────┐     TGP      ┌─────┐
+│  0  │◄────────────►│  1  │
+└─────┘   C→D→T→Q    └─────┘
+
+Threshold: 1/1 (your only neighbor must agree)
+```
+
+The four-phase handshake:
+1. **C (Commitment)**: "I intend to coordinate"
+2. **D (Double)**: "I know you intend"
+3. **T (Triple)**: "I know you know I intend"
+4. **Q (Quad)**: Epistemic fixpoint—mutual knowledge achieved
+
+### Stage 3: TGP Triad (3 Nodes)
+
+Three nodes form a triangle. Each pair runs bilateral TGP.
+
+```
+        ┌─────┐
+        │  0  │
+        └──┬──┘
+          ╱ ╲
+    TGP  ╱   ╲  TGP
+        ╱     ╲
+   ┌───┴─┐ ┌──┴──┐
+   │  1  │─│  2  │
+   └─────┘ └─────┘
+      TGP
+
+├── TRIAD CONSENSUS: 2/3 pairs must agree
+├── Can tolerate 1 Byzantine node
+└── Deterministic: hash(peer_ids) breaks ties
+```
+
+**How it works**: Run bilateral TGP between each pair. If 2/3 pairs achieve QuadProof, consensus is reached. One malicious node cannot prevent the other two from coordinating.
+
+### Stage 4: BFT Emergence (4-6 Nodes)
+
+Threshold signatures emerge. The TGP bilateral construction extends to N-party.
+
+```
+N = 3f + 1  (total nodes)
+T = 2f + 1  (threshold for quorum)
+
+For N=4: f=1, T=3 (tolerate 1 Byzantine)
+For N=7: f=2, T=5 (tolerate 2 Byzantine)
+```
+
+### Stage 5: Full BFT (7+ Nodes)
+
+**BFT in Two Floods** - the same structural insight that solves Two Generals extends to N-party consensus.
+
+```
+PROPOSE FLOOD:
+┌────────────────────────────────────────────────────────┐
+│  Leader broadcasts: PROPOSE(round, value)              │
+│  All nodes receive (flooding ensures delivery)         │
+└────────────────────────────────────────────────────────┘
+                          ↓
+SHARE FLOOD:
+┌────────────────────────────────────────────────────────┐
+│  Each node signs: SHARE(round, H(value), partial_sig)  │
+│  Flood partial signature to all                        │
+└────────────────────────────────────────────────────────┘
+                          ↓
+COMMIT (Local Aggregation):
+┌────────────────────────────────────────────────────────┐
+│  Any node with ≥T shares aggregates threshold sig      │
+│  COMMIT = proof that T nodes agreed                    │
+│  Flood the commit (compact proof of consensus)         │
+└────────────────────────────────────────────────────────┘
+```
+
+**Why this achieves BFT**:
+- Two quorums of size T must overlap by ≥ f+1 nodes
+- At least one overlapping node is honest (only f Byzantine)
+- Honest nodes sign only one value per round
+- Therefore: conflicting threshold signatures impossible
+
+### Stage 6: Full SPIRAL (20+ Neighbors)
+
+At maturity, each node has 20 neighbors in the honeycomb topology.
+
+```
+Threshold: 11/20 (ceil(20 × 0.55))
+Byzantine tolerance: 6 nodes (need 14 honest, 14 > 11)
+
+VALIDATION THRESHOLD FORMULA:
+  threshold(n) = ceil(n × 11/20)
+
+Examples:
+  1 neighbor  → 1 required
+  3 neighbors → 2 required
+  6 neighbors → 4 required
+  10 neighbors → 6 required
+  20 neighbors → 11 required
+```
+
+### Implementation References
+
+| Component | Location | Description |
+|-----------|----------|-------------|
+| Bilateral TGP | `citadel-protocols/src/coordinator.rs` | C→D→T→Q handshake |
+| BFT Extension | `two-generals/rust/src/bft.rs` | Threshold signatures |
+| BFT Proofs | `two-generals/lean4/BFT.lean` | Formal verification |
+| Threshold calc | `citadel-consensus/src/threshold.rs` | `validation_threshold(n)` |
+| SPIRAL topology | `citadel-topology/src/spiral3d.rs` | 3D hex coordinates |
+
+### Key Theorems (from Lean proofs)
+
+From `two-generals/lean4/BFT.lean`:
+
+```lean
+-- Two quorums must overlap
+theorem two_quorums_must_overlap (config : BftConfig) :
+    2 * config.threshold > config.n
+
+-- No conflicting threshold signatures possible
+theorem no_conflicting_threshold_signatures (config : BftConfig)
+    (sig1 sig2 : ThresholdSignature config) :
+    sig1.round = sig2.round → sig1.value = sig2.value
+
+-- BFT safety: same round implies same value
+theorem bft_safety (config : BftConfig) (c1 c2 : BftCommit config) :
+    c1.round = c2.round → c1.value = c2.value
+```
+
+From `proofs/CitadelProofs/Convergence.lean`:
+
+```lean
+-- Slot identity through connections
+theorem slot_occupancy_unique :
+    ∀ slot, at_most_one_node_occupies slot
+
+-- Direction exclusivity prevents double-occupancy
+theorem direction_exclusivity :
+    ∀ neighbor port, at_most_one_peer_in_direction neighbor port
+```
+
+### Why Progressive Scaling Works
+
+The insight: **TGP's bilateral construction is the atomic unit of consensus.**
+
+```
+2-party:  A ←→ B                    (1 TGP session)
+3-party:  A ←→ B, B ←→ C, A ←→ C    (3 TGP sessions, 2/3 majority)
+N-party:  All pairs + threshold aggregation
+```
+
+Each stage builds on the previous:
+1. Bilateral TGP provides the cryptographic foundation
+2. Threshold signatures aggregate bilateral proofs
+3. Quorum intersection guarantees safety
+4. Flooding ensures liveness
+
+**The mesh doesn't switch protocols as it grows—it scales the same mechanism.**
+
+---
+
 ## Files to Modify
 
 ### Primary Changes

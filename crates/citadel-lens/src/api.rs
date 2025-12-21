@@ -1149,11 +1149,7 @@ async fn get_network_map(
             coord_to_node.insert(claim.coord, short_self_id.clone());
         }
 
-        // Track which peer IDs we've already added (to avoid duplicates)
-        let mut added_peers: std::collections::HashSet<String> = std::collections::HashSet::new();
-        added_peers.insert(short_self_id.clone());
-
-        // First pass: collect nodes from claimed_slots (peers with SPIRAL positions)
+        // First pass: collect all nodes from claimed_slots (the authoritative source)
         for (slot_index, claim) in &mesh.claimed_slots {
             let short_id = short_peer_id(&claim.peer_id);
 
@@ -1162,13 +1158,12 @@ async fn get_network_map(
                 continue;
             }
 
-            // TGP-NATIVE: Check authorized_peers (QuadProof-verified), not TCP peers
-            let (online, last_heartbeat) = if let Some(auth_peer) = mesh.authorized_peers.get(&claim.peer_id) {
-                // Authorized via QuadProof - definitely connected
-                (true, auth_peer.established.elapsed().as_secs())
+            // Check if we're directly connected to this peer
+            let (online, last_heartbeat) = if let Some(peer) = mesh.peers.get(&claim.peer_id) {
+                (true, peer.last_seen.elapsed().as_secs())
             } else {
-                // Check by short ID prefix match in authorized_peers
-                let connected = mesh.authorized_peers.keys().any(|k| short_peer_id(k) == short_id);
+                // Check by short ID prefix match
+                let connected = mesh.peers.keys().any(|k| short_peer_id(k) == short_id);
                 (connected, 0)
             };
 
@@ -1187,44 +1182,7 @@ async fn get_network_map(
                 online,
             });
 
-            coord_to_node.insert(claim.coord, short_id.clone());
-            added_peers.insert(short_id);
-        }
-
-        // TGP-NATIVE: Add authorized_peers that don't have slots yet
-        // These are QuadProof-verified peers that haven't claimed SPIRAL positions
-        for (peer_id, auth_peer) in &mesh.authorized_peers {
-            let short_id = short_peer_id(peer_id);
-
-            // Skip if already added from claimed_slots
-            if added_peers.contains(&short_id) {
-                continue;
-            }
-
-            // Peer is authorized but has no slot - show at origin with no index
-            let slot = if let Some(ref slot_claim) = auth_peer.slot {
-                HexSlot {
-                    index: Some(slot_claim.index),
-                    q: slot_claim.coord.q,
-                    r: slot_claim.coord.r,
-                    z: slot_claim.coord.z,
-                }
-            } else {
-                // No slot claimed yet - position at origin
-                HexSlot { index: None, q: 0, r: 0, z: 0 }
-            };
-
-            nodes.push(PeerNode {
-                id: short_id.clone(),
-                label: short_id.clone(),
-                slot,
-                peer_type: "server".to_string(),
-                last_heartbeat: auth_peer.established.elapsed().as_secs(),
-                capabilities: vec!["storage".to_string(), "relay".to_string()],
-                online: true, // Authorized peers are by definition connected
-            });
-
-            added_peers.insert(short_id);
+            coord_to_node.insert(claim.coord, short_id);
         }
 
         // Second pass: compute SPIRAL edges based on actual hex neighbor topology
@@ -1292,25 +1250,8 @@ async fn get_network_map(
 
 /// Shorten a peer ID for display (first 12 chars of hash)
 pub fn short_peer_id(id: &str) -> String {
-    // Handle b3b3/ prefixed hashes - take first 12 chars of hash
-    if let Some(hash) = id.strip_prefix("b3b3/") {
-        return hash.chars().take(12).collect();
-    }
-
-    // Handle peer-{addr} format - extract last octet and port for uniqueness
-    if let Some(addr) = id.strip_prefix("peer-") {
-        // Parse IP:port and extract distinguishing parts
-        // e.g., "172.18.0.2:9000" -> "peer-0.2"
-        let parts: Vec<&str> = addr.split(':').next().unwrap_or(addr).split('.').collect();
-        if parts.len() >= 2 {
-            let last_octets = parts[parts.len()-2..].join(".");
-            return format!("peer-{}", last_octets);
-        }
-        return format!("peer-{}", addr.chars().take(8).collect::<String>());
-    }
-
-    // Fallback: take first 12 chars
-    id.chars().take(12).collect()
+    let hash = id.strip_prefix("b3b3/").unwrap_or(id);
+    hash.chars().take(12).collect()
 }
 
 // --- Mesh State endpoint ---
@@ -1376,18 +1317,17 @@ async fn get_mesh_state(
             })
             .collect();
 
-        // TGP-NATIVE: Use authorized_peers (QuadProof-verified) instead of TCP peers
-        let peers: Vec<PeerSummary> = mesh.authorized_peers.iter()
-            .map(|(id, auth_peer)| PeerSummary {
+        let peers: Vec<PeerSummary> = mesh.peers.iter()
+            .map(|(id, peer)| PeerSummary {
                 id: short_peer_id(id),
-                addr: auth_peer.last_addr.to_string(),
-                slot: auth_peer.slot.as_ref().map(|s| s.index),
-                coordinated: true, // Always true - only QuadProof-verified peers are in authorized_peers
-                last_seen_ms: auth_peer.established.elapsed().as_millis() as u64,
+                addr: peer.addr.to_string(),
+                slot: peer.slot.as_ref().map(|s| s.index),
+                coordinated: peer.coordinated,
+                last_seen_ms: peer.last_seen.elapsed().as_millis() as u64,
             })
             .collect();
 
-        (mesh.self_id.clone(), our_slot, mesh.authorized_peers.len(), slot_claims, peers)
+        (mesh.self_id.clone(), our_slot, mesh.peers.len(), slot_claims, peers)
     } else {
         (String::new(), None, 0, Vec::new(), Vec::new())
     };
