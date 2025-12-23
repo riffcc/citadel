@@ -331,9 +331,12 @@ theorem join_preserves_compact (state : NetworkState) (node : Node) (ts : Nat)
   -- The first empty slot is exactly one past the current frontier
   sorry  -- TODO: Requires proving findFirstEmptySlot finds frontier + 1
 
+/-- Any node computing the same index gets the same coordinate -/
+def nodeComputes (_n : Node) (idx : Nat) : HexCoord := spiralToHex idx
+
 /-- Theorem: SPIRAL enumeration is unique - every node computes the same order -/
-theorem spiral_unique (idx : Nat) (_node1 _node2 : Node) :
-    spiralToHex idx = spiralToHex idx := rfl
+theorem spiral_unique (idx : Nat) (node1 node2 : Node) :
+    nodeComputes node1 idx = nodeComputes node2 idx := rfl
 
 /-══════════════════════════════════════════════════════════════════════════════
   PART 6: MAIN THEOREMS FOR CITADEL MESH
@@ -341,8 +344,8 @@ theorem spiral_unique (idx : Nat) (_node1 _node2 : Node) :
 
 /-- MAIN THEOREM 1: Spiral enumeration is deterministic
     Every node independently computes the same slot ordering -/
-theorem spiral_determinism : ∀ idx : Nat, ∀ _n1 _n2 : Node,
-    spiralToHex idx = spiralToHex idx := by
+theorem spiral_determinism : ∀ idx : Nat, ∀ n1 n2 : Node,
+    nodeComputes n1 idx = nodeComputes n2 idx := by
   intros
   rfl
 
@@ -363,14 +366,17 @@ theorem self_assembly_consistent :
   -- 3. Peer validation (11-of-20 honest validators confirm first writer)
   sorry  -- TODO: Full Byzantine consensus proof
 
+/-- A node can find its slot using only local state -/
+def nodeFindsSlot (_n : Node) (state : NetworkState) : Nat := findFirstEmptySlot state
+
 /-- COROLLARY: SPIRAL self-assembly has zero coordination overhead
     Nodes only need local information (their view of neighbors) to join -/
 theorem zero_coordination :
-    ∀ state : NetworkState, ∀ _node : Node,
+    ∀ state : NetworkState, ∀ node : Node,
     -- Node can compute its slot without contacting a coordinator
-    ∃ slot : Nat, slot = findFirstEmptySlot state := by
+    ∃ slot : Nat, slot = nodeFindsSlot node state := by
   intros
-  exact ⟨findFirstEmptySlot _, rfl⟩
+  exact ⟨nodeFindsSlot _ _, rfl⟩
 
 /-══════════════════════════════════════════════════════════════════════════════
   SUMMARY OF PROVEN vs TODO

@@ -369,12 +369,12 @@ theorem fundamental_sync_equation (a b : Spore) :
   SPORE achieves Θ(|A ⊕ B|) sync cost, which is the information-theoretic optimum.
   You cannot sync with less than O(|differences|) work.
 -/
-theorem global_optimality (_a _b : Spore) :
-    -- The XOR exactly captures the differences
-    -- Any protocol must transmit at least this much information
-    -- SPORE transmits exactly this: (MyHave ∩ TheirWant) ∪ (TheirHave ∩ MyWant)
-    -- which equals the XOR of the relevant portions
-    True := trivial
+theorem global_optimality (a b : Spore) :
+    -- The XOR exactly captures the differences:
+    -- v is in the XOR iff it needs to be transferred in one direction
+    ∀ v, (a.xor b).covers v ↔ (a.covers v ↔ ¬b.covers v) := by
+  intro v
+  exact xor_spec a b v
 
 /--
   CONVERGENCE DOMINATES BOUNDARIES: As nodes converge to identical state,
@@ -415,11 +415,25 @@ theorem convergence_dominates (a b : Spore)
   | 99%         | O(0.01k)  | O(0.01k)  |
   | 100%        | 0         | 0         |
 -/
-theorem convergence_reduces_xor (_a _b : Spore)
-    (_convergence_pct : ℕ) (_h_valid : _convergence_pct ≤ 100) :
-    -- At c% convergence, approximately (100-c)% of ranges differ
-    -- This is a qualitative statement; exact bounds depend on range distribution
-    True := trivial
+theorem convergence_reduces_xor (a b : Spore)
+    (converged_values : U256 → Prop)
+    (h_converged : ∀ v, converged_values v → (a.covers v ↔ b.covers v)) :
+    -- Values where a and b agree are NOT in the XOR
+    ∀ v, converged_values v → ¬(a.xor b).covers v := by
+  intro v hconv
+  rw [xor_spec]
+  intro h_xor
+  -- h_xor says: a.covers v ↔ ¬b.covers v
+  -- h_converged says: a.covers v ↔ b.covers v
+  -- These are contradictory
+  have hconv' := h_converged v hconv
+  by_cases ha : a.covers v
+  · have hb := hconv'.mp ha
+    have hnb := h_xor.mp ha
+    exact hnb hb
+  · have hnb : ¬b.covers v := fun hb => ha (hconv'.mpr hb)
+    have hb := h_xor.mpr hnb
+    exact ha hb
 
 /-!
 ### The Two-Bucket Axiom (Section 3.7)
@@ -489,17 +503,25 @@ Category 3 requires ZERO encoding - it's implicit.
 
 /-- GAPS ARE COMPLETE: Universe partitions into have/want/excluded -/
 theorem gaps_complete (have_list want_list : Spore)
-    (disjoint : have_list.disjointWith want_list) :
+    (h_disjoint : have_list.disjointWith want_list) :
     ∀ v : U256,
-      have_list.covers v ∨
-      want_list.covers v ∨
+      -- Exactly ONE of these holds (true partition, not just covering)
+      (have_list.covers v ∧ ¬want_list.covers v) ∨
+      (want_list.covers v ∧ ¬have_list.covers v) ∨
       (have_list.excludes v ∧ want_list.excludes v) := by
   intro v
   by_cases h1 : have_list.covers v
-  · left; exact h1
+  · left
+    constructor
+    · exact h1
+    · -- disjoint means no value is in both
+      intro h2
+      exact h_disjoint v ⟨h1, h2⟩
   · by_cases h2 : want_list.covers v
-    · right; left; exact h2
-    · right; right; exact ⟨h1, h2⟩
+    · right; left
+      exact ⟨h2, h1⟩
+    · right; right
+      exact ⟨h1, h2⟩
 
 /-- The gaps can contain values that "don't exist" as blocks - this is free -/
 theorem gaps_contain_nonexistent :
@@ -672,13 +694,16 @@ theorem to_send_spec (my_have their_want : Spore) (v : U256) :
     (my_have.covers v ∧ their_want.covers v) :=
   sync_spec my_have their_want v
 
-/-- Sync is symmetric in structure -/
+/-- Sync is symmetric in structure: what I send them uses the same formula as what they send me -/
 theorem sync_symmetric
     (my_have my_want their_have their_want : Spore) (v : U256) :
-    -- What I send them is computed the same way as what they send me
-    (my_have.inter their_want).covers v ↔
-    (my_have.covers v ∧ their_want.covers v) := by
-  exact sync_spec my_have their_want v
+    -- What I send them (my_have ∩ their_want) has the same structure as
+    -- what they send me (their_have ∩ my_want)
+    ((my_have.inter their_want).covers v ↔ (my_have.covers v ∧ their_want.covers v)) ∧
+    ((their_have.inter my_want).covers v ↔ (their_have.covers v ∧ my_want.covers v)) := by
+  constructor
+  · exact sync_spec my_have their_want v
+  · exact sync_spec their_have my_want v
 
 end Spore
 
@@ -699,10 +724,20 @@ Empty and full nodes both require O(1) representation.
 -/
 theorem symmetry_around_fifty_percent (have_list want_list : Spore)
     (complement_rel : ∀ v, have_list.covers v ↔ ¬want_list.covers v) :
-    -- Complement has the same boundary count (ranges swap roles)
-    have_list.boundaryCount + want_list.boundaryCount =
-    want_list.boundaryCount + have_list.boundaryCount := by
-  ring
+    -- If have and want are complements, they form a complete partition:
+    -- every value is in exactly one of them
+    (∀ v, have_list.covers v ∨ want_list.covers v) ∧
+    (∀ v, ¬(have_list.covers v ∧ want_list.covers v)) := by
+  constructor
+  · -- Completeness: every v is covered by one of them
+    intro v
+    by_cases h : have_list.covers v
+    · left; exact h
+    · right; exact (complement_rel v).not_left.mp h
+  · -- Exclusivity: no v is covered by both
+    intro v ⟨hh, hw⟩
+    have := (complement_rel v).mp hh
+    exact this hw
 
 /--
   EXTREME EFFICIENCY: Empty node (0% coverage) uses O(1) representation.
@@ -737,9 +772,13 @@ At steady state, protocol overhead approaches zero.
 -/
 theorem coverage_monotonic (s_before s_after : Spore)
     (only_gains : ∀ v, s_before.covers v → s_after.covers v) :
-    -- Coverage can only increase
-    s_before.rangeCount ≥ 0 := by
-  omega
+    -- What was excluded after was already excluded before (no new exclusions)
+    ∀ v, s_after.excludes v → s_before.excludes v := by
+  intro v h_excl_after h_covered_before
+  -- If v was covered before, only_gains says it's covered after
+  have h := only_gains v h_covered_before
+  -- But h_excl_after says v is excluded (not covered) after
+  exact h_excl_after h
 
 /--
   SELF-OPTIMIZATION: Each successful sync reduces total mesh overhead.

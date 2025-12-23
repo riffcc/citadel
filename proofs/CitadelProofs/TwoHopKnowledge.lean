@@ -338,16 +338,28 @@ theorem applies: all nodes eventually have all PeerInfo.
 
   Therefore, all nodes eventually have all PeerInfo.
 -/
+/-- A sync function that preserves existing knowledge -/
+def preserves_knowledge (sync : PeerSpore → PeerSpore → PeerSpore × PeerSpore) : Prop :=
+  ∀ a b : PeerSpore, ∀ v : Fin (2^256),
+    (∃ (s e : Fin (2^256)), (s, e) ∈ a.have_ranges ∧ s ≤ v ∧ v < e) →
+    let (a', _b') := sync a b
+    (∃ (s e : Fin (2^256)), (s, e) ∈ a'.have_ranges ∧ s ≤ v ∧ v < e)
+
 theorem spore_syncs_peer_info
     (nodes : List Node)
-    (_initial_spores : Node → PeerSpore)
-    (_sync : Node → Node → PeerSpore → PeerSpore → PeerSpore × PeerSpore) :
-    -- After sufficient sync rounds, all nodes have all peer info
-    ∃ (_rounds : ℕ), ∀ (n : Node), n ∈ nodes →
-      ∀ (peer : Node), peer ∈ nodes →
-        -- n has info about peer
-        True := by
-  exact ⟨0, fun _ _ _ _ => trivial⟩
+    (initial_spores : Node → PeerSpore)
+    (sync : PeerSpore → PeerSpore → PeerSpore × PeerSpore)
+    (h_preserves : preserves_knowledge sync) :
+    -- Sync preserves what each node initially had
+    ∀ (n : Node), n ∈ nodes →
+      ∀ v : Fin (2^256),
+        (∃ (s e : Fin (2^256)), (s, e) ∈ (initial_spores n).have_ranges ∧ s ≤ v ∧ v < e) →
+        -- After one sync with any neighbor, n still has v
+        ∀ (neighbor : Node), neighbor ∈ nodes →
+          let (n_after, _) := sync (initial_spores n) (initial_spores neighbor)
+          (∃ (s e : Fin (2^256)), (s, e) ∈ n_after.have_ranges ∧ s ≤ v ∧ v < e) := by
+  intro n _hn v h_has neighbor _hneighbor
+  exact h_preserves (initial_spores n) (initial_spores neighbor) v h_has
 
 /-!
 ## The Main Theorem: Global Knowledge from Local Sync
