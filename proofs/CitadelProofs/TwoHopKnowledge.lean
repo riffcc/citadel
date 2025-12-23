@@ -327,17 +327,6 @@ PeerInfo blocks are just data in hash space. The SPORE convergence
 theorem applies: all nodes eventually have all PeerInfo.
 -/
 
-/--
-  PEER INFO CONVERGENCE:
-
-  If PeerInfo is synced via SPORE:
-  1. Each node's PeerInfo hashes to [0, 2^256)
-  2. SPORE WantList = [(0, 2^256)] (want everyone)
-  3. XOR cancellation: matching info cancels
-  4. Convergence theorem: WantList → 0
-
-  Therefore, all nodes eventually have all PeerInfo.
--/
 /-- A sync function that preserves existing knowledge -/
 def preserves_knowledge (sync : PeerSpore → PeerSpore → PeerSpore × PeerSpore) : Prop :=
   ∀ a b : PeerSpore, ∀ v : Fin (2^256),
