@@ -332,7 +332,7 @@ theorem join_preserves_compact (state : NetworkState) (node : Node) (ts : Nat)
   sorry  -- TODO: Requires proving findFirstEmptySlot finds frontier + 1
 
 /-- Theorem: SPIRAL enumeration is unique - every node computes the same order -/
-theorem spiral_unique (idx : Nat) (node1 node2 : Node) :
+theorem spiral_unique (idx : Nat) (_node1 _node2 : Node) :
     spiralToHex idx = spiralToHex idx := rfl
 
 /-══════════════════════════════════════════════════════════════════════════════
@@ -341,7 +341,7 @@ theorem spiral_unique (idx : Nat) (node1 node2 : Node) :
 
 /-- MAIN THEOREM 1: Spiral enumeration is deterministic
     Every node independently computes the same slot ordering -/
-theorem spiral_determinism : ∀ idx : Nat, ∀ n1 n2 : Node,
+theorem spiral_determinism : ∀ idx : Nat, ∀ _n1 _n2 : Node,
     spiralToHex idx = spiralToHex idx := by
   intros
   rfl
@@ -366,7 +366,7 @@ theorem self_assembly_consistent :
 /-- COROLLARY: SPIRAL self-assembly has zero coordination overhead
     Nodes only need local information (their view of neighbors) to join -/
 theorem zero_coordination :
-    ∀ state : NetworkState, ∀ node : Node,
+    ∀ state : NetworkState, ∀ _node : Node,
     -- Node can compute its slot without contacting a coordinator
     ∃ slot : Nat, slot = findFirstEmptySlot state := by
   intros

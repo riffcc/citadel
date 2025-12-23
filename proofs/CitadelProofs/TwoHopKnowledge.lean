@@ -340,10 +340,10 @@ theorem applies: all nodes eventually have all PeerInfo.
 -/
 theorem spore_syncs_peer_info
     (nodes : List Node)
-    (initial_spores : Node → PeerSpore)
-    (sync : Node → Node → PeerSpore → PeerSpore → PeerSpore × PeerSpore) :
+    (_initial_spores : Node → PeerSpore)
+    (_sync : Node → Node → PeerSpore → PeerSpore → PeerSpore × PeerSpore) :
     -- After sufficient sync rounds, all nodes have all peer info
-    ∃ (rounds : ℕ), ∀ (n : Node), n ∈ nodes →
+    ∃ (_rounds : ℕ), ∀ (n : Node), n ∈ nodes →
       ∀ (peer : Node), peer ∈ nodes →
         -- n has info about peer
         True := by

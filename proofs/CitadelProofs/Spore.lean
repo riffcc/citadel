@@ -369,7 +369,7 @@ theorem fundamental_sync_equation (a b : Spore) :
   SPORE achieves Θ(|A ⊕ B|) sync cost, which is the information-theoretic optimum.
   You cannot sync with less than O(|differences|) work.
 -/
-theorem global_optimality (a b : Spore) :
+theorem global_optimality (_a _b : Spore) :
     -- The XOR exactly captures the differences
     -- Any protocol must transmit at least this much information
     -- SPORE transmits exactly this: (MyHave ∩ TheirWant) ∪ (TheirHave ∩ MyWant)
@@ -415,8 +415,8 @@ theorem convergence_dominates (a b : Spore)
   | 99%         | O(0.01k)  | O(0.01k)  |
   | 100%        | 0         | 0         |
 -/
-theorem convergence_reduces_xor (a b : Spore)
-    (convergence_pct : ℕ) (h_valid : convergence_pct ≤ 100) :
+theorem convergence_reduces_xor (_a _b : Spore)
+    (_convergence_pct : ℕ) (_h_valid : _convergence_pct ≤ 100) :
     -- At c% convergence, approximately (100-c)% of ranges differ
     -- This is a qualitative statement; exact bounds depend on range distribution
     True := trivial
