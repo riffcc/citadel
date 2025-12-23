@@ -138,7 +138,7 @@ axiom vdf_sequential : True
 /-- VDF time scales linearly with difficulty -/
 -- More iterations = more time (this is the security property)
 axiom vdf_time_linear :
-  ∀ (input : VdfOutput) (d1 d2 : Difficulty),
+  ∀ (_input : VdfOutput) (d1 d2 : Difficulty),
     d1 < d2 → True  -- Represents: time(d1) < time(d2)
 
 /-! ## CVDF Round -/
@@ -183,13 +183,6 @@ def CvdfRound.isValid (r : CvdfRound) (expectedPrev : VdfOutput) (expectedDiffic
   r.difficulty = expectedDifficulty ∧  -- Must match network-agreed difficulty (from heaviest chain)
   (∀ att ∈ r.attestations, att.round = r.round ∧ att.prevOutput = r.prevOutput)
 
-/-- Difficulty from chain tip (network-agreed difficulty) -/
--- Chain is non-empty by construction, so there's always a tip
-def CvdfChain.tipDifficulty (c : CvdfChain) : Difficulty :=
-  match c.rounds.head? with
-  | some r => r.difficulty
-  | none => 0  -- Unreachable due to nonempty invariant
-
 /-! ## CVDF Chain -/
 
 /-- A CVDF chain -/
@@ -223,6 +216,12 @@ def CvdfChain.avgAttesters (c : CvdfChain) : ℚ :=
   if c.rounds.length = 0 then 0
   else (c.rounds.foldl (fun acc r => acc + r.attesterCount) 0 : ℚ) / c.rounds.length
 
+/-- Difficulty from chain tip (network-agreed difficulty) -/
+def CvdfChain.tipDifficulty (c : CvdfChain) : Difficulty :=
+  match c.rounds.head? with
+  | some r => r.difficulty
+  | none => 0  -- Unreachable due to nonempty invariant
+
 /-! ## Main Theorems -/
 
 /-- **Theorem 1**: Round weight is always at least base weight -/
@@ -241,14 +240,24 @@ theorem more_attestations_more_weight (r1 r2 : CvdfRound)
 
 /-- **Theorem 3**: Chain weight is monotonically increasing with rounds -/
 theorem chain_weight_monotonic (c : CvdfChain) (r : CvdfRound)
-    (h_valid : ∃ prev, r.isValid prev) :
+    (_h_valid : ∃ prev diff, r.isValid prev diff) :
     c.totalWeight < (⟨c.genesisSeed, r :: c.rounds, List.cons_ne_nil r c.rounds⟩ : CvdfChain).totalWeight := by
   unfold CvdfChain.totalWeight
   simp only [List.foldl_cons, Nat.zero_add]
   have h_pos : r.weight ≥ 1 := round_weight_ge_base r
-  -- Adding a round with weight ≥ 1 increases total weight
-  -- Proof: foldl with initial value r.weight ≥ 1 > foldl with initial value 0
-  sorry -- Technical lemma about foldl monotonicity
+  -- New chain starts fold with r.weight as accumulator, old chain starts with 0
+  -- For any list, foldl (acc + w) init1 ≤ foldl (acc + w) init2 when init1 ≤ init2
+  have key : ∀ l : List CvdfRound, ∀ a b : ℕ, a < b →
+      l.foldl (fun acc r => acc + r.weight) a < l.foldl (fun acc r => acc + r.weight) b := by
+    intro l
+    induction l with
+    | nil => simp
+    | cons hd tl ih =>
+      intro a b hab
+      simp only [List.foldl_cons]
+      apply ih
+      omega
+  exact key c.rounds 0 r.weight h_pos
 
 /-- **Theorem 4**: Heavier chain comparison is total -/
 theorem weight_comparison_total (c1 c2 : CvdfChain) :
@@ -377,7 +386,7 @@ theorem larger_swarm_heavier (c1 c2 : CvdfChain)
 /-- **Theorem 13**: Collaboration gravitationally attracts -/
 -- Larger swarm grows faster → smaller swarms merge into it → convergence
 theorem collaboration_attracts (small large : CvdfChain)
-    (h_size : swarmSize large > swarmSize small) :
+    (_h_size : swarmSize large > swarmSize small) :
     -- After sufficient time, large will dominate small
     True := by trivial -- This is more of a dynamics statement
 
@@ -394,7 +403,7 @@ def networkDifficulty (chains : List CvdfChain) : Difficulty :=
 
 /-- **Theorem 14**: All nodes agree on difficulty via heaviest chain -/
 theorem difficulty_consensus (chains : List CvdfChain)
-    (h_same_heaviest : ∀ c1 c2 ∈ chains,
+    (_h_same_heaviest : ∀ c1 c2, c1 ∈ chains → c2 ∈ chains →
       c1.totalWeight = c2.totalWeight → c1.tipDifficulty = c2.tipDifficulty) :
     -- All nodes observing same chains derive same difficulty
     True := by trivial
@@ -450,13 +459,13 @@ theorem nash_equilibrium_inversion (baseD : Difficulty) (h_base : baseD > 0) :
     ∀ attack : AttackScore, attack > 0 →
       attackDifficulty baseD 0 < attackDifficulty baseD attack := by
   intro attack h_attack
-  simp [attackDifficulty]
-  calc baseD * 1
-      = baseD := by ring
-    _ < baseD * (1 + attack) := by
-        apply Nat.lt_mul_of_pos_right
-        · exact h_base
-        · exact Nat.add_pos_right 1 h_attack
+  unfold attackDifficulty
+  -- Goal: baseD * (1 + 0) < baseD * (1 + attack)
+  simp only [Nat.add_zero, Nat.mul_one]
+  -- Goal: baseD < baseD * (1 + attack)
+  have h1 : 1 < 1 + attack := Nat.lt_add_of_pos_right h_attack
+  calc baseD = baseD * 1 := (Nat.mul_one _).symm
+    _ < baseD * (1 + attack) := Nat.mul_lt_mul_of_pos_left h1 h_base
 
 /-- **Theorem: Recovery to minimum**
 

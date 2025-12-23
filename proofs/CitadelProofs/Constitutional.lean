@@ -136,7 +136,7 @@ theorem constitutional_requires_all (state : ConstitutionalState)
 
 /-- **Theorem 4**: Controlling one dimension is insufficient -/
 theorem one_branch_insufficient (state : ConstitutionalState)
-    (h_exec : state.executiveControl > attackThreshold)
+    (_h_exec : state.executiveControl > attackThreshold)
     (h_jud_low : state.judicialControl ≤ attackThreshold) :
     ¬attackSucceeds state := by
   intro h_attack
@@ -144,9 +144,9 @@ theorem one_branch_insufficient (state : ConstitutionalState)
 
 /-- **Theorem 5**: Controlling three dimensions is insufficient -/
 theorem three_branches_insufficient (state : ConstitutionalState)
-    (h_exec : state.executiveControl > attackThreshold)
-    (h_jud : state.judicialControl > attackThreshold)
-    (h_leg : state.legislativeControl > attackThreshold)
+    (_h_exec : state.executiveControl > attackThreshold)
+    (_h_jud : state.judicialControl > attackThreshold)
+    (_h_leg : state.legislativeControl > attackThreshold)
     (h_diff_low : state.diffusionControl ≤ attackThreshold) :
     ¬attackSucceeds state := by
   intro h_attack
@@ -182,7 +182,7 @@ def networkValue (k : ℚ) (integrity : ℚ) : ℚ :=
 theorem value_increases_with_integrity (k : ℚ) (i1 i2 : ℚ)
     (h_k_pos : k > 0)
     (h_i1_pos : i1 ≥ 0)
-    (h_i2_pos : i2 ≥ 0)
+    (_h_i2_pos : i2 ≥ 0)
     (h_lt : i1 < i2) :
     networkValue k i1 < networkValue k i2 := by
   unfold networkValue
@@ -211,8 +211,8 @@ theorem integrity_halving_effect (k : ℚ) (i : ℚ)
 -- If attack degrades integrity to i', and attack cost is C,
 -- then attack is unprofitable when C > V(1) - V(i')
 theorem attack_unprofitable (k : ℚ) (attackCost : ℚ) (degradedIntegrity : ℚ)
-    (h_k_pos : k > 0)
-    (h_di_bound : 0 ≤ degradedIntegrity ∧ degradedIntegrity ≤ 1)
+    (_h_k_pos : k > 0)
+    (_h_di_bound : 0 ≤ degradedIntegrity ∧ degradedIntegrity ≤ 1)
     (h_cost_high : attackCost > networkValue k 1 - networkValue k degradedIntegrity) :
     attackCost > networkValue k 1 - networkValue k degradedIntegrity := h_cost_high
 

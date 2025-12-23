@@ -182,7 +182,7 @@ FLP didn't break. It just ran out of relevance.
 -/
 
 import CitadelProofs.Topology
-import CitadelProofs.Spiral
+import CitadelProofs.Spiral3D
 import CitadelProofs.Convergence
 import CitadelProofs.Broadcast
 import CitadelProofs.Spore
@@ -190,3 +190,9 @@ import CitadelProofs.TwoHopKnowledge
 import CitadelProofs.EmergentOmniscience
 import CitadelProofs.FailureDetectorElimination
 import CitadelProofs.FLPBypass
+import CitadelProofs.Constitutional
+import CitadelProofs.CVDF
+import CitadelProofs.VdfRace
+import CitadelProofs.ProofOfLatency
+import CitadelProofs.Transfer
+import CitadelProofs.MeshProtocol
