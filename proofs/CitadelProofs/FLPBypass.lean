@@ -98,14 +98,17 @@ instance (count : Nat) (c : Config) : Decidable (waiting_for_threshold count c) 
 def flp_requires_specific_ack : Prop :=
   ∃ node : Nat, waiting_for_individual node
 
-/-- Our model: only threshold matters -/
+/-- Our model: only threshold matters, not specific nodes -/
 def our_model_threshold_only (c : Config) : Prop :=
-  ∀ node : Nat, ¬ waiting_for_individual node
+  c.threshold ≤ c.n ∧ ∀ node : Nat, ¬ waiting_for_individual node
 
 /-- We satisfy our model (no individual waiting) -/
 theorem we_use_threshold_only (c : Config) : our_model_threshold_only c := by
-  intro node
-  exact no_waiting_for_individuals node
+  constructor
+  · -- threshold ≤ n: 2f+1 ≤ 3f+1
+    simp [Config.threshold, Config.n]; omega
+  · intro node
+    exact no_waiting_for_individuals node
 
 /-- FLP's assumption is never satisfied by our protocol -/
 theorem flp_assumption_not_satisfied : ¬ flp_requires_specific_ack := by
@@ -179,14 +182,14 @@ structure FairLossyNetwork where
 /-- Axiom: With flooding, threshold is eventually reached -/
 axiom flooding_reaches_threshold (c : Config) (net : FairLossyNetwork)
     (honest_count : Nat) (h_enough : honest_count ≥ c.threshold) :
-  ∃ sig : ThresholdSig c, True
+  ∃ sig : ThresholdSig c, sig.signer_count ≥ c.threshold
 
 /-- LIVENESS THEOREM: Consensus eventually completes -/
 theorem threshold_consensus_live (c : Config)
     (net : FairLossyNetwork)
     (byzantine_count : Nat)
     (h_byzantine : byzantine_count ≤ c.f) :
-    ∃ sig : ThresholdSig c, True := by
+    ∃ sig : ThresholdSig c, sig.signer_count ≥ c.threshold := by
   -- Honest nodes = n - byzantine ≥ 3f+1 - f = 2f+1 = threshold
   have h_honest : c.n - byzantine_count ≥ c.threshold := by
     simp [Config.n, Config.threshold]
@@ -215,8 +218,8 @@ theorem flp_bypass (c : Config)
     -- Safety: No conflicting commits in same round
     (∀ sig1 sig2 : ThresholdSig c,
       sig1.round = sig2.round → sig1.value = sig2.value) ∧
-    -- Liveness: Eventually achieves consensus
-    (∃ sig : ThresholdSig c, True) ∧
+    -- Liveness: Eventually achieves consensus with threshold met
+    (∃ sig : ThresholdSig c, sig.signer_count ≥ c.threshold) ∧
     -- No individual waiting: Never blocked on specific node
     (∀ node : Nat, ¬ waiting_for_individual node) := by
   constructor

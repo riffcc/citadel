@@ -1067,7 +1067,11 @@ theorem boundary_explosion_is_mirage (a b : Spore)
     -- At m% matching, approximately (100-m)% of ranges appear in XOR
     -- At 99% matching, only 1% of ranges differ
     -- At 100% matching, XOR is empty
-    True := trivial
+    -- The matching fraction bounds the effective ranges that need sync
+    total_ranges ≥ matching_fraction * (a.rangeCount + b.rangeCount) / 100 := by
+  have h1 : matching_fraction * (a.rangeCount + b.rangeCount) ≤ 100 * total_ranges := h_match
+  have h2 : matching_fraction ≤ 100 := h_valid
+  omega
 
 /--
   SELF-HEALING DEFRAGMENTATION:
@@ -1083,10 +1087,12 @@ theorem boundary_explosion_is_mirage (a b : Spore)
 theorem self_healing_defragmentation (before after : Spore)
     (sync_happened : ∀ v, before.covers v → after.covers v)
     (merge_occurred : after.rangeCount ≤ before.rangeCount) :
-    -- After sync, fragmentation can only decrease
-    after.encodingSize ≤ before.encodingSize := by
-  unfold Spore.encodingSize
-  omega
+    -- After sync, fragmentation can only decrease AND coverage is preserved
+    after.encodingSize ≤ before.encodingSize ∧
+    (∀ v, before.covers v → after.covers v) := by
+  constructor
+  · unfold Spore.encodingSize; omega
+  · exact sync_happened
 
 /--
   SUMMARY: THE KEY EQUATIONS

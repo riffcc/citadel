@@ -316,15 +316,32 @@ theorem value_collapse_before_attack (k : ℚ) (state : ConstitutionalState)
   have h_integ_low : 1 - state.executiveControl < 49/100 := by linarith
   unfold networkValue
   -- networkValue k i = k * i * i, so we need k * (1 - exec)^2 < k
-  -- Since exec > 51/100, we have 1 - exec < 49/100
-  -- So (1 - exec)^2 < (49/100)^2 < 1
-  have h_integ_sq : (1 - state.executiveControl) * (1 - state.executiveControl) < 1 := by
-    -- For any x where 0 < x < 1, we have x * x < 1
-    -- Here 1 - exec < 49/100 < 1, and since exec > 51/100 > 0, we have 1 - exec > 0
-    have h_upper : 1 - state.executiveControl < 1 := by
-      have : state.executiveControl > 0 := by linarith
+  -- Since k > 0, this is equivalent to (1 - exec)^2 < 1
+  -- From bounds: 0 ≤ exec ≤ 1, so 0 ≤ 1 - exec ≤ 1
+  -- From h_exec_high: exec > 51/100, so 1 - exec < 49/100 < 1
+  -- Therefore (1 - exec)^2 ≤ (1 - exec) < 1 when exec > 0
+  -- And even if exec = 1, we get 0 < k, which is what we need
+  have h_integ_nonneg : 0 ≤ 1 - state.executiveControl := by
+    have := state.h_exec_bound.2
+    linarith
+  have h_integ_lt_one : 1 - state.executiveControl < 1 := by
+    have := state.h_exec_bound.1
+    linarith
+  -- (1-exec)^2 ≤ 1-exec when 0 ≤ 1-exec ≤ 1, with strict < when 0 < 1-exec < 1
+  have h_sq_le_one : (1 - state.executiveControl) * (1 - state.executiveControl) ≤ 1 := by
+    calc (1 - state.executiveControl) * (1 - state.executiveControl)
+        ≤ 1 * 1 := by nlinarith
+      _ = 1 := by ring
+  have h_sq_lt_one : (1 - state.executiveControl) * (1 - state.executiveControl) < 1 := by
+    -- If 1 - exec = 1, then exec = 0, but exec > 51/100, contradiction
+    -- If 1 - exec < 1 and ≥ 0, then (1-exec)^2 < 1
+    by_cases h : 1 - state.executiveControl = 1
+    · exfalso
+      have : state.executiveControl = 0 := by linarith
       linarith
-    nlinarith
+    · have h_strict : 1 - state.executiveControl < 1 := h_integ_lt_one
+      have h_bound2 : 1 - state.executiveControl ≤ 1 := le_of_lt h_strict
+      nlinarith [sq_nonneg (1 - state.executiveControl)]
   calc k * (1 - state.executiveControl) * (1 - state.executiveControl)
       < k * 1 := by nlinarith
     _ = k := mul_one k
