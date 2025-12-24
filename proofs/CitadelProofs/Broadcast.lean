@@ -204,7 +204,12 @@ theorem turnLeft_size (node : HexCoord) (sender : Option HexCoord) :
         List.filter (fun x => !(x == s)) (HexCoord.allConnections node) := by
       congr 1
       ext x
-      simp only [ne_eq, beq_eq_false_iff_ne, Bool.not_eq_true']
+      -- Goal: decide (x ≠ s) = !(x == s)
+      -- After simp [ne_eq, decide_not]: (!decide (x = s)) = !(x == s)
+      -- This holds because decide (x = s) = (x == s) for LawfulBEq
+      simp only [ne_eq, decide_not]
+      congr 1
+      exact (beq_eq_decide x s).symm
     -- Combine: goal becomes (filter (!(· == s))).length ≥ 19
     -- h_split: 20 = (filter (· == s)).length + (filter (!(· == s))).length
     -- h_count_eq: (filter (· == s)).length = count s ≤ 1
