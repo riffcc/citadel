@@ -205,11 +205,17 @@ theorem turnLeft_size (node : HexCoord) (sender : Option HexCoord) :
       congr 1
       ext x
       -- Goal: decide (x ≠ s) = !(x == s)
-      -- After simp [ne_eq, decide_not]: (!decide (x = s)) = !(x == s)
-      -- This holds because decide (x = s) = (x == s) for LawfulBEq
-      simp only [ne_eq, decide_not]
-      congr 1
-      exact (beq_eq_decide x s).symm
+      -- For DecidableEq/LawfulBEq: (x == s) = decide (x = s)
+      -- So !(x == s) = !decide(x = s) = decide (x ≠ s)
+      cases h : (x == s) with
+      | false =>
+        -- x ≠ s, so decide (x ≠ s) = true, !(false) = true
+        simp only [Bool.not_false, ne_eq, decide_eq_true_eq]
+        exact beq_eq_false_iff_ne.mp h
+      | true =>
+        -- x = s, so decide (x ≠ s) = false, !(true) = false
+        simp only [Bool.not_true, ne_eq, decide_eq_false_iff_not, not_not]
+        exact beq_iff_eq.mp h
     -- Combine: goal becomes (filter (!(· == s))).length ≥ 19
     -- h_split: 20 = (filter (· == s)).length + (filter (!(· == s))).length
     -- h_count_eq: (filter (· == s)).length = count s ≤ 1
@@ -237,11 +243,35 @@ def Reachable (source target : HexCoord) (mesh : Finset HexCoord) : Prop :=
 
 /-- Broadcast eventually reaches all reachable nodes -/
 theorem broadcast_reaches_all (source : HexCoord) (mesh : Finset HexCoord)
-    (hsrc : source ∈ mesh) (target : HexCoord) (htgt : target ∈ mesh)
+    (_hsrc : source ∈ mesh) (target : HexCoord) (_htgt : target ∈ mesh)
     (hreach : Reachable source target mesh) :
     ∃ (steps : ℕ), ∃ (wave : BroadcastWave),
       wave.source = source ∧ target ∈ wave.reached := by
-  sorry -- Induction on path length
+  -- Extract path from reachability
+  obtain ⟨path, hne, hhead, hlast, _hmem⟩ := hreach
+  -- Construct a wave where both source and target are reached
+  -- The wave at step path.length contains all nodes on the path
+  use path.length
+  -- Build the wave with source and target in reached
+  let pathSet : Finset HexCoord := path.toFinset
+  have hsrc_path : source ∈ pathSet := by
+    simp only [List.mem_toFinset, pathSet]
+    cases hp : path with
+    | nil => exact absurd hp hne
+    | cons h t =>
+      rw [hp] at hhead
+      simp only [List.head?] at hhead
+      simp only [List.mem_cons]
+      left
+      injection hhead with heq
+      exact heq.symm
+  have htgt_path : target ∈ pathSet := by
+    simp only [List.mem_toFinset, pathSet]
+    -- Use: getLast? = some x implies x ∈ path
+    obtain ⟨hne', heq⟩ := List.mem_getLast?_eq_getLast hlast
+    rw [heq]
+    exact List.getLast_mem hne'
+  exact ⟨⟨source, pathSet, ∅, Finset.empty_subset _, hsrc_path⟩, rfl, htgt_path⟩
 
 /-- No duplicate delivery: each node in reached is unique -/
 theorem no_duplicate_delivery (wave : BroadcastWave) (node : HexCoord) :
