@@ -70,25 +70,29 @@ def get_peers_for_node(node_num: int, total_nodes: int) -> str:
     """
     Get CITADEL_PEERS for a specific node.
 
-    Each node connects to up to 3 predecessors to distribute connection load.
-    This creates a more resilient mesh than all nodes pointing at node 1.
+    Nodes 1-3 bootstrap off each other (the foundation).
+    Nodes 4+ always bootstrap off nodes 1-3 (stable DNS, always exist first).
+
+    This avoids DNS race conditions when spinning up many nodes at once -
+    nodes 1-3 are always registered in Docker DNS before nodes 4+ start.
 
     Examples:
       Node 1: "" (genesis, no peers)
       Node 2: "citadel-1:9000"
       Node 3: "citadel-1:9000,citadel-2:9000"
-      Node 4: "citadel-1:9000,citadel-2:9000,citadel-3:9000"
-      Node 5: "citadel-2:9000,citadel-3:9000,citadel-4:9000"
+      Node 4+: "citadel-1:9000,citadel-2:9000,citadel-3:9000"
     """
     if node_num <= 1:
         return ""
 
-    # Connect to up to 3 predecessors
-    start = max(1, node_num - 3)
-    end = node_num
+    if node_num == 2:
+        return "citadel-1:9000"
 
-    peers = [f'citadel-{i}:9000' for i in range(start, end)]
-    return ','.join(peers)
+    if node_num == 3:
+        return "citadel-1:9000,citadel-2:9000"
+
+    # Nodes 4+ always bootstrap off the stable foundation (nodes 1-3)
+    return "citadel-1:9000,citadel-2:9000,citadel-3:9000"
 
 
 def ensure_base_image():
