@@ -180,9 +180,37 @@ def turnLeftNeighbors (node : HexCoord) (sender : Option HexCoord) : List HexCoo
 /-- Turn-left excludes at most one neighbor -/
 theorem turnLeft_size (node : HexCoord) (sender : Option HexCoord) :
     (turnLeftNeighbors node sender).length ≥ 19 := by
-  -- Turn-left keeps all 20 neighbors except the sender (if any)
-  -- So minimum is 19 when sender is in the list
-  sorry
+  unfold turnLeftNeighbors
+  cases sender with
+  | none =>
+    -- No sender to exclude, all 20 connections
+    rw [allConnections_length]; decide
+  | some s =>
+    -- Filter out s, leaves at least 19
+    have h20 : (HexCoord.allConnections node).length = 20 := allConnections_length node
+    have h_nodup : (HexCoord.allConnections node).Nodup := allConnections_nodup node
+    -- In a nodup list, filtering out one value removes at most 1 element
+    have h_count : (HexCoord.allConnections node).count s ≤ 1 :=
+      List.nodup_iff_count_le_one.mp h_nodup s
+    -- Use length_eq_length_filter_add: l.length = (filter f).length + (filter !f).length
+    -- With f = (· == s), we have filter (· ≠ s) = filter (!(· == s))
+    have h_split := @List.length_eq_length_filter_add _ (HexCoord.allConnections node) (fun x => x == s)
+    -- count s = (filter (· == s)).length
+    have h_count_eq : (List.filter (· == s) (HexCoord.allConnections node)).length =
+        (HexCoord.allConnections node).count s := by
+      simp only [List.count, List.countP_eq_length_filter]
+    -- filter (· ≠ s) is the same as filter (!(· == s))
+    have h_neq_eq : List.filter (· ≠ s) (HexCoord.allConnections node) =
+        List.filter (fun x => !(x == s)) (HexCoord.allConnections node) := by
+      congr 1
+      ext x
+      simp only [ne_eq, bne_iff_ne, Bool.decide_not]
+    -- Combine: goal becomes (filter (!(· == s))).length ≥ 19
+    -- h_split: 20 = (filter (· == s)).length + (filter (!(· == s))).length
+    -- h_count_eq: (filter (· == s)).length = count s ≤ 1
+    simp only [h_neq_eq]
+    rw [h20, h_count_eq] at h_split
+    omega
 
 /-- Turn-left never sends back to sender -/
 theorem turnLeft_no_backflow (node : HexCoord) (sender : HexCoord) :
