@@ -19,11 +19,41 @@
 //!     No vouchers = slot invalid
 //! ```
 //!
+//! # Symmetric Protocol: Join = Reverse(Leave)
+//!
+//! ```text
+//! JOIN:  Empty slot → TGP with neighbors → Accumulate vouches → Threshold met → VALID
+//! LEAVE: Valid slot → TGP reverse → Vouches expire/withdrawn → Below threshold → INVALID
+//! ```
+//!
+//! Same protocol, same proofs, same guarantees. Just reversed.
+//!
+//! Dead node detection is NOT a separate mechanism - it's vouches expiring naturally
+//! when neighbors stop receiving latency responses.
+//!
+//! # Vouch Rotation (O(n) traffic)
+//!
+//! Instead of flooding vouches for all 20 neighbors every round:
+//! - Rotate: vouch for 1 neighbor per round
+//! - After 20 rounds, all neighbors have fresh vouches
+//! - Network trends to zero traffic at steady state
+//!
+//! # Bilateral Vouch Construction
+//!
+//! Node X collects vouches FROM neighbors and propagates them:
+//! 1. X exchanges latency with neighbor Y
+//! 2. Y signs "X is alive at height H"
+//! 3. X collects this vouch and propagates it once
+//! 4. Everyone can verify Y's signature
+//!
+//! This is TGP applied to liveness!
+//!
 //! # Components
 //!
 //! 1. **LatencyProof** - Challenge/response proving round-trip time
 //! 2. **FailureProof** - Witnesses (neighbors) attesting to failure
 //! 3. **SlotVouch** - Neighbor vouching that a slot holder is behaving
+//! 4. **SlotAction** - Symmetric Claim/Release operations
 //!
 //! # Consensus Tiers (scales with neighbor count)
 //!

@@ -64,7 +64,8 @@ use crate::error::Result;
 use crate::storage::Storage;
 use crate::vdf_race::{VdfRace, VdfLink, AnchoredSlotClaim, claim_has_priority};
 use crate::cvdf::{CvdfCoordinator, CvdfRound, RoundAttestation};
-use crate::accountability::{AccountabilityTracker, FailureType, LatencyProof};
+use crate::accountability::{AccountabilityTracker, FailureType};
+use crate::liveness::{LivenessManager, MeshVouch, PropagationDecision};
 use citadel_protocols::{
     CoordinatorConfig, FloodRateConfig, KeyPair, Message as TgpMessage, MessagePayload, PeerCoordinator, PublicKey,
     QuadProof, SporeSyncManager,
@@ -533,6 +534,10 @@ pub struct MeshState {
     /// Accountability tracker for neighbor monitoring and misbehaviour detection
     /// Tracks latency proofs, vouches, and failure witnesses
     pub accountability: Option<AccountabilityTracker>,
+    /// Liveness manager for structure-aware vouch propagation
+    /// Handles 2-hop vouches: Origin → Judged → Witness → STOP
+    /// Event-driven: zero traffic at steady state
+    pub liveness: Option<LivenessManager>,
     // NOTE: tgp_sessions moved to MeshService for contention-free access
 }
 
@@ -787,7 +792,13 @@ pub enum FloodMessage {
     /// Proof of Latency swap response
     PoLSwapResponse { response: crate::proof_of_latency::SwapResponse },
     /// CVDF attestation for current round
-    CvdfAttestation { att: RoundAttestation },
+    /// Optionally carries a MeshVouch (liveness proof for all neighbors)
+    /// Vouches piggyback on attestations - zero extra traffic at steady state
+    CvdfAttestation {
+        att: RoundAttestation,
+        /// Stapled liveness vouch (2-hop propagation: Origin → Judged → Witness → STOP)
+        vouch: Option<MeshVouch>,
+    },
     /// CVDF new round produced (with stapled SPORE proof for zero-overhead sync)
     CvdfNewRound {
         round: CvdfRound,
@@ -931,7 +942,8 @@ impl MeshService {
                 erasure_confirmed: HashSet::new(),  // SPORE: ErasureConfirmed for GDPR compliance
                 erasure_synced: HashMap::new(),  // SPORE: Peer erasure sync status
                 bad_bits: HashSet::new(),  // BadBits: permanent blocklist (DMCA, abuse, illegal)
-                accountability: Some(AccountabilityTracker::new(signing_key)),  // Misbehaviour tracking
+                accountability: Some(AccountabilityTracker::new(signing_key.clone())),  // Misbehaviour tracking
+                liveness: Some(LivenessManager::new(signing_key)),  // Structure-aware liveness (2-hop vouches)
             })),
             // Separate lock for TGP sessions - contention-free TGP operations
             tgp_sessions: Arc::new(RwLock::new(HashMap::new())),
@@ -1015,6 +1027,14 @@ impl MeshService {
         );
 
         drop(state);
+
+        // Set our slot in CVDF for duty rotation
+        self.cvdf_set_slot(index).await;
+
+        // Also register ourselves in CVDF
+        let mut pubkey_arr = [0u8; 32];
+        pubkey_arr.copy_from_slice(&public_key_bytes);
+        self.cvdf_register_slot(index, pubkey_arr).await;
 
         // Flood our claim to the network (with public key for TGP)
         self.flood(FloodMessage::SlotClaim {
@@ -1213,6 +1233,14 @@ impl MeshService {
         );
 
         drop(state);
+
+        // Set our slot in CVDF for duty rotation
+        self.cvdf_set_slot(index).await;
+
+        // Also register ourselves in CVDF
+        let mut pubkey_arr = [0u8; 32];
+        pubkey_arr.copy_from_slice(&public_key_bytes);
+        self.cvdf_register_slot(index, pubkey_arr).await;
 
         // Flood the VDF claim
         self.flood(FloodMessage::VdfSlotClaim { claim: claim.clone() });
@@ -1514,9 +1542,19 @@ impl MeshService {
         loop {
             tick.tick().await;
 
-            // Create and broadcast attestation
+            // Create and broadcast attestation (with piggybacked vouch when needed)
             if let Some(att) = self.cvdf_attest().await {
-                self.flood(FloodMessage::CvdfAttestation { att });
+                // CRITICAL: Process our OWN attestation first (add to pending queue)
+                // Without this, try_produce() has no attestations to work with!
+                self.cvdf_process_attestation(att.clone()).await;
+
+                // Piggyback vouch on attestation - zero extra traffic
+                let vouch = if self.should_create_mesh_vouch().await {
+                    self.create_mesh_vouch().await
+                } else {
+                    None
+                };
+                self.flood(FloodMessage::CvdfAttestation { att, vouch });
             }
 
             // Try to produce a round
@@ -1691,6 +1729,159 @@ impl MeshService {
     }
 
     // ==================== END CVDF METHODS ====================
+
+    // ==================== STRUCTURE-AWARE LIVENESS ====================
+    //
+    // MeshVouch: One signature attesting to all 20 neighbors.
+    // Propagation: Origin → Judged → Witness → STOP (2 hops max)
+    // Event-driven: Zero traffic at steady state.
+    //
+    // This is the symmetric protocol for join/leave:
+    // - JOIN:  Accumulate vouches until threshold → slot valid
+    // - LEAVE: Vouches expire until below threshold → slot invalid
+
+    /// Initialize the liveness manager with our signing key
+    pub async fn init_liveness_manager(&self) {
+        let mut state = self.state.write().await;
+        if state.liveness.is_none() {
+            let manager = LivenessManager::new(state.signing_key.clone());
+            state.liveness = Some(manager);
+        }
+    }
+
+    /// Update liveness manager with current VDF height and neighbors
+    pub async fn update_liveness_context(&self) {
+        let mut state = self.state.write().await;
+
+        // Get current VDF height
+        let vdf_height = state.cvdf.as_ref()
+            .map(|c| c.current_round())
+            .unwrap_or(0);
+
+        // Get our slot
+        let our_slot = state.self_slot.as_ref().map(|s| s.index);
+
+        // Get neighbor public keys
+        let neighbors: Vec<[u8; 32]> = state.present_neighbors()
+            .iter()
+            .filter_map(|claim| {
+                claim.public_key.as_ref().and_then(|pk| {
+                    if pk.len() == 32 {
+                        let mut arr = [0u8; 32];
+                        arr.copy_from_slice(pk);
+                        Some(arr)
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect();
+
+        // Update liveness manager
+        if let Some(ref mut liveness) = state.liveness {
+            liveness.set_vdf_height(vdf_height);
+            if let Some(slot) = our_slot {
+                liveness.set_slot(slot);
+            }
+            liveness.set_neighbors(neighbors);
+        }
+    }
+
+    /// Record a latency measurement for liveness purposes
+    pub async fn record_liveness_latency(&self, neighbor_pubkey: [u8; 32], latency_ms: u64) {
+        let mut state = self.state.write().await;
+        if let Some(ref mut liveness) = state.liveness {
+            liveness.record_latency(neighbor_pubkey, latency_ms);
+        }
+    }
+
+    /// Handle an incoming mesh vouch - returns propagation decision
+    ///
+    /// Based on the decision:
+    /// - Drop: Ignore (not relevant to us)
+    /// - Stop: Record and don't propagate further (we're a witness)
+    /// - ForwardToNeighbors: Record and forward to our neighbors (we're judged)
+    pub async fn handle_mesh_vouch(&self, vouch: MeshVouch) -> PropagationDecision {
+        let mut state = self.state.write().await;
+        if let Some(ref mut liveness) = state.liveness {
+            liveness.handle_vouch(vouch)
+        } else {
+            PropagationDecision::Drop
+        }
+    }
+
+    /// Check if we should create a new mesh vouch (event-driven)
+    pub async fn should_create_mesh_vouch(&self) -> bool {
+        let state = self.state.read().await;
+        state.liveness.as_ref()
+            .map(|l| l.should_create_vouch())
+            .unwrap_or(false)
+    }
+
+    /// Create a mesh vouch for all alive neighbors
+    ///
+    /// Returns the vouch to be broadcast via the mesh.
+    /// Call this when should_create_mesh_vouch() returns true.
+    pub async fn create_mesh_vouch(&self) -> Option<MeshVouch> {
+        let mut state = self.state.write().await;
+        state.liveness.as_mut()?.create_vouch()
+    }
+
+    /// Check if a node is valid (has sufficient vouches)
+    pub async fn is_node_valid(&self, pubkey: &[u8; 32]) -> bool {
+        let state = self.state.read().await;
+        state.liveness.as_ref()
+            .map(|l| l.is_node_valid(pubkey))
+            .unwrap_or(false)
+    }
+
+    /// Get all nodes that have become invalid (for slot reclamation)
+    ///
+    /// These are nodes whose vouches have expired below threshold.
+    /// Their slots can now be claimed by new nodes.
+    pub async fn get_invalid_nodes(&self) -> Vec<[u8; 32]> {
+        let state = self.state.read().await;
+        state.liveness.as_ref()
+            .map(|l| l.invalid_nodes())
+            .unwrap_or_default()
+    }
+
+    /// Get vouch count for a node
+    pub async fn get_vouch_count(&self, pubkey: &[u8; 32]) -> usize {
+        let state = self.state.read().await;
+        state.liveness.as_ref()
+            .map(|l| l.vouch_count(pubkey))
+            .unwrap_or(0)
+    }
+
+    /// Prune expired liveness data
+    pub async fn prune_liveness(&self) {
+        let mut state = self.state.write().await;
+        if let Some(ref mut liveness) = state.liveness {
+            liveness.prune_expired();
+        }
+    }
+
+    /// Get slots that have become invalid and can be reclaimed
+    ///
+    /// Maps invalid node pubkeys to their slot indices.
+    /// These slots are available for new nodes to claim.
+    pub async fn get_reclaimable_slots(&self) -> Vec<u64> {
+        let invalid_nodes = self.get_invalid_nodes().await;
+        let state = self.state.read().await;
+
+        invalid_nodes.iter().filter_map(|pubkey| {
+            state.claimed_slots.values()
+                .find(|claim| {
+                    claim.public_key.as_ref()
+                        .map(|pk| pk.as_slice() == pubkey.as_slice())
+                        .unwrap_or(false)
+                })
+                .map(|claim| claim.index)
+        }).collect()
+    }
+
+    // ==================== END STRUCTURE-AWARE LIVENESS ====================
 
     /// Attempt to occupy a SPIRAL slot through TGP bilateral connections.
     ///
@@ -2298,6 +2489,14 @@ impl MeshService {
                           target_slot, coord.q, coord.r, coord.z, peer_id);
 
                     drop(state);
+
+                    // Set our slot in CVDF for duty rotation
+                    self.cvdf_set_slot(target_slot).await;
+
+                    // Also register ourselves in CVDF
+                    let mut pubkey_arr = [0u8; 32];
+                    pubkey_arr.copy_from_slice(&my_pubkey);
+                    self.cvdf_register_slot(target_slot, pubkey_arr).await;
 
                     // Flood our claim
                     debug!("Flooding slot_claim for slot {} from {}", target_slot, my_id);
@@ -3067,14 +3266,28 @@ impl MeshService {
                             let _ = writer.write_all(flood_msg.to_string().as_bytes()).await;
                             let _ = writer.write_all(b"\n").await;
                         }
-                        Ok(FloodMessage::CvdfAttestation { att }) => {
-                            let flood_msg = serde_json::json!({
+                        Ok(FloodMessage::CvdfAttestation { att, vouch }) => {
+                            let mut flood_msg = serde_json::json!({
                                 "type": "cvdf_attestation",
                                 "round": att.round,
                                 "slot": att.slot,
                                 "prev_output": hex::encode(att.prev_output),
                                 "attester": hex::encode(att.attester),
                             });
+                            // Include piggybacked vouch if present
+                            if let Some(v) = vouch {
+                                flood_msg["vouch"] = serde_json::json!({
+                                    "voucher": hex::encode(v.voucher),
+                                    "voucher_slot": v.voucher_slot,
+                                    "alive_neighbors": v.alive_neighbors.iter().map(hex::encode).collect::<Vec<_>>(),
+                                    "vdf_height": v.vdf_height,
+                                    "latencies": v.latencies.iter().map(|(n, l)| serde_json::json!({
+                                        "node": hex::encode(n),
+                                        "latency_ms": l,
+                                    })).collect::<Vec<_>>(),
+                                    "signature": hex::encode(v.signature),
+                                });
+                            }
                             let _ = writer.write_all(flood_msg.to_string().as_bytes()).await;
                             let _ = writer.write_all(b"\n").await;
                         }
@@ -3477,6 +3690,15 @@ impl MeshService {
                     // Process the slot claim (stores public key in claim and peer)
                     let (we_lost, race_won) = self.process_slot_claim(index, claimer_id.to_string(), coord, public_key.clone()).await;
 
+                    // Register slot in CVDF for attestation tracking and duty rotation
+                    if let Some(ref pk) = public_key {
+                        if pk.len() == 32 {
+                            let mut pubkey_arr = [0u8; 32];
+                            pubkey_arr.copy_from_slice(pk);
+                            self.cvdf_register_slot(index, pubkey_arr).await;
+                        }
+                    }
+
                     // Re-flood claims to propagate through mesh:
                     // - New claims (is_new): first time we've seen this slot claimed
                     // - Race winners (race_won): a new claimer beat the previous one
@@ -3748,8 +3970,88 @@ impl MeshService {
                                 slot: Some(slot),
                                 signature: signature.try_into().unwrap(),
                             };
-                            if self.cvdf_process_attestation(att).await {
+                            if self.cvdf_process_attestation(att.clone()).await {
                                 debug!("Processed CVDF attestation for round {} from {}", round, peer_id);
+                            }
+
+                            // Handle piggybacked vouch (2-hop propagation)
+                            if let Some(vouch_data) = msg.get("vouch") {
+                                if let (
+                                    Some(voucher_hex),
+                                    Some(voucher_slot),
+                                    Some(alive_neighbors),
+                                    Some(vdf_height),
+                                    Some(vouch_sig_hex),
+                                ) = (
+                                    vouch_data.get("voucher").and_then(|v| v.as_str()),
+                                    vouch_data.get("voucher_slot").and_then(|v| v.as_u64()),
+                                    vouch_data.get("alive_neighbors").and_then(|v| v.as_array()),
+                                    vouch_data.get("vdf_height").and_then(|v| v.as_u64()),
+                                    vouch_data.get("signature").and_then(|v| v.as_str()),
+                                ) {
+                                    if let (Ok(voucher), Ok(vouch_sig)) = (
+                                        hex::decode(voucher_hex),
+                                        hex::decode(vouch_sig_hex),
+                                    ) {
+                                        if voucher.len() == 32 && vouch_sig.len() == 64 {
+                                            // Parse alive neighbors
+                                            let mut alive: Vec<[u8; 32]> = Vec::new();
+                                            for n in alive_neighbors {
+                                                if let Some(n_hex) = n.as_str() {
+                                                    if let Ok(n_bytes) = hex::decode(n_hex) {
+                                                        if n_bytes.len() == 32 {
+                                                            alive.push(n_bytes.try_into().unwrap());
+                                                        }
+                                                    }
+                                                }
+                                            }
+
+                                            // Parse latencies (optional)
+                                            let latencies = vouch_data.get("latencies")
+                                                .and_then(|l| l.as_array())
+                                                .map(|arr| {
+                                                    arr.iter().filter_map(|item| {
+                                                        let node = hex::decode(item.get("node")?.as_str()?).ok()?;
+                                                        let latency = item.get("latency_ms")?.as_u64()?;
+                                                        if node.len() == 32 {
+                                                            Some((node.try_into().unwrap(), latency))
+                                                        } else {
+                                                            None
+                                                        }
+                                                    }).collect::<Vec<_>>()
+                                                })
+                                                .unwrap_or_default();
+
+                                            let vouch = MeshVouch {
+                                                voucher: voucher.try_into().unwrap(),
+                                                voucher_slot,
+                                                alive_neighbors: alive,
+                                                vdf_height,
+                                                latencies,
+                                                signature: vouch_sig.try_into().unwrap(),
+                                            };
+
+                                            // Handle vouch with 2-hop propagation
+                                            match self.handle_mesh_vouch(vouch.clone()).await {
+                                                PropagationDecision::ForwardToNeighbors => {
+                                                    // I'm judged - re-flood to my neighbors (witnesses)
+                                                    debug!("Vouch judges me - forwarding to witnesses");
+                                                    self.flood(FloodMessage::CvdfAttestation {
+                                                        att,
+                                                        vouch: Some(vouch),
+                                                    });
+                                                }
+                                                PropagationDecision::Stop => {
+                                                    // I'm a witness - recorded, stop propagation
+                                                    debug!("Vouch witnessed for neighbor - stopping");
+                                                }
+                                                PropagationDecision::Drop => {
+                                                    // Not relevant to me
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }

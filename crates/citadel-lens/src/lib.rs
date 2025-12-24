@@ -38,6 +38,7 @@ pub mod proof_of_latency;
 pub mod pvdf;
 pub mod cvdf;
 pub mod accountability;
+pub mod liveness;
 #[cfg(test)]
 mod convergence_test;
 
