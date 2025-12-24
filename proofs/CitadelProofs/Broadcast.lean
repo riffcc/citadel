@@ -192,19 +192,19 @@ theorem turnLeft_size (node : HexCoord) (sender : Option HexCoord) :
     -- In a nodup list, filtering out one value removes at most 1 element
     have h_count : (HexCoord.allConnections node).count s ≤ 1 :=
       List.nodup_iff_count_le_one.mp h_nodup s
-    -- Use length_eq_length_filter_add: l.length = (filter f).length + (filter !f).length
-    -- With f = (· == s), we have filter (· ≠ s) = filter (!(· == s))
-    have h_split := @List.length_eq_length_filter_add _ (HexCoord.allConnections node) (fun x => x == s)
+    -- Use length_eq_length_filter_add: l.length = (filter f).length + (filter (!f ·)).length
+    -- With f = (· == s), we have filter (· ≠ s) = filter (!· == s)
+    have h_split := @List.length_eq_length_filter_add _ (HexCoord.allConnections node) (· == s)
     -- count s = (filter (· == s)).length
     have h_count_eq : (List.filter (· == s) (HexCoord.allConnections node)).length =
         (HexCoord.allConnections node).count s := by
       simp only [List.count, List.countP_eq_length_filter]
-    -- filter (· ≠ s) is the same as filter (!(· == s))
+    -- filter (· ≠ s) is the same as filter (! (· == s))
     have h_neq_eq : List.filter (· ≠ s) (HexCoord.allConnections node) =
         List.filter (fun x => !(x == s)) (HexCoord.allConnections node) := by
       congr 1
       ext x
-      simp only [ne_eq, bne_iff_ne, Bool.decide_not]
+      simp only [ne_eq, beq_eq_false_iff_ne, Bool.not_eq_true']
     -- Combine: goal becomes (filter (!(· == s))).length ≥ 19
     -- h_split: 20 = (filter (· == s)).length + (filter (!(· == s))).length
     -- h_count_eq: (filter (· == s)).length = count s ≤ 1
