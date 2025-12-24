@@ -16,6 +16,41 @@ And finally
 * No "FOR NOW" compromises - Do it right or don't do it
 * No "TODO" or "SIMPLIFIED IMPLEMENTATION" - Complete implementations only
 
+## CVDF - Cooperative VDF (NOT "Cluster", "Chained", "Collaborative", etc.)
+
+CVDF is **Cooperative Verifiable Delay Function**. The key insight:
+
+* **Traditional PoW**: 1000 miners race, 1 wins, 999 wasted work. Hashrate concentrates geographically.
+* **CVDF**: All participants contribute TO each other, not against. Required hashrate goes DOWN as more nodes join and cooperate.
+
+**Why cooperation wins mathematically:**
+```
+Weight(cooperative) = rounds × (1 + attesters)   # n attesters per round
+Weight(solo)        = rounds × 2                 # just yourself
+
+Cooperative > Solo when attesters > 1
+```
+
+**Inverted difficulty:**
+- Nodes can run VDF hashrate as fast as they want
+- But difficulty goes DOWN as more nodes join and cooperate
+- Individual power = f(hashrate, latency diversity to MY neighbors) - not just hashrate alone
+- Geographic distribution (Proof of Diffusion) is part of the security model
+
+Core properties:
+* **Proof of Diffusion** prevents geographic concentration of hashrate
+* **Weight = attestation count**: Chains with more attesters are heavier (more cooperation = wins)
+* **Inverted economics**: Cooperation is the Nash equilibrium, not defection
+* **Swarm merge via weight**: When swarms meet, heavier chain wins, lighter swarm's nodes get reallocated
+
+```
+CVDF Round R:
+  Nodes A, B, C attest (sign prev_output)
+  → Attestations washed into VDF input
+  → Duty holder computes VDF (sequential, can't parallelize)
+  → Round output proves time + participation
+```
+
 ## SPIRAL - Core Invariants
 * **SPIRAL is DETERMINISTIC GLOBAL TOPOLOGY** - Given a slot index, anyone can compute hex coordinates. Same math = same result everywhere.
 * **SLOTS CAN SWAP VIA PROOF OF LATENCY** - VDF proves time passed (can't fake waiting). Two nodes measure average latency to their 20 neighbors using VDF-backed proofs. Swap is Pareto improvement: BOTH parties must strictly benefit. Protocol: PROPOSE → HALFLOCK (maintain connections to BOTH old AND new neighbors) → bilateral ATTACK/RETREAT (TGP-style). Any RETREAT aborts. Zero sync interruption - current connections maintained throughout. See proofs/CitadelProofs/ProofOfLatency.lean.
