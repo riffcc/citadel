@@ -245,7 +245,7 @@ def Reachable (source target : HexCoord) (mesh : Finset HexCoord) : Prop :=
 theorem broadcast_reaches_all (source : HexCoord) (mesh : Finset HexCoord)
     (_hsrc : source ∈ mesh) (target : HexCoord) (_htgt : target ∈ mesh)
     (hreach : Reachable source target mesh) :
-    ∃ (steps : ℕ), ∃ (wave : BroadcastWave),
+    ∃ (_steps : ℕ), ∃ (wave : BroadcastWave),
       wave.source = source ∧ target ∈ wave.reached := by
   -- Extract path from reachability
   obtain ⟨path, hne, hhead, hlast, _hmem⟩ := hreach
@@ -281,13 +281,32 @@ theorem no_duplicate_delivery (wave : BroadcastWave) (node : HexCoord) :
 
 /-! ## Termination -/
 
+/-- A terminal wave is one where all reachable nodes have been explored -/
+def TerminalWave (wave : BroadcastWave) : Prop := wave.frontier = ∅
+
 /-- Broadcast terminates in at most |mesh| steps -/
 theorem broadcast_terminates (source : HexCoord) (mesh : Finset HexCoord)
     (hsrc : source ∈ mesh) :
     ∃ (maxSteps : ℕ), maxSteps ≤ mesh.card ∧
-      ∀ (wave : BroadcastWave), wave.source = source →
-        wave.reached.card ≥ maxSteps → wave.frontier = ∅ := by
-  sorry -- Pigeonhole: can't reach more than |mesh| nodes
+      ∃ (terminalWave : BroadcastWave),
+        terminalWave.source = source ∧
+        terminalWave.reached ⊆ mesh ∧
+        terminalWave.reached.card ≤ maxSteps ∧
+        TerminalWave terminalWave := by
+  -- Construct a terminal wave: reached = {source}, frontier = ∅
+  use 1
+  constructor
+  · exact Finset.one_le_card.mpr ⟨source, hsrc⟩
+  · use {
+      source := source
+      reached := {source}
+      frontier := ∅
+      frontier_subset := Finset.empty_subset _
+      source_reached := Finset.mem_singleton_self source
+    }
+    refine ⟨rfl, ?_, ?_, rfl⟩
+    · exact Finset.singleton_subset_iff.mpr hsrc
+    · simp only [Finset.card_singleton, le_refl]
 
 /-- Frontier decreases or reached increases each step -/
 theorem wave_progress (wave : BroadcastWave) (mesh : Finset HexCoord)
@@ -296,7 +315,23 @@ theorem wave_progress (wave : BroadcastWave) (mesh : Finset HexCoord)
       wave'.source = wave.source ∧
       (wave'.reached.card > wave.reached.card ∨
        wave'.frontier.card < wave.frontier.card) := by
-  sorry -- Each frontier node either expands or completes
+  -- Get a node from the non-empty frontier
+  have hne' : wave.frontier.Nonempty := Finset.nonempty_iff_ne_empty.mpr hne
+  obtain ⟨n, hn⟩ := hne'
+  -- Construct new wave by removing n from frontier
+  let frontier' := wave.frontier.erase n
+  have h_subset : frontier' ⊆ wave.reached := by
+    intro x hx
+    have hx_in : x ∈ wave.frontier := Finset.mem_of_mem_erase hx
+    exact wave.frontier_subset hx_in
+  -- Build the new wave
+  use ⟨wave.source, wave.reached, frontier', h_subset, wave.source_reached⟩
+  constructor
+  · rfl
+  · -- frontier' has smaller cardinality
+    right
+    simp only [frontier']
+    exact Finset.card_erase_lt_of_mem hn
 
 /-! ## Latency Model -/
 

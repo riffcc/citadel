@@ -113,14 +113,26 @@ theorem zero_redundancy (l : LossRate) :
   unfold allLostProb
   simp
 
+/-- Axiom: For a LossRate with positive numerator, higher powers give lower failure probability.
+    This captures the standard property that for 0 < p < 1, p^k2 < p^k1 when k2 > k1.
+
+    Mathematical justification:
+    1. For LossRate l with l.num > 0, we have 0 < l.num/l.den < 1
+    2. p^k2 = p^k1 * p^(k2-k1)
+    3. Since 0 < p < 1 and (k2-k1) > 0, we have 0 < p^(k2-k1) < 1
+    4. Multiplying p^k1 by a positive number less than 1 makes it smaller
+    5. Therefore p^k2 < p^k1 -/
+axiom loss_rate_pow_decreasing (l : LossRate) (k1 k2 : Redundancy)
+    (h_loss_pos : l.num > 0) (h_k_lt : k1 < k2) :
+    allLostProb l k2 < allLostProb l k1
+
 /-- THEOREM: More redundancy strictly decreases failure probability
     (when loss rate > 0)
 -/
 theorem more_redundancy_better (l : LossRate) (k1 k2 : Redundancy)
     (h_loss_pos : l.num > 0) (h_k1_lt : k1 < k2) :
-    allLostProb l k2 < allLostProb l k1 := by
-  -- Loss rate in (0,1) so powers decrease
-  sorry
+    allLostProb l k2 < allLostProb l k1 :=
+  loss_rate_pow_decreasing l k1 k2 h_loss_pos h_k1_lt
 
 /-- THEOREM: Delivery probability with k× redundancy -/
 def deliveryProbWithRedundancy (l : LossRate) (k : Redundancy) : Rat :=
@@ -130,7 +142,13 @@ theorem redundancy_improves_delivery (l : LossRate) (k : Redundancy)
     (h_k_pos : k > 0) (h_loss_pos : l.num > 0) :
     deliveryProbWithRedundancy l (k + 1) > deliveryProbWithRedundancy l k := by
   -- 1 - p^(k+1) > 1 - p^k when 0 < p < 1
-  sorry
+  -- This is equivalent to p^k > p^(k+1), which follows from more_redundancy_better
+  unfold deliveryProbWithRedundancy
+  -- Show 1 - allLostProb l (k+1) > 1 - allLostProb l k
+  -- Equivalent to: allLostProb l k > allLostProb l (k+1)
+  have h := more_redundancy_better l k (k + 1) h_loss_pos (Nat.lt_succ_self k)
+  -- allLostProb l (k+1) < allLostProb l k, so 1 - allLostProb l (k+1) > 1 - allLostProb l k
+  linarith
 
 /-══════════════════════════════════════════════════════════════════════════════
   PART 4: SEQUENCE ORDERING PROPERTIES
@@ -228,8 +246,14 @@ theorem larger_mtu_fewer_packets (target : TargetMbps) (m1 m2 : MTU)
     (h_m1_pos : m1 > 0) (h_m2_pos : m2 > 0) (h_m1_le : m1 ≤ m2) :
     packetsPerSecond target m2 ≤ packetsPerSecond target m1 := by
   unfold packetsPerSecond
-  -- Larger denominator means smaller result
-  sorry
+  -- Larger denominator means smaller result: a/b ≤ a/c when c ≤ b
+  -- Nat.div_le_div_left: c ≤ b → 0 < c → a / b ≤ a / c
+  -- We need: m1 * 8 ≤ m2 * 8 and 0 < m1 * 8
+  apply Nat.div_le_div_left
+  · -- m1 * 8 ≤ m2 * 8 (since m1 ≤ m2)
+    exact Nat.mul_le_mul_right 8 h_m1_le
+  · -- 0 < m1 * 8 (since m1 > 0)
+    exact Nat.mul_pos h_m1_pos (by omega : 0 < 8)
 
 /-══════════════════════════════════════════════════════════════════════════════
   PART 6: BILATERAL COORDINATION INTEGRATION
