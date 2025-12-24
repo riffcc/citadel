@@ -296,6 +296,31 @@ def isSoloChain (c : CvdfChain) : Prop :=
 def isCollaborativeChain (c : CvdfChain) (n : ℕ) : Prop :=
   n > 1 ∧ ∀ r ∈ c.rounds, r.attestations.length = n
 
+/-- Helper: foldl with nonzero accumulator -/
+private lemma foldl_add_acc (rounds : List CvdfRound) (acc : ℕ) :
+    rounds.foldl (fun a r => a + r.weight) acc =
+    acc + rounds.foldl (fun a r => a + r.weight) 0 := by
+  induction rounds generalizing acc with
+  | nil => simp
+  | cons r rs ih =>
+    simp only [List.foldl_cons, Nat.zero_add]
+    rw [ih (acc + r.weight), ih r.weight]
+    ring
+
+/-- Helper: foldl sum where every element has the same value -/
+private lemma foldl_add_uniform (rounds : List CvdfRound) (w : ℕ)
+    (h_uniform : ∀ r ∈ rounds, r.weight = w) :
+    rounds.foldl (fun acc r => acc + r.weight) 0 = rounds.length * w := by
+  induction rounds with
+  | nil => simp
+  | cons r rs ih =>
+    simp only [List.foldl_cons, List.length_cons, Nat.zero_add]
+    have h_r : r.weight = w := h_uniform r (by simp)
+    have h_rs : ∀ x ∈ rs, x.weight = w := fun x hx => h_uniform x (List.mem_cons_of_mem r hx)
+    rw [foldl_add_acc rs r.weight]
+    rw [ih h_rs, h_r]
+    ring
+
 /-- **Theorem 6**: Collaborative chain dominates solo chain of same height -/
 theorem collaboration_wins (solo collab : CvdfChain) (n : ℕ)
     (h_solo : isSoloChain solo)
@@ -303,21 +328,39 @@ theorem collaboration_wins (solo collab : CvdfChain) (n : ℕ)
     (h_same_rounds : solo.rounds.length = collab.rounds.length)
     (h_rounds_pos : solo.rounds.length > 0) :
     chainDominates collab solo := by
-  unfold chainDominates
-  unfold CvdfChain.totalWeight
-  -- Solo weight = rounds * (1 + 1) = rounds * 2
-  -- Collab weight = rounds * (1 + n) where n > 1
-  -- So collab weight > solo weight when n > 1
-  sorry -- Requires induction over rounds list
+  unfold chainDominates CvdfChain.totalWeight
+  -- Solo: each round has weight = 1 + 1 = 2
+  have h_solo_weight : ∀ r ∈ solo.rounds, r.weight = 2 := by
+    intro r hr
+    unfold CvdfRound.weight baseWeight attestationWeight
+    simp [h_solo r hr]
+  -- Collab: each round has weight = 1 + n
+  have h_collab_weight : ∀ r ∈ collab.rounds, r.weight = 1 + n := by
+    intro r hr
+    unfold CvdfRound.weight baseWeight attestationWeight
+    simp [h_collab.2 r hr]
+  rw [foldl_add_uniform solo.rounds 2 h_solo_weight]
+  rw [foldl_add_uniform collab.rounds (1 + n) h_collab_weight]
+  rw [h_same_rounds]
+  -- Need: collab.rounds.length * (1 + n) > solo.rounds.length * 2
+  -- Since n > 1, 1 + n > 2
+  have h_n_gt : n > 1 := h_collab.1
+  have h_weight_gt : 1 + n > 2 := by omega
+  have h_len_pos : collab.rounds.length > 0 := h_same_rounds ▸ h_rounds_pos
+  exact Nat.mul_lt_mul_of_pos_left h_weight_gt h_len_pos
 
 /-- **Theorem 7**: Weight scales linearly with attesters -/
 theorem weight_scales_with_attesters (c : CvdfChain) (n : ℕ) (k : ℕ)
     (h_collab : isCollaborativeChain c n)
     (h_len : c.rounds.length = k) :
     c.totalWeight = k * (baseWeight + n * attestationWeight) := by
-  -- Each round has weight = baseWeight + n * attestationWeight
-  -- Total = k * that
-  sorry -- Requires induction over rounds list
+  unfold CvdfChain.totalWeight baseWeight attestationWeight
+  simp only [Nat.mul_one]
+  have h_weight : ∀ r ∈ c.rounds, r.weight = 1 + n := by
+    intro r hr
+    unfold CvdfRound.weight baseWeight attestationWeight
+    simp [h_collab.2 r hr]
+  rw [foldl_add_uniform c.rounds (1 + n) h_weight, h_len]
 
 /-! ## No Wasted Work -/
 
@@ -373,15 +416,72 @@ theorem heavier_survives_merge (c1 c2 : CvdfChain)
 def swarmSize (c : CvdfChain) : ℕ :=
   (c.rounds.flatMap (·.attestations)).map (·.attester) |>.toFinset.card
 
+/-- Helper: if every element of list1 is greater than corresponding element of list2, sum is greater -/
+private lemma foldl_add_gt (rounds1 rounds2 : List CvdfRound)
+    (h_len : rounds1.length = rounds2.length)
+    (h_nonempty : rounds1.length > 0)
+    (h_gt : ∀ i, (h : i < rounds1.length) →
+        (rounds1.get ⟨i, h⟩).weight > (rounds2.get ⟨i, h_len ▸ h⟩).weight) :
+    rounds1.foldl (fun acc r => acc + r.weight) 0 >
+    rounds2.foldl (fun acc r => acc + r.weight) 0 := by
+  -- Induction on the lists with length equality
+  induction rounds1 generalizing rounds2 with
+  | nil => simp at h_nonempty
+  | cons r1 rs1 ih =>
+    match rounds2 with
+    | [] => simp at h_len
+    | r2 :: rs2 =>
+      simp only [List.foldl_cons, List.length_cons, Nat.zero_add] at h_len ⊢
+      -- First round: r1.weight > r2.weight
+      have h_first : r1.weight > r2.weight := by
+        have := h_gt 0 (Nat.zero_lt_succ _)
+        simp only [List.get] at this
+        exact this
+      -- Use foldl_add_acc to rewrite
+      rw [foldl_add_acc rs1 r1.weight, foldl_add_acc rs2 r2.weight]
+      -- Now we need: r1.weight + sum(rs1) > r2.weight + sum(rs2)
+      cases Nat.eq_zero_or_pos rs1.length with
+      | inl h_empty =>
+        -- rs1 is empty, so rs2 is also empty (since lengths equal)
+        have h_rs1_nil : rs1 = [] := List.eq_nil_of_length_eq_zero h_empty
+        have h_len_tail : rs1.length = rs2.length := Nat.succ_injective h_len
+        have h_len_rs2 : rs2.length = 0 := by rw [← h_len_tail]; exact h_empty
+        have h_rs2_nil : rs2 = [] := List.eq_nil_of_length_eq_zero h_len_rs2
+        simp [h_rs1_nil, h_rs2_nil]
+        exact h_first
+      | inr h_pos =>
+        have h_len_tail : rs1.length = rs2.length := Nat.succ_injective h_len
+        have h_tail : ∀ i, (h : i < rs1.length) →
+            (rs1.get ⟨i, h⟩).weight > (rs2.get ⟨i, h_len_tail ▸ h⟩).weight := by
+          intro i hi
+          have h_succ : i + 1 < (r1 :: rs1).length := Nat.succ_lt_succ hi
+          have := h_gt (i + 1) h_succ
+          simp only [List.get] at this
+          convert this using 2
+        have ih_result := ih rs2 h_len_tail h_pos h_tail
+        calc r1.weight + rs1.foldl (fun acc r => acc + r.weight) 0
+            > r1.weight + rs2.foldl (fun acc r => acc + r.weight) 0 := by
+              exact Nat.add_lt_add_left ih_result r1.weight
+          _ > r2.weight + rs2.foldl (fun acc r => acc + r.weight) 0 := by
+              exact Nat.add_lt_add_right h_first _
+
 /-- **Theorem 12**: Larger swarm produces heavier chain (same time) -/
 theorem larger_swarm_heavier (c1 c2 : CvdfChain)
-    (h_same_height : c1.height = c2.height)
+    (_h_same_height : c1.height = c2.height)
     (h_same_len : c1.rounds.length = c2.rounds.length)
-    (h_more_attesters : ∀ r1 ∈ c1.rounds, ∀ r2 ∈ c2.rounds,
-        r1.round = r2.round → r1.attestations.length > r2.attestations.length) :
+    (h_more_attesters : ∀ i, (h : i < c1.rounds.length) →
+        (c1.rounds.get ⟨i, h⟩).attestations.length >
+        (c2.rounds.get ⟨i, h_same_len ▸ h⟩).attestations.length) :
     chainDominates c1 c2 := by
-  -- More attesters per round → more weight per round → more total weight
-  sorry -- Requires induction with round-by-round comparison
+  unfold chainDominates CvdfChain.totalWeight
+  have h_nonempty : c1.rounds.length > 0 := List.length_pos_of_ne_nil c1.nonempty
+  have h_weight_gt : ∀ i, (h : i < c1.rounds.length) →
+      (c1.rounds.get ⟨i, h⟩).weight > (c2.rounds.get ⟨i, h_same_len ▸ h⟩).weight := by
+    intro i hi
+    unfold CvdfRound.weight baseWeight attestationWeight
+    simp only [Nat.mul_one, Nat.add_lt_add_iff_left]
+    exact h_more_attesters i hi
+  exact foldl_add_gt c1.rounds c2.rounds h_same_len h_nonempty h_weight_gt
 
 /-- **Theorem 13**: Collaboration gravitationally attracts -/
 -- Larger swarm grows faster → smaller swarms merge into it → convergence

@@ -127,15 +127,21 @@ theorem distance_symm (a b : HexCoord) : distance a b = distance b a := by
 theorem distance_to_planar_neighbor (h : HexCoord) (n : HexCoord) :
   n ∈ planarNeighbors h → distance h n = 1 := by
   intro hn
-  -- Each planar neighbor is at distance 1 by construction
-  sorry
+  unfold planarNeighbors at hn
+  simp only [List.mem_cons, List.not_mem_nil, or_false] at hn
+  -- Each of the 6 neighbors: check distance formula gives 1
+  rcases hn with rfl | rfl | rfl | rfl | rfl | rfl <;>
+    simp only [distance, s, make] <;> omega
 
 /-- Helper: sum of absolute values in hex distance is always even -/
 private lemma hex_sum_even (q r : ℤ) :
     2 ∣ (Int.natAbs q + Int.natAbs r + Int.natAbs (-q - r)) := by
-  -- For q + r + s = 0, the sum |q| + |r| + |s| = 2 * max(|q|, |r|, |s|)
-  -- Proof requires case analysis on signs; placeholder for now
-  sorry
+  -- Key insight: |-q-r| = |q+r|, and the sum |q| + |r| + |q+r| is always even
+  have h : Int.natAbs (-q - r) = Int.natAbs (q + r) := by
+    rw [← Int.natAbs_neg]; ring_nf
+  rw [h]
+  -- Use omega to handle all the case analysis automatically
+  omega
 
 /-- Triangle inequality for hexagonal distance -/
 theorem distance_triangle (a b c : HexCoord) :
