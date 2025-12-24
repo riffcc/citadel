@@ -25,11 +25,13 @@ mod hex;
 mod spiral;
 mod spiral3d;
 mod neighbors;
+mod gap_and_wrap;
 
 pub use hex::HexCoord;
 pub use spiral::{SpiralIndex, Spiral, slots_in_ring, total_slots_through, spiral_to_coord, coord_to_spiral};
 pub use spiral3d::{Spiral3DIndex, Spiral3D, slots_in_shell, total_slots_through_shell, spiral3d_to_coord, coord_to_spiral3d};
 pub use neighbors::{Neighbors, are_neighbors, count_present_neighbors};
+pub use gap_and_wrap::{Direction, Connection, theoretical_neighbor, ghost_target, compute_all_connections, is_bidirectional};
 
 /// Total number of connections per node (invariant: always 20)
 pub const CONNECTIONS_PER_NODE: usize = 20;

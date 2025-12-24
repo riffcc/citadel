@@ -510,9 +510,9 @@ impl NetworkHealth {
 #[derive(Debug, Clone, Default)]
 pub struct SlotLiveness {
     /// Last round each slot attested (slot -> round)
-    last_attestation: HashMap<u64, u64>,
+    pub last_attestation: HashMap<u64, u64>,
     /// Current round number
-    current_round: u64,
+    pub current_round: u64,
 }
 
 impl SlotLiveness {
@@ -904,6 +904,11 @@ impl CvdfCoordinator {
             return false;
         }
 
+        // Track liveness for this slot (if attestation has one)
+        if let Some(slot) = att.slot {
+            self.slot_liveness.record_attestation(slot, att.round);
+        }
+
         // Add to pending
         self.pending_attestations.insert(att.attester, att);
         true
@@ -1045,6 +1050,54 @@ impl CvdfCoordinator {
     /// Get registered slots as (slot, pubkey) pairs
     pub fn registered_slots(&self) -> Vec<(u64, [u8; 32])> {
         self.slot_holders.iter().map(|(k, v)| (*k, *v)).collect()
+    }
+
+    // =========================================================================
+    // Neighbour Liveness Monitoring
+    // =========================================================================
+    //
+    // Track which slots are actively participating in VDF rounds.
+    // Slots that don't attest within SLOT_LIVENESS_THRESHOLD rounds are stale.
+
+    /// Check if a specific slot is live (attested recently)
+    pub fn is_slot_live(&self, slot: u64) -> bool {
+        self.slot_liveness.is_live(slot)
+    }
+
+    /// Get all stale slots (haven't attested in SLOT_LIVENESS_THRESHOLD rounds)
+    pub fn stale_slots(&self) -> Vec<u64> {
+        self.slot_liveness.stale_slots()
+    }
+
+    /// Get liveness status for all registered slots
+    /// Returns Vec<(slot, is_live, last_attestation_round)>
+    pub fn slot_liveness_status(&self) -> Vec<(u64, bool, Option<u64>)> {
+        self.slot_holders.keys().map(|&slot| {
+            let is_live = self.slot_liveness.is_live(slot);
+            let last_round = self.slot_liveness.last_attestation.get(&slot).copied();
+            (slot, is_live, last_round)
+        }).collect()
+    }
+
+    /// Get current round number (from chain tip)
+    pub fn current_round(&self) -> u64 {
+        self.chain.height()
+    }
+
+    /// Advance liveness tracking to new round
+    pub fn advance_liveness(&mut self, round: u64) {
+        self.slot_liveness.advance_round(round);
+    }
+
+    /// Prune stale slots from slot_holders
+    /// Returns list of pruned slots
+    pub fn prune_stale_slots(&mut self) -> Vec<u64> {
+        let stale = self.slot_liveness.stale_slots();
+        for &slot in &stale {
+            self.slot_holders.remove(&slot);
+            self.slot_liveness.remove_slot(slot);
+        }
+        stale
     }
 }
 

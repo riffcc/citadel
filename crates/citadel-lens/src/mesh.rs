@@ -64,12 +64,17 @@ use crate::error::Result;
 use crate::storage::Storage;
 use crate::vdf_race::{VdfRace, VdfLink, AnchoredSlotClaim, claim_has_priority};
 use crate::cvdf::{CvdfCoordinator, CvdfRound, RoundAttestation};
+use crate::accountability::{AccountabilityTracker, FailureType, LatencyProof};
 use citadel_protocols::{
     CoordinatorConfig, FloodRateConfig, KeyPair, Message as TgpMessage, MessagePayload, PeerCoordinator, PublicKey,
     QuadProof, SporeSyncManager,
 };
 use citadel_spore::{U256, Spore, Range256, SyncState as SporeSyncState, SporeMessage};
-use citadel_topology::{HexCoord, Neighbors, Spiral3DIndex, spiral3d_to_coord};
+use citadel_topology::{
+    HexCoord, Neighbors, Spiral3DIndex, spiral3d_to_coord, coord_to_spiral3d,
+    // Gap-and-Wrap: toroidal mesh with ghost connections
+    Direction, Connection, compute_all_connections, ghost_target,
+};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -209,9 +214,32 @@ impl SlotClaim {
         }
     }
 
-    /// Get the 20 neighbor coordinates of this slot
+    /// Get the 20 theoretical neighbor coordinates of this slot.
+    ///
+    /// This returns the "ideal" neighbors assuming all slots are occupied.
+    /// Used for slot validation: to claim slot N, you need TGP with its theoretical neighbors.
     pub fn neighbor_coords(&self) -> [HexCoord; 20] {
         Neighbors::of(self.coord)
+    }
+
+    /// Get the actual connections for this slot using Gap-and-Wrap.
+    ///
+    /// In a sparse mesh, some theoretical neighbors may be empty. GnW creates
+    /// "ghost connections" that span gaps to the next occupied slot in each direction.
+    /// This ensures every node has up to 20 logical connections regardless of density.
+    ///
+    /// Returns connections sorted by direction (6 planar + 2 vertical + 12 extended).
+    pub fn ghost_connections(&self, occupied: &HashSet<HexCoord>) -> Vec<Connection> {
+        compute_all_connections(occupied, self.coord)
+    }
+
+    /// Get the ghost target for a specific direction.
+    ///
+    /// Returns the actual connection target in the given direction:
+    /// - If theoretical neighbor is occupied → normal connection
+    /// - Otherwise → ghost connection to next occupied slot in that direction
+    pub fn ghost_target_in_direction(&self, occupied: &HashSet<HexCoord>, direction: Direction) -> Option<HexCoord> {
+        ghost_target(occupied, self.coord, direction)
     }
 }
 
@@ -456,6 +484,8 @@ pub struct MeshState {
     pub authorized_peers: HashMap<String, AuthorizedPeer>,
     /// Our claimed slot in the mesh
     pub self_slot: Option<SlotClaim>,
+    /// Slot we're currently trying to claim via TGP (event-driven, no waiting)
+    pub pending_slot_claim: Option<u64>,
     /// Known peers in the mesh (by PeerID)
     pub peers: HashMap<String, MeshPeer>,
     /// Claimed slots (by SPIRAL index)
@@ -500,6 +530,9 @@ pub struct MeshState {
     /// Checked on upload - matching CIDs are rejected before storage
     /// Can sync from external sources like https://badbits.dwebops.pub/
     pub bad_bits: HashSet<[u8; 32]>,
+    /// Accountability tracker for neighbor monitoring and misbehaviour detection
+    /// Tracks latency proofs, vouches, and failure witnesses
+    pub accountability: Option<AccountabilityTracker>,
     // NOTE: tgp_sessions moved to MeshService for contention-free access
 }
 
@@ -628,6 +661,104 @@ impl MeshState {
             .map(|(id, _)| id.clone())
             .collect()
     }
+
+    // =========================================================================
+    // Gap-and-Wrap: Toroidal mesh with ghost connections
+    // =========================================================================
+    //
+    // In a sparse mesh, theoretical neighbors may be empty. Gap-and-Wrap creates
+    // "ghost connections" that span gaps to the next occupied slot in each direction.
+    // This ensures every node has up to 20 logical connections regardless of density.
+    //
+    // Properties (proven in Lean: CitadelProofs.GapAndWrap):
+    // - ghost_bidirectional: A→B in d implies B→A in opposite(d)
+    // - full_connectivity: Every node has 20 connections (if mesh > 1)
+    // - connections_symmetric: The connection graph is undirected
+    // - self_healing: Connections auto-resolve when nodes leave
+
+    /// Get our ghost connections using Gap-and-Wrap.
+    ///
+    /// Returns all actual connections for our slot, including ghost connections
+    /// that span gaps in the mesh. In a dense mesh, these match theoretical neighbors.
+    /// In a sparse mesh, ghost connections may span multiple slots.
+    pub fn ghost_connections(&self) -> Vec<Connection> {
+        let Some(ref self_slot) = self.self_slot else {
+            return Vec::new();
+        };
+        self_slot.ghost_connections(&self.slot_coords)
+    }
+
+    /// Get ghost connection targets as (Direction, HexCoord, is_ghost, gap_size).
+    ///
+    /// Useful for routing: "forward in direction D" uses the ghost target for D.
+    /// Works identically for normal and ghost connections - routing is direction-based.
+    pub fn ghost_connection_targets(&self) -> Vec<(Direction, HexCoord, bool, u32)> {
+        self.ghost_connections()
+            .into_iter()
+            .map(|c| (c.direction, c.target, c.is_ghost, c.gap_size))
+            .collect()
+    }
+
+    /// Get the peer at a ghost connection target in a specific direction.
+    ///
+    /// This is the GnW-aware version of "who is my neighbor in direction D?"
+    /// Unlike theoretical neighbors, this accounts for gaps in the mesh.
+    pub fn ghost_neighbor_peer(&self, direction: Direction) -> Option<&MeshPeer> {
+        let self_slot = self.self_slot.as_ref()?;
+        let target_coord = ghost_target(&self.slot_coords, self_slot.coord, direction)?;
+
+        // Find the slot at target_coord
+        let target_slot_index = self.claimed_slots.values()
+            .find(|s| s.coord == target_coord)?
+            .index;
+
+        // Find peer with this slot
+        self.peers.values()
+            .find(|p| p.slot.as_ref().map(|s| s.index) == Some(target_slot_index))
+    }
+
+    /// Get all ghost neighbor peers.
+    ///
+    /// Returns peers at each ghost connection target. In a sparse mesh,
+    /// these may be far away in slot index but are our logical neighbors.
+    pub fn ghost_neighbor_peers(&self) -> Vec<&MeshPeer> {
+        Direction::all()
+            .iter()
+            .filter_map(|&d| self.ghost_neighbor_peer(d))
+            .collect()
+    }
+
+    /// Count ghost connections (should be 20 in a mesh with > 1 node).
+    pub fn ghost_connection_count(&self) -> usize {
+        self.ghost_connections().len()
+    }
+
+    /// Count ghost connections that are actual ghosts (span gaps).
+    pub fn ghost_gap_count(&self) -> usize {
+        self.ghost_connections().iter().filter(|c| c.is_ghost).count()
+    }
+
+    /// Get total gap size across all ghost connections.
+    ///
+    /// In a dense mesh, this is 0. In a sparse mesh, this indicates
+    /// how many empty slots our connections span.
+    pub fn total_gap_size(&self) -> u32 {
+        self.ghost_connections().iter().map(|c| c.gap_size).sum()
+    }
+
+    /// Convert a HexCoord to its slot index (if claimed).
+    pub fn coord_to_slot_index(&self, coord: HexCoord) -> Option<u64> {
+        self.claimed_slots.values()
+            .find(|s| s.coord == coord)
+            .map(|s| s.index)
+    }
+
+    /// Get the peer_id at a given coordinate (if any).
+    pub fn peer_at_coord(&self, coord: HexCoord) -> Option<&str> {
+        self.claimed_slots.values()
+            .find(|s| s.coord == coord)
+            .map(|s| s.peer_id.as_str())
+    }
 }
 
 /// Broadcast message for continuous flooding
@@ -726,6 +857,8 @@ pub struct MeshService {
     /// Channel for pending connections to spawn from listener
     pending_connect_tx: mpsc::Sender<(String, SocketAddr)>,
     pending_connect_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<(String, SocketAddr)>>>,
+    /// Atomic flag to prevent concurrent slot claiming attempts
+    claiming_in_progress: std::sync::atomic::AtomicBool,
 }
 
 impl MeshService {
@@ -777,11 +910,12 @@ impl MeshService {
             storage,
             state: Arc::new(RwLock::new(MeshState {
                 self_id,
-                signing_key,
+                signing_key: signing_key.clone(),
                 tgp_keypair,
                 udp_socket: None,  // Set when run() is called
                 authorized_peers: HashMap::new(),  // TGP-native: QuadProof-authorized peers
                 self_slot: None,
+                pending_slot_claim: None,
                 peers: HashMap::new(),
                 claimed_slots: HashMap::new(),
                 slot_coords: HashSet::new(),
@@ -797,6 +931,7 @@ impl MeshService {
                 erasure_confirmed: HashSet::new(),  // SPORE: ErasureConfirmed for GDPR compliance
                 erasure_synced: HashMap::new(),  // SPORE: Peer erasure sync status
                 bad_bits: HashSet::new(),  // BadBits: permanent blocklist (DMCA, abuse, illegal)
+                accountability: Some(AccountabilityTracker::new(signing_key)),  // Misbehaviour tracking
             })),
             // Separate lock for TGP sessions - contention-free TGP operations
             tgp_sessions: Arc::new(RwLock::new(HashMap::new())),
@@ -806,6 +941,8 @@ impl MeshService {
             // Channel for pending peer connections
             pending_connect_tx,
             pending_connect_rx: Arc::new(tokio::sync::Mutex::new(pending_connect_rx)),
+            // Atomic flag for slot claiming (prevents concurrent claims)
+            claiming_in_progress: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -888,6 +1025,113 @@ impl MeshService {
         });
 
         true
+    }
+
+    /// EVENT-DRIVEN slot claiming trigger.
+    /// Called when a peer connects. NO WAITING. NO LOOPS.
+    ///
+    /// 1. Sets pending_slot_claim to next available slot
+    /// 2. Starts TGP with available peers
+    /// 3. Returns immediately
+    ///
+    /// When QuadProof is achieved (in handle_tgp_message), the slot is claimed.
+    pub fn trigger_slot_claim_if_ready(self: &Arc<Self>) {
+        let mesh = Arc::clone(self);
+        tokio::spawn(async move {
+            mesh.start_slot_claim_tgp().await;
+        });
+    }
+
+    /// Start TGP exchanges for slot claiming. Returns immediately (event-driven).
+    async fn start_slot_claim_tgp(&self) {
+        let mut state = self.state.write().await;
+
+        // Already have a slot? Done.
+        if state.self_slot.is_some() {
+            return;
+        }
+
+        // Already claiming? Don't start another.
+        if state.pending_slot_claim.is_some() {
+            return;
+        }
+
+        // No peers? Can't claim.
+        if state.peers.is_empty() {
+            return;
+        }
+
+        // Pick the next available slot
+        let target_slot = state.next_available_slot();
+
+        // Check if slot is already claimed (race condition check)
+        if state.claimed_slots.contains_key(&target_slot) {
+            info!("Slot {} already claimed, will retry on next peer event", target_slot);
+            return;
+        }
+
+        // Gather peers to start TGP with (only those with public keys)
+        let peers_to_tgp: Vec<(String, SocketAddr, [u8; 32])> = state.peers.values()
+            .filter_map(|p| {
+                p.public_key.as_ref().and_then(|pk| {
+                    if pk.len() == 32 {
+                        let mut arr = [0u8; 32];
+                        arr.copy_from_slice(pk);
+                        Some((p.id.clone(), p.addr, arr))
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect();
+
+        // No peers with public keys? Can't start TGP yet. Will retry on next peer event.
+        if peers_to_tgp.is_empty() {
+            debug!("No peers with public keys yet, will retry slot claim later");
+            return;
+        }
+
+        // Set pending claim ONLY if we have peers to TGP with
+        state.pending_slot_claim = Some(target_slot);
+        let target_coord = spiral3d_to_coord(Spiral3DIndex::new(target_slot));
+        let commitment_msg = format!("mesh_slot:{}:{}:{}", target_slot, target_coord.q, target_coord.r);
+
+        let my_keypair = (*state.tgp_keypair).clone();
+        drop(state);
+
+        info!("Starting TGP for slot {} with {} peers", target_slot, peers_to_tgp.len());
+
+        // Create TGP sessions and send first messages
+        for (peer_id, peer_addr, pubkey_bytes) in peers_to_tgp {
+            let Ok(counterparty_key) = PublicKey::from_bytes(&pubkey_bytes) else {
+                continue;
+            };
+
+            let mut coordinator = PeerCoordinator::symmetric(
+                my_keypair.clone(),
+                counterparty_key,
+                CoordinatorConfig::default()
+                    .with_commitment(commitment_msg.clone().into_bytes())
+                    .with_flood_rate(FloodRateConfig::fast()),
+            );
+            coordinator.set_active(true);
+
+            self.tgp_sessions.write().await.insert(
+                peer_id.clone(),
+                TgpSession {
+                    coordinator,
+                    commitment: commitment_msg.clone(),
+                    result_tx: None, // No channel needed - event-driven
+                    peer_tgp_addr: peer_addr,
+                },
+            );
+
+            // Send first TGP message
+            if let Some(socket) = self.state.read().await.udp_socket.clone() {
+                self.send_tgp_messages(&socket, &peer_id).await;
+            }
+        }
+        // Return immediately. When QuadProof is achieved, handle_tgp_message will claim the slot.
     }
 
     // ==================== VDF RACE METHODS ====================
@@ -1295,6 +1539,157 @@ impl MeshService {
         }
     }
 
+    // ==================== LIVENESS MONITORING ====================
+
+    /// Check if a slot is live (has attested recently in CVDF)
+    pub async fn is_slot_live(&self, slot: u64) -> bool {
+        let state = self.state.read().await;
+        state.cvdf.as_ref()
+            .map(|c| c.is_slot_live(slot))
+            .unwrap_or(false)
+    }
+
+    /// Get all stale slots (haven't attested in SLOT_LIVENESS_THRESHOLD rounds)
+    pub async fn get_stale_slots(&self) -> Vec<u64> {
+        let state = self.state.read().await;
+        state.cvdf.as_ref()
+            .map(|c| c.stale_slots())
+            .unwrap_or_default()
+    }
+
+    /// Get liveness status for all registered slots
+    /// Returns Vec<(slot, is_live, last_attestation_round)>
+    pub async fn get_slot_liveness_status(&self) -> Vec<(u64, bool, Option<u64>)> {
+        let state = self.state.read().await;
+        state.cvdf.as_ref()
+            .map(|c| c.slot_liveness_status())
+            .unwrap_or_default()
+    }
+
+    /// Get liveness status for ghost neighbors (our actual connections via GnW)
+    /// Returns live/stale status for each direction
+    pub async fn ghost_neighbor_liveness(&self) -> Vec<(Direction, u64, bool)> {
+        let state = self.state.read().await;
+
+        let Some(ref self_slot) = state.self_slot else {
+            return Vec::new();
+        };
+
+        let connections = self_slot.ghost_connections(&state.slot_coords);
+        let cvdf = state.cvdf.as_ref();
+
+        connections.iter().filter_map(|conn| {
+            // Find slot index at target coord
+            let slot_idx = state.claimed_slots.values()
+                .find(|s| s.coord == conn.target)
+                .map(|s| s.index)?;
+
+            // Check liveness
+            let is_live = cvdf.map(|c| c.is_slot_live(slot_idx)).unwrap_or(false);
+
+            Some((conn.direction, slot_idx, is_live))
+        }).collect()
+    }
+
+    /// Count live ghost neighbors
+    pub async fn live_ghost_neighbor_count(&self) -> usize {
+        self.ghost_neighbor_liveness().await
+            .iter()
+            .filter(|(_, _, live)| *live)
+            .count()
+    }
+
+    /// Prune stale slots from CVDF tracking
+    /// Returns list of pruned slot indices
+    pub async fn prune_stale_slots(&self) -> Vec<u64> {
+        let mut state = self.state.write().await;
+        state.cvdf.as_mut()
+            .map(|c| c.prune_stale_slots())
+            .unwrap_or_default()
+    }
+
+    // ==================== MISBEHAVIOUR DETECTION ====================
+    //
+    // Track and report protocol violations using the accountability system.
+    // Types of misbehaviour detected:
+    // - Unresponsive: Node stopped responding to challenges
+    // - InvalidResponse: Node provided invalid/lying responses
+    // - BftFailure: Node failed BFT coordination
+    // - PositionLie: Node claimed wrong position in mesh
+    // - RelayFailure: Node failed to relay messages properly
+
+    /// Start tracking a failure for a node
+    pub async fn start_failure_tracking(
+        &self,
+        failed_pubkey: [u8; 32],
+        failed_slot: Option<u64>,
+        failure_type: FailureType,
+    ) {
+        let mut state = self.state.write().await;
+        if let Some(ref mut accountability) = state.accountability {
+            accountability.start_failure_tracking(failed_pubkey, failed_slot, failure_type);
+        }
+    }
+
+    /// Report misbehaviour (unresponsive neighbor detected via liveness)
+    pub async fn report_unresponsive(&self, slot: u64) {
+        let state = self.state.read().await;
+
+        // Get pubkey for the slot
+        let slot_claim = state.claimed_slots.get(&slot);
+        if let Some(claim) = slot_claim {
+            if let Some(ref pubkey_bytes) = claim.public_key {
+                if pubkey_bytes.len() == 32 {
+                    let mut pubkey = [0u8; 32];
+                    pubkey.copy_from_slice(pubkey_bytes);
+                    drop(state);
+                    self.start_failure_tracking(pubkey, Some(slot), FailureType::Unresponsive).await;
+                }
+            }
+        }
+    }
+
+    /// Check if a node is under failure tracking
+    pub async fn is_tracking_failure(&self, pubkey: &[u8; 32]) -> bool {
+        let state = self.state.read().await;
+        state.accountability.as_ref()
+            .map(|a| a.get_failure_proof(pubkey, 20).is_some())
+            .unwrap_or(false)
+    }
+
+    /// Get all nodes currently being tracked for failure
+    pub async fn get_failure_candidates(&self) -> Vec<[u8; 32]> {
+        // Combine stale slots (from CVDF liveness) with accountability tracking
+        let stale_slots = self.get_stale_slots().await;
+        let state = self.state.read().await;
+
+        stale_slots.iter().filter_map(|&slot| {
+            state.claimed_slots.get(&slot)
+                .and_then(|claim| claim.public_key.as_ref())
+                .and_then(|pk| {
+                    if pk.len() == 32 {
+                        let mut arr = [0u8; 32];
+                        arr.copy_from_slice(pk);
+                        Some(arr)
+                    } else {
+                        None
+                    }
+                })
+        }).collect()
+    }
+
+    /// Trigger misbehaviour check for all stale ghost neighbors
+    pub async fn check_ghost_neighbor_misbehaviour(&self) {
+        let liveness = self.ghost_neighbor_liveness().await;
+
+        for (direction, slot, is_live) in liveness {
+            if !is_live {
+                debug!("Ghost neighbor at slot {} (direction {:?}) is stale - reporting unresponsive", slot, direction);
+                self.report_unresponsive(slot).await;
+            }
+        }
+    }
+
     // ==================== END CVDF METHODS ====================
 
     /// Attempt to occupy a SPIRAL slot through TGP bilateral connections.
@@ -1329,14 +1724,16 @@ impl MeshService {
         let target_coord = spiral3d_to_coord(Spiral3DIndex::new(target_slot));
         let neighbor_coords = Neighbors::of(target_coord);
 
-        // Find existing nodes at neighbor positions
-        let mut potential_neighbors: Vec<(String, SocketAddr, Option<Vec<u8>>)> = Vec::new();
+        // Find validators for this slot claim:
+        // 1. First, look for SPIRAL neighbors (nodes at neighboring coordinates)
+        // 2. If mesh is empty/forming, use ANY connected peer as witness
+        let mut potential_validators: Vec<(String, SocketAddr, Option<Vec<u8>>)> = Vec::new();
+
+        // Try SPIRAL neighbors first
         for coord in &neighbor_coords {
-            // Find claimed slot at this coordinate
             if let Some(slot_claim) = state.claimed_slots.values().find(|s| s.coord == *coord) {
-                // Find peer with this ID
                 if let Some(peer) = state.peers.get(&slot_claim.peer_id) {
-                    potential_neighbors.push((
+                    potential_validators.push((
                         peer.id.clone(),
                         peer.addr,
                         peer.public_key.clone(),
@@ -1345,32 +1742,48 @@ impl MeshService {
             }
         }
 
-        let existing_neighbor_count = potential_neighbors.len();
+        // If no SPIRAL neighbors, use ANY connected peer (bootstrap case)
+        // RULE ZERO: Any peer can witness. The topology emerges from claims, not the other way around.
+        if potential_validators.is_empty() {
+            for peer in state.peers.values() {
+                if peer.public_key.is_some() {
+                    potential_validators.push((
+                        peer.id.clone(),
+                        peer.addr,
+                        peer.public_key.clone(),
+                    ));
+                }
+            }
+        }
+
+        let validator_count = potential_validators.len();
         drop(state);
 
         info!(
-            "Attempting slot {} via TGP: {} existing neighbors, threshold {} (mesh size {})",
-            target_slot, existing_neighbor_count, threshold, mesh_size
+            "Attempting slot {} via TGP: {} validators, threshold {} (mesh size {})",
+            target_slot, validator_count, threshold, mesh_size
         );
 
-        // Special case: genesis node (no neighbors exist)
-        if mesh_size == 0 || existing_neighbor_count == 0 {
-            info!("Genesis slot {} - auto-occupy (no neighbors to validate)", target_slot);
-            return self.claim_slot(target_slot).await;
+        // RULE ZERO: NO NODE IS SPECIAL
+        // You cannot claim a slot without at least one peer to validate with.
+        // If you have no connections, you can't prove to anyone that you claimed it.
+        if validator_count == 0 {
+            info!("Cannot claim slot {} - no peers to validate with", target_slot);
+            return false;
         }
 
         // Calculate scaled threshold based on existing neighbors
         // If only 6 neighbors exist, we need ceil(6 * threshold / 20)
-        let scaled_threshold = if existing_neighbor_count >= 20 {
+        let scaled_threshold = if validator_count >= 20 {
             threshold
         } else {
             // Scale proportionally but require at least 1
-            std::cmp::max(1, (existing_neighbor_count * threshold + 19) / 20)
+            std::cmp::max(1, (validator_count * threshold + 19) / 20)
         };
 
         info!(
             "Scaled threshold: {} of {} existing neighbors (full threshold: {} of 20)",
-            scaled_threshold, existing_neighbor_count, threshold
+            scaled_threshold, validator_count, threshold
         );
 
         // Create TGP sessions with each neighbor and collect result receivers
@@ -1383,7 +1796,7 @@ impl MeshService {
             target_coord.r
         );
 
-        for (peer_id, peer_addr, maybe_pubkey) in potential_neighbors {
+        for (peer_id, peer_addr, maybe_pubkey) in potential_validators {
             // Skip if we don't have their public key
             let Some(pubkey_bytes) = maybe_pubkey else {
                 warn!("Cannot attempt TGP with {} - no public key", peer_id);
@@ -1475,7 +1888,7 @@ impl MeshService {
 
         info!(
             "TGP slot {} attempt: {} of {} coordinations (need {})",
-            target_slot, successful_coordinations, existing_neighbor_count, scaled_threshold
+            target_slot, successful_coordinations, validator_count, scaled_threshold
         );
 
         // Check if we reached threshold
@@ -1518,9 +1931,10 @@ impl MeshService {
         priority_a < priority_b  // Lower hash wins
     }
 
-    /// Process a slot claim from another node
-    /// Returns true if WE lost our slot to this claim (caller should reclaim)
-    pub async fn process_slot_claim(&self, index: u64, peer_id: String, coord: (i64, i64, i64), public_key: Option<Vec<u8>>) -> bool {
+    /// Process a slot claim. Returns (we_lost, race_won) where:
+    /// - we_lost: true if we lost our own slot to this claimer
+    /// - race_won: true if this claimer beat a previous claimer (needs re-flooding)
+    pub async fn process_slot_claim(&self, index: u64, peer_id: String, coord: (i64, i64, i64), public_key: Option<Vec<u8>>) -> (bool, bool) {
         let mut state = self.state.write().await;
         let hex_coord = HexCoord::new(coord.0, coord.1, coord.2);
 
@@ -1529,7 +1943,7 @@ impl MeshService {
         if hex_coord != expected_coord {
             warn!("Invalid slot claim: index {} should be at {:?}, not {:?}",
                   index, expected_coord, hex_coord);
-            return false;
+            return (false, false);
         }
 
         let self_id = state.self_id.clone();
@@ -1559,10 +1973,11 @@ impl MeshService {
         };
 
         // Check if already claimed
+        let mut race_won = false;
         if let Some(existing) = state.claimed_slots.get(&index) {
             if existing.peer_id == peer_id {
                 // Same claim we already have - skip (deduplication)
-                return we_lost;
+                return (we_lost, false);
             }
             // Different claimer - use ungameable tiebreaker
             if Self::peer_wins_slot(&peer_id, &existing.peer_id, index) {
@@ -1573,11 +1988,13 @@ impl MeshService {
                 if let Some(loser_peer) = state.peers.get_mut(&loser_id) {
                     loser_peer.slot = None;
                 }
+                // Mark that a race was won - this needs re-flooding!
+                race_won = true;
                 // Fall through to accept the new claim
             } else {
                 debug!("Slot {} stays with {} (beats new claimer {} by priority)",
                        index, existing.peer_id, peer_id);
-                return we_lost;
+                return (we_lost, false);
             }
         }
 
@@ -1598,7 +2015,7 @@ impl MeshService {
             }
         }
 
-        we_lost
+        (we_lost, race_won)
     }
 
     /// Get a receiver for flood messages (for connections to subscribe)
@@ -1675,6 +2092,24 @@ impl MeshService {
         }
     }
 
+    /// Extract slot claim info from a Commitment message.
+    /// Returns Some(slot_index) if this is a slot claim commitment.
+    fn extract_slot_claim_from_commitment(commitment: &citadel_protocols::Commitment) -> Option<u64> {
+        // The commitment message is "mesh_slot:X:q:r" where X is the slot index
+        let msg_bytes = commitment.message.as_slice();
+        let msg_str = std::str::from_utf8(msg_bytes).ok()?;
+        if !msg_str.starts_with("mesh_slot:") {
+            return None;
+        }
+        // Parse "mesh_slot:123:0:0" -> 123
+        let parts: Vec<&str> = msg_str.split(':').collect();
+        if parts.len() >= 2 {
+            parts[1].parse::<u64>().ok()
+        } else {
+            None
+        }
+    }
+
     /// Handle incoming TGP message from UDP.
     /// Returns the peer_id if message was processed (for sending response).
     /// Uses symmetric TGP - party roles determined by public key comparison.
@@ -1694,49 +2129,72 @@ impl MeshService {
                         .unwrap_or(false)
                 });
 
-            // If pubkey match fails, fall back to full socket address match
-            let (id, peer) = match peer {
-                Some(found) => found,
-                None => {
-                    // Fallback: try matching by full socket address (IP + port)
-                    match state.peers.iter().find(|(_, p)| p.addr == src_addr) {
-                        Some(found) => found,
-                        None => {
-                            info!("TGP: No peer found with pubkey {} or addr {} - {} peers known",
-                                  hex::encode(&sender_pubkey[..6]), src_addr, state.peers.len());
-                            return None;
-                        }
-                    }
-                }
-            };
-
-            let Some(pubkey_bytes) = peer.public_key.as_ref() else {
-                info!("TGP: Peer {} has no public key - cannot do TGP", id);
-                return None;
-            };
-
-            let Ok(pubkey_array) = <[u8; 32]>::try_from(pubkey_bytes.as_slice()) else {
-                warn!("Peer {} has invalid public key length", id);
-                return None;
-            };
-
-            let Ok(counterparty) = PublicKey::from_bytes(&pubkey_array) else {
-                warn!("Peer {} has invalid public key", id);
-                return None;
-            };
-
+            // TGP is TCP-free: we can establish coordination with ANY node that sends us
+            // a valid TGP message, using just the public key from the message itself.
+            // No pre-existing TCP peer relationship required!
             let keypair = (*state.tgp_keypair).clone();
-            debug!("Found peer {} for TGP from {} (matched by pubkey)", id, src_addr);
-            (id.clone(), keypair, counterparty)
+
+            match peer {
+                Some((id, _peer)) => {
+                    // Known peer - use their stored info
+                    let Ok(counterparty) = PublicKey::from_bytes(&sender_pubkey) else {
+                        warn!("Invalid public key from peer {}", id);
+                        return None;
+                    };
+                    debug!("TGP from known peer {} at {}", id, src_addr);
+                    (id.clone(), keypair, counterparty)
+                }
+                None => {
+                    // Unknown peer - create peer_id from their public key (TCP-free TGP!)
+                    // Format: "b3b3/<pubkey_hex>" - consistent with how we generate our own ID
+                    let peer_id = format!("b3b3/{}", hex::encode(&sender_pubkey));
+                    let Ok(counterparty) = PublicKey::from_bytes(&sender_pubkey) else {
+                        warn!("Invalid public key from unknown peer at {}", src_addr);
+                        return None;
+                    };
+                    info!("TGP-PURE: Accepting coordination from {} at {} (no TCP required)",
+                          &peer_id[..12], src_addr);
+                    (peer_id, keypair, counterparty)
+                }
+            }
         };
+
+        // SLOT VALIDATION: If this is a slot claim, check if the slot is available
+        // Per MESH_PROTOCOL.md: "Loser's neighbors reject (slot already filling)"
+        if let MessagePayload::Commitment(c) = &msg.payload {
+            if let Some(claimed_slot) = Self::extract_slot_claim_from_commitment(c) {
+                let state = self.state.read().await;
+                // Check if this slot is already claimed by someone else
+                if let Some(existing_claim) = state.claimed_slots.get(&claimed_slot) {
+                    // Slot is taken - reject this TGP
+                    info!("SLOT VALIDATION: Rejecting TGP for slot {} from {} - slot already claimed by {}",
+                          claimed_slot, peer_id, existing_claim.peer_id);
+                    return None;
+                }
+                debug!("SLOT VALIDATION: Slot {} is available for {}", claimed_slot, peer_id);
+            }
+        }
 
         // Create session if needed (SYMMETRIC - no tiebreaker needed!)
         // With symmetric TGP, both peers can create sessions independently
         // and they'll automatically have opposite roles based on public key comparison.
         {
             let mut sessions = self.tgp_sessions.write().await;
-            if !sessions.contains_key(&peer_id) {
-                debug!("Creating SYMMETRIC TGP session for {} (incoming message)", peer_id);
+            let is_commitment = matches!(&msg.payload, MessagePayload::Commitment(_));
+            let need_new_session = if let Some(existing) = sessions.get(&peer_id) {
+                // If we receive a Commitment and our session is Complete, a new TGP is starting
+                // This happens when a peer starts claiming a different slot after their first claim
+                is_commitment && existing.coordinator.is_coordinated()
+            } else {
+                true
+            };
+
+            if need_new_session {
+                if sessions.contains_key(&peer_id) {
+                    info!("Resetting TGP session for {} (new Commitment received after Complete)", peer_id);
+                } else {
+                    debug!("Creating SYMMETRIC TGP session for {} (incoming message)", peer_id);
+                }
                 let mut coordinator = PeerCoordinator::symmetric(
                     my_keypair.clone(),
                     counterparty_key.clone(),
@@ -1808,8 +2266,7 @@ impl MeshService {
             }
         };
 
-        // If coordination completed, store in authorized_peers (TGP-native)
-        // This is done outside the sessions lock to avoid deadlock
+        // If coordination completed, store in authorized_peers AND claim our slot
         if let Some((our_quad, their_quad, pubkey, addr)) = completed_auth {
             info!("TGP-NATIVE: Adding {} to authorized_peers (QuadProof stored)", peer_id);
             let authorized = AuthorizedPeer::new(
@@ -1819,9 +2276,44 @@ impl MeshService {
                 their_quad,
                 addr,
             );
+
             let mut state = self.state.write().await;
             state.authorized_peers.insert(peer_id.clone(), authorized);
             info!("TGP-NATIVE: {} authorized peers total", state.authorized_peers.len());
+
+            // EVENT-DRIVEN SLOT CLAIM: One QuadProof = claim the slot
+            if let Some(target_slot) = state.pending_slot_claim.take() {
+                // Double-check slot is still available
+                if !state.claimed_slots.contains_key(&target_slot) {
+                    let my_id = state.self_id.clone();
+                    let my_pubkey = state.signing_key.verifying_key().as_bytes().to_vec();
+                    let claim = SlotClaim::with_public_key(target_slot, my_id.clone(), Some(my_pubkey.clone()));
+                    let coord = claim.coord;
+
+                    state.self_slot = Some(claim.clone());
+                    state.claimed_slots.insert(target_slot, claim);
+                    state.slot_coords.insert(coord);
+
+                    info!("SLOT CLAIMED: {} at ({}, {}, {}) via QuadProof with {}",
+                          target_slot, coord.q, coord.r, coord.z, peer_id);
+
+                    drop(state);
+
+                    // Flood our claim
+                    debug!("Flooding slot_claim for slot {} from {}", target_slot, my_id);
+                    self.flood(FloodMessage::SlotClaim {
+                        index: target_slot,
+                        peer_id: my_id,
+                        coord: (coord.q, coord.r, coord.z),
+                        public_key: Some(my_pubkey),
+                    });
+                } else {
+                    info!("Slot {} was claimed by someone else during TGP, will retry", target_slot);
+                    drop(state);
+                    // Trigger retry for next available slot
+                    self.start_slot_claim_tgp().await;
+                }
+            }
         }
 
         Some(peer_id)
@@ -1929,38 +2421,18 @@ impl MeshService {
             self_clone.init_cvdf_genesis().await;
             self_clone.init_vdf_genesis().await;
 
-            // Connect to entry peers (if any)
-            // When connected, we'll exchange chain states and adopt heavier chains
-            let connected = self_clone.connect_to_entry_peers().await;
-            if connected > 0 {
-                info!("Connected to {} peer(s), exchanging chain states", connected);
-            } else if self_clone.entry_peers.is_empty() {
-                info!("No peers configured - running as standalone genesis");
-            } else {
-                info!("No entry peers responded yet - will keep trying");
-            }
+            // Try connecting to entry peers (if any configured)
+            // This is just a hint - connections can come from anywhere
+            let _ = self_clone.connect_to_entry_peers().await;
 
-            // After learning mesh state, attempt to join via TGP
-            // Try slots in SPIRAL order until one succeeds
-            let mut target_slot = self_clone.state.read().await.next_available_slot();
-            loop {
-                if self_clone.attempt_slot_via_tgp(target_slot).await {
-                    info!("Successfully joined mesh at slot {}", target_slot);
-
-                    // Register our slot in CVDF
-                    let pubkey = self_clone.state.read().await.signing_key.verifying_key().to_bytes();
-                    self_clone.cvdf_register_slot(target_slot, pubkey).await;
-                    self_clone.cvdf_set_slot(target_slot).await;
-
-                    break;
-                }
-                // Try next slot
-                target_slot += 1;
-                if target_slot > 1000 {
-                    error!("Failed to join mesh after 1000 slot attempts");
-                    break;
-                }
-            }
+            // Slot claiming is EVENT-DRIVEN, triggered by:
+            // - on_peer_connected() when any peer connects (inbound or outbound)
+            // - on_slot_claim_received() when we learn about the mesh state
+            // - on_slot_lost() when we lose a priority race
+            //
+            // NO TIMEOUTS. NO GIVING UP. The mesh is dynamic.
+            // See: trigger_slot_claim_if_ready()
+            info!("Node initialized - slot claiming will trigger on first peer connection");
         });
 
         // Spawn CVDF coordination loop
@@ -2134,6 +2606,9 @@ impl MeshService {
         }
 
         info!("Peer {} registered", peer_id);
+
+        // EVENT: Peer connected - trigger slot claiming if we don't have a slot yet
+        self.trigger_slot_claim_if_ready();
 
         // Simple protocol: exchange node info and sync state
         let (reader, mut writer) = stream.into_split();
@@ -2760,30 +3235,13 @@ impl MeshService {
             }
         }
 
-        // Remove peer on disconnect using current key
-        // Also clean up their slot claim and latency history to avoid ghost nodes and memory leaks
+        // Remove peer from active connections on disconnect
+        // NOTE: We do NOT remove their slot claim - they still own the slot even if disconnected!
+        // Slots are only invalidated via CVDF chain adoption, not TCP disconnect.
         {
             let mut state = self.state.write().await;
-            if let Some(peer) = state.peers.remove(&current_peer_key) {
-                // If this peer had a slot, remove it from claimed_slots
-                if let Some(slot) = peer.slot {
-                    info!("Cleaning up slot {} from disconnected peer {}", slot.index, current_peer_key);
-                    state.claimed_slots.remove(&slot.index);
-                    state.slot_coords.remove(&slot.coord);
-                }
-            }
-            // Also scan claimed_slots for any claims by this peer ID
-            // (in case slot was learned via flooding but not stored on peer struct)
-            let slots_to_remove: Vec<u64> = state.claimed_slots
-                .iter()
-                .filter(|(_, claim)| claim.peer_id == current_peer_key)
-                .map(|(idx, _)| *idx)
-                .collect();
-            for idx in slots_to_remove {
-                if let Some(claim) = state.claimed_slots.remove(&idx) {
-                    info!("Cleaning up flooded slot {} from disconnected peer {}", idx, current_peer_key);
-                    state.slot_coords.remove(&claim.coord);
-                }
+            if let Some(_peer) = state.peers.remove(&current_peer_key) {
+                debug!("Peer {} disconnected (slot claim preserved)", current_peer_key);
             }
 
             // Clean up latency history for this peer to prevent memory leak
@@ -2857,6 +3315,13 @@ impl MeshService {
                             let peer_addr = peer.addr;
                             state.peers.insert(node_id.to_string(), peer);
                             info!("Peer {} identified as {} at {}", peer_id, node_id, peer_addr);
+
+                            // Peer now has public key - try slot claiming if we don't have a slot
+                            if state.self_slot.is_none() && state.pending_slot_claim.is_none() {
+                                drop(state);
+                                self.start_slot_claim_tgp().await;
+                            }
+
                             return Ok((Some(node_id.to_string()), vec![]));
                         }
                     }
@@ -2975,6 +3440,7 @@ impl MeshService {
                     msg.get("index").and_then(|i| i.as_u64()),
                     msg.get("peer_id").and_then(|p| p.as_str()),
                 ) {
+                    debug!("Received slot_claim flood: slot {} from {}", index, claimer_id);
                     let coord = msg.get("coord")
                         .and_then(|c| c.as_array())
                         .map(|arr| {
@@ -2993,11 +3459,28 @@ impl MeshService {
                     // Check if this is a new claim before processing
                     let is_new = !self.state.read().await.claimed_slots.contains_key(&index);
 
-                    // Process the slot claim (stores public key in claim and peer)
-                    let we_lost = self.process_slot_claim(index, claimer_id.to_string(), coord, public_key.clone()).await;
+                    // Check if someone else claimed the slot we're trying to claim via TGP
+                    let self_id = self.state.read().await.self_id.clone();
+                    let pending_sniped = {
+                        let state = self.state.read().await;
+                        state.pending_slot_claim == Some(index) && claimer_id != self_id
+                    };
 
-                    // Re-flood new claims to propagate through mesh (with public key)
-                    if is_new {
+                    if pending_sniped {
+                        // Someone else got our pending slot - cancel our TGP and retry for next slot
+                        info!("Pending slot {} was claimed by {} - canceling TGP and retrying", index, claimer_id);
+                        let mut state = self.state.write().await;
+                        state.pending_slot_claim = None;
+                        drop(state);
+                    }
+
+                    // Process the slot claim (stores public key in claim and peer)
+                    let (we_lost, race_won) = self.process_slot_claim(index, claimer_id.to_string(), coord, public_key.clone()).await;
+
+                    // Re-flood claims to propagate through mesh:
+                    // - New claims (is_new): first time we've seen this slot claimed
+                    // - Race winners (race_won): a new claimer beat the previous one
+                    if is_new || race_won {
                         self.flood(FloodMessage::SlotClaim {
                             index,
                             peer_id: claimer_id.to_string(),
@@ -3006,18 +3489,14 @@ impl MeshService {
                         });
                     }
 
-                    // If we lost our slot, attempt to join at next available via TGP
-                    if we_lost {
-                        let mut target_slot = self.state.read().await.next_available_slot();
-                        info!("Lost slot race, attempting slot {} via TGP", target_slot);
-                        // Try slots until one succeeds
-                        while !self.attempt_slot_via_tgp(target_slot).await {
-                            target_slot += 1;
-                            if target_slot > 1000 {
-                                error!("Failed to rejoin mesh after 1000 slot attempts");
-                                break;
-                            }
-                        }
+                    // EVENT: Mesh state changed - trigger claim attempt
+                    // Per FailureDetectorElimination.lean: state changes are valid trigger events
+                    if we_lost || pending_sniped {
+                        debug!("Lost slot {} - triggering reclaim", index);
+                        self.trigger_slot_claim_if_ready();
+                    } else if is_new || race_won {
+                        // Slot state changed - maybe we can claim now
+                        self.trigger_slot_claim_if_ready();
                     }
                 }
             }
@@ -3419,7 +3898,7 @@ impl MeshService {
                             let coord = spiral3d_to_coord(Spiral3DIndex::new(*slot_idx));
 
                             // Process through tiebreaker - this handles conflicts
-                            let lost = self.process_slot_claim(
+                            let (lost, _race_won) = self.process_slot_claim(
                                 *slot_idx,
                                 their_peer_id,
                                 (coord.q, coord.r, coord.z),
@@ -3431,26 +3910,13 @@ impl MeshService {
                             }
                         }
 
-                        // If we lost our slot, reclaim at next available
+                        // EVENT: Chain adopted - mesh state changed
+                        // Per FailureDetectorElimination.lean: state changes are valid trigger events
                         if we_lost_our_slot {
-                            let mut target_slot = self.state.read().await.next_available_slot();
-                            info!("Lost slot during chain adoption, reclaiming at slot {}", target_slot);
-
-                            while !self.attempt_slot_via_tgp(target_slot).await {
-                                target_slot += 1;
-                                if target_slot > 1000 {
-                                    error!("Failed to reclaim slot after chain adoption");
-                                    break;
-                                }
-                            }
-
-                            if target_slot <= 1000 {
-                                // Register our new slot
-                                let pubkey = self.state.read().await.signing_key.verifying_key().to_bytes();
-                                self.cvdf_register_slot(target_slot, pubkey).await;
-                                self.cvdf_set_slot(target_slot).await;
-                            }
+                            info!("Lost slot during chain adoption - triggering reclaim");
                         }
+                        // Always trigger after chain adoption - we learned about new mesh state
+                        self.trigger_slot_claim_if_ready();
                     }
                 }
             }
