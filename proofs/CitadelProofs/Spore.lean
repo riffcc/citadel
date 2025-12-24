@@ -1011,9 +1011,9 @@ theorem dynamic_convergence_stable :
   simp only [Spore.excludes, Spore.covers, eq_iff_iff]
   constructor
   · intro _; trivial
-  · intro _
-    intro ⟨_, hr, _⟩
-    simp_all
+  · intro _ ⟨_r, hr, _hv⟩
+    -- hr says _r ∈ [], but [] has no elements - this is a contradiction
+    cases hr
 
 /-!
 ## Hierarchical SPORE (Section 8.6)

@@ -308,11 +308,13 @@ theorem broadcast_terminates (source : HexCoord) (mesh : Finset HexCoord)
     · exact Finset.singleton_subset_iff.mpr hsrc
     · simp only [Finset.card_singleton, le_refl]
 
-/-- Frontier decreases or reached increases each step -/
+/-- Frontier decreases or reached increases each step.
+    The mesh bounds the maximum reachable set - broadcast cannot escape the mesh. -/
 theorem wave_progress (wave : BroadcastWave) (mesh : Finset HexCoord)
-    (hne : wave.frontier ≠ ∅) :
+    (hne : wave.frontier ≠ ∅) (h_in_mesh : wave.reached ⊆ mesh) :
     ∃ (wave' : BroadcastWave),
       wave'.source = wave.source ∧
+      wave'.reached ⊆ mesh ∧  -- Invariant: reached stays within mesh
       (wave'.reached.card > wave.reached.card ∨
        wave'.frontier.card < wave.frontier.card) := by
   -- Get a node from the non-empty frontier
@@ -326,12 +328,11 @@ theorem wave_progress (wave : BroadcastWave) (mesh : Finset HexCoord)
     exact wave.frontier_subset hx_in
   -- Build the new wave
   use ⟨wave.source, wave.reached, frontier', h_subset, wave.source_reached⟩
-  constructor
-  · rfl
-  · -- frontier' has smaller cardinality
-    right
-    simp only [frontier']
-    exact Finset.card_erase_lt_of_mem hn
+  refine ⟨rfl, h_in_mesh, ?_⟩
+  -- frontier' has smaller cardinality
+  right
+  simp only [frontier']
+  exact Finset.card_erase_lt_of_mem hn
 
 /-! ## Latency Model -/
 

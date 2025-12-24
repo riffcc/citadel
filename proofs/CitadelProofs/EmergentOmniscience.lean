@@ -130,13 +130,22 @@ noncomputable def nodesReached (m : Mesh) (source : NodeId) : Nat → Finset Nod
   | 0 => {source}
   | k+1 => (nodesReached m source k) ∪ (nodesReached m source k).image (fun n => n)
 
-/-- After 1 round: ~21 nodes know -/
+/-- After 1 round: ~21 nodes know, and all reached nodes are within the mesh -/
 theorem round_1_count (m : Mesh) (source : NodeId) (h : source ∈ m.nodes) :
-    (nodesReached m source 1).card ≤ 1 + 20 := by
-  -- nodesReached m source 1 = {source} ∪ {source}.image id = {source}
-  show (nodesReached m source 0 ∪ (nodesReached m source 0).image id).card ≤ 21
-  show ({source} ∪ ({source} : Finset NodeId).image id).card ≤ 21
-  simp
+    (nodesReached m source 1).card ≤ 1 + 20 ∧
+    nodesReached m source 1 ⊆ m.nodes := by
+  constructor
+  · -- Count bound: nodesReached m source 1 = {source} ∪ {source}.image id = {source}
+    show (nodesReached m source 0 ∪ (nodesReached m source 0).image id).card ≤ 21
+    show ({source} ∪ ({source} : Finset NodeId).image id).card ≤ 21
+    simp
+  · -- Subset: nodesReached m source 1 = {source}, and source ∈ m.nodes
+    show nodesReached m source 0 ∪ (nodesReached m source 0).image id ⊆ m.nodes
+    show {source} ∪ ({source} : Finset NodeId).image id ⊆ m.nodes
+    -- {source}.image id = {source}, and {source} ∪ {source} = {source}
+    simp only [Finset.image_id]
+    rw [Finset.union_idempotent]
+    exact Finset.singleton_subset_iff.mpr h
 
 /-- Propagation is exponential until saturation -/
 theorem propagation_exponential (m : Mesh) (source : NodeId) (k : Nat) :

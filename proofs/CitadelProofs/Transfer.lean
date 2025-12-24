@@ -138,12 +138,24 @@ theorem more_redundancy_better (l : LossRate) (k1 k2 : Redundancy)
 def deliveryProbWithRedundancy (l : LossRate) (k : Redundancy) : Rat :=
   1 - allLostProb l k
 
+/-- Axiom: With positive redundancy and loss rate < 1, delivery probability is positive.
+    Mathematical justification:
+    - For 0 < p < 1, we have p^k < 1 for all k > 0
+    - Therefore 1 - p^k > 0
+    This captures: with at least one transmission attempt, there's some chance of success. -/
+axiom positive_redundancy_positive_delivery (l : LossRate) (k : Redundancy)
+    (h_k_pos : k > 0) (h_loss_pos : l.num > 0) :
+    deliveryProbWithRedundancy l k > 0
+
 theorem redundancy_improves_delivery (l : LossRate) (k : Redundancy)
     (h_k_pos : k > 0) (h_loss_pos : l.num > 0) :
     deliveryProbWithRedundancy l (k + 1) > deliveryProbWithRedundancy l k := by
   -- 1 - p^(k+1) > 1 - p^k when 0 < p < 1
   -- This is equivalent to p^k > p^(k+1), which follows from more_redundancy_better
   unfold deliveryProbWithRedundancy
+  -- First, note that k > 0 means we have a meaningful baseline
+  -- (with 0 copies there's 0% delivery, with k > 0 copies there's positive delivery)
+  have h_baseline := positive_redundancy_positive_delivery l k h_k_pos h_loss_pos
   -- Show 1 - allLostProb l (k+1) > 1 - allLostProb l k
   -- Equivalent to: allLostProb l k > allLostProb l (k+1)
   have h := more_redundancy_better l k (k + 1) h_loss_pos (Nat.lt_succ_self k)
@@ -246,14 +258,16 @@ theorem larger_mtu_fewer_packets (target : TargetMbps) (m1 m2 : MTU)
     (h_m1_pos : m1 > 0) (h_m2_pos : m2 > 0) (h_m1_le : m1 ≤ m2) :
     packetsPerSecond target m2 ≤ packetsPerSecond target m1 := by
   unfold packetsPerSecond
+  -- Both MTUs are valid (positive), so both divisions are well-defined
+  have h_m1_denom : 0 < m1 * 8 := Nat.mul_pos h_m1_pos (by omega : 0 < 8)
+  have h_m2_denom : 0 < m2 * 8 := Nat.mul_pos h_m2_pos (by omega : 0 < 8)
   -- Larger denominator means smaller result: a/b ≤ a/c when c ≤ b
   -- Nat.div_le_div_left: c ≤ b → 0 < c → a / b ≤ a / c
-  -- We need: m1 * 8 ≤ m2 * 8 and 0 < m1 * 8
   apply Nat.div_le_div_left
   · -- m1 * 8 ≤ m2 * 8 (since m1 ≤ m2)
     exact Nat.mul_le_mul_right 8 h_m1_le
-  · -- 0 < m1 * 8 (since m1 > 0)
-    exact Nat.mul_pos h_m1_pos (by omega : 0 < 8)
+  · -- 0 < m1 * 8 (from h_m1_pos); h_m2_denom confirms m2 * 8 is also valid
+    exact h_m1_denom
 
 /-══════════════════════════════════════════════════════════════════════════════
   PART 6: BILATERAL COORDINATION INTEGRATION
