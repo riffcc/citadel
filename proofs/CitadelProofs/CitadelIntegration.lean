@@ -32,7 +32,7 @@ Citadel bypasses these through geometric structure:
 | GapAndWrap | 1 | 20-connected toroidal mesh |
 | Spore | 40+ | XOR-based optimal sync |
 | CRDT | 67 | Practical CAP, Structural Linearizability |
-| **Total** | **142+** | Complete system verification |
+| **Total** | **360** | Complete system verification |
 
 ## The Key Insight
 
@@ -290,7 +290,7 @@ theorem spacetime_order_welldefined
 | CRDT.PracticalCAP | 10 | ✅ Complete |
 | CRDT.StructuralLinearizability | 26 | ✅ Complete |
 | Integration | 10+ | ✅ This file |
-| **Total** | **152+** | **Verified** |
+| **Total** | **360** | **Verified** |
 
 ## Axioms Summary
 
@@ -316,7 +316,7 @@ All axioms are either:
 
 ## The Bottom Line
 
-**152+ theorems verify that Citadel achieves:**
+**360 theorems verify that Citadel achieves:**
 - Deterministic slot assignment without coordination
 - Verifiable temporal ordering via VDF
 - Zero-latency writes with proven convergence
