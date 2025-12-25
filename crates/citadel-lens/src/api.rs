@@ -182,6 +182,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/admin/featured-releases/:id", delete(delete_featured_release))
         // Account (identity management)
         .route("/api/v1/account/:public_key", get(get_account))
+        // Upload permission validation (for nginx auth_request)
+        .route("/api/v1/validate-upload", get(validate_upload))
         // Network mesh topology map
         .route("/api/v1/map", get(get_network_map))
         // Mesh state (slots, peers, TGP sessions)
@@ -1017,6 +1019,40 @@ async fn get_account(
         roles,
         permissions,
     }))
+}
+
+/// Validate upload permission for nginx auth_request.
+/// Returns 200 OK if pubkey has upload permission, 403 Forbidden otherwise.
+/// nginx passes the pubkey via X-Pubkey header.
+async fn validate_upload(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> StatusCode {
+    // Get pubkey from header (set by nginx from original request)
+    let public_key = match headers.get("X-Pubkey").and_then(|v| v.to_str().ok()) {
+        Some(key) => key,
+        None => {
+            tracing::debug!("validate_upload: Missing X-Pubkey header");
+            return StatusCode::FORBIDDEN;
+        }
+    };
+
+    let state = state.read().await;
+
+    // Check if admin
+    if state.storage.is_admin(public_key).unwrap_or(false) {
+        tracing::debug!("validate_upload: {} is admin, allowed", public_key);
+        return StatusCode::OK;
+    }
+
+    // Check if has upload permission
+    if state.storage.has_permission(public_key, "upload").unwrap_or(false) {
+        tracing::debug!("validate_upload: {} has upload permission, allowed", public_key);
+        return StatusCode::OK;
+    }
+
+    tracing::debug!("validate_upload: {} denied - no upload permission", public_key);
+    StatusCode::FORBIDDEN
 }
 
 // --- Network Map endpoints ---
