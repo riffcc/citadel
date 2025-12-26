@@ -2,5 +2,15 @@
 name = "citadel-crdt"
 version.workspace = true
 edition = "2021"
+description = "Bilateral CRDTs with proven convergence for Citadel"
+license = "AGPL-3.0-or-later"
 
 [dependencies]
+serde = { version = "1", features = ["derive"] }
+serde-big-array = "0.5"
+blake3 = "1.5"
+hex = "0.4"
+bincode = "1.3"
+
+[dev-dependencies]
+# Tests only need the main dependencies

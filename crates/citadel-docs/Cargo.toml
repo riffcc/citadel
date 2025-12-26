@@ -1,0 +1,27 @@
+[package]
+name = "citadel-docs"
+version.workspace = true
+edition = "2021"
+description = "Bilateral CRDT document storage for Citadel"
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+# Citadel crates
+citadel-crdt = { path = "../citadel-crdt" }
+citadel-spore = { path = "../citadel-spore" }
+
+# Storage
+rocksdb = "0.22"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+bincode = "1.3"
+
+# Logging
+tracing = "0.1"
+
+# Error handling
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
