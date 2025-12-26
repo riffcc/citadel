@@ -1341,13 +1341,20 @@ async fn get_account(
 }
 
 /// Validate upload permission for nginx auth_request.
-/// Returns 200 OK if pubkey has upload permission, 403 Forbidden otherwise.
-/// nginx passes the pubkey via X-Pubkey header.
+/// Returns 200 OK if signature is valid and pubkey has upload permission.
+/// Returns 403 Forbidden otherwise.
+///
+/// Required headers (passed by nginx from original request):
+/// - X-Pubkey: Public key in "ed25519p/{hex}" format
+/// - X-Signature: Hex-encoded ed25519 signature over "{timestamp}:UPLOAD"
+/// - X-Timestamp: Unix timestamp (seconds) when signature was created
+///
+/// The signature must be recent (within 5 minutes) to prevent replay attacks.
 async fn validate_upload(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> StatusCode {
-    // Get pubkey from header (set by nginx from original request)
+    // Get required headers
     let public_key = match headers.get("X-Pubkey").and_then(|v| v.to_str().ok()) {
         Some(key) => key,
         None => {
@@ -1355,6 +1362,52 @@ async fn validate_upload(
             return StatusCode::FORBIDDEN;
         }
     };
+
+    let signature = match headers.get("X-Signature").and_then(|v| v.to_str().ok()) {
+        Some(sig) => sig,
+        None => {
+            tracing::debug!("validate_upload: Missing X-Signature header");
+            return StatusCode::FORBIDDEN;
+        }
+    };
+
+    let timestamp = match headers.get("X-Timestamp").and_then(|v| v.to_str().ok()) {
+        Some(ts) => ts,
+        None => {
+            tracing::debug!("validate_upload: Missing X-Timestamp header");
+            return StatusCode::FORBIDDEN;
+        }
+    };
+
+    // Verify timestamp is recent (within 24 hours) to prevent replay attacks
+    // We use a longer window because jobs may be queued before execution
+    let ts_secs: i64 = match timestamp.parse() {
+        Ok(ts) => ts,
+        Err(_) => {
+            tracing::debug!("validate_upload: Invalid timestamp format");
+            return StatusCode::FORBIDDEN;
+        }
+    };
+
+    let now = chrono::Utc::now().timestamp();
+    let age = (now - ts_secs).abs();
+    if age > 86400 {
+        // 24 hours - allows for queued jobs
+        tracing::debug!(
+            "validate_upload: Timestamp too old/future: {} (now: {}, age: {}s)",
+            ts_secs,
+            now,
+            age
+        );
+        return StatusCode::FORBIDDEN;
+    }
+
+    // Verify signature over "{timestamp}:UPLOAD"
+    let message = format!("{}:UPLOAD", timestamp);
+    if let Err(e) = verify_signature(public_key, message.as_bytes(), signature) {
+        tracing::debug!("validate_upload: Signature verification failed: {}", e);
+        return StatusCode::FORBIDDEN;
+    }
 
     let state = state.read().await;
 
@@ -1366,7 +1419,10 @@ async fn validate_upload(
 
     // Check if has upload permission
     if state.storage.has_permission(public_key, "upload").unwrap_or(false) {
-        tracing::debug!("validate_upload: {} has upload permission, allowed", public_key);
+        tracing::debug!(
+            "validate_upload: {} has upload permission, allowed",
+            public_key
+        );
         return StatusCode::OK;
     }
 
