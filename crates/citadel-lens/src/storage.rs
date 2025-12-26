@@ -1,7 +1,8 @@
 //! Persistent storage using RocksDB.
 
 use crate::error::Result;
-use crate::models::{Category, ContentItem, FeaturedRelease, Release};
+use crate::models::{Category, ContentItem, FeaturedRelease, Release, ReleaseStatus};
+use std::collections::HashMap;
 use ed25519_dalek::SigningKey;
 use rocksdb::{Options, DB};
 use std::path::Path;
@@ -84,6 +85,64 @@ impl Storage {
         }
 
         Ok(releases)
+    }
+
+    /// List releases filtered by status.
+    pub fn list_releases_by_status(&self, status: ReleaseStatus) -> Result<Vec<Release>> {
+        let all = self.list_releases()?;
+        Ok(all.into_iter().filter(|r| r.status == status).collect())
+    }
+
+    /// List only pending releases (for moderation queue).
+    pub fn list_pending_releases(&self) -> Result<Vec<Release>> {
+        self.list_releases_by_status(ReleaseStatus::Pending)
+    }
+
+    /// List only approved releases (public catalog).
+    pub fn list_public_releases(&self) -> Result<Vec<Release>> {
+        self.list_releases_by_status(ReleaseStatus::Approved)
+    }
+
+    /// Count releases grouped by status.
+    pub fn count_releases_by_status(&self) -> Result<HashMap<String, usize>> {
+        let releases = self.list_releases()?;
+        let mut counts = HashMap::new();
+
+        for release in releases {
+            let status_str = release.status.to_string();
+            *counts.entry(status_str).or_insert(0) += 1;
+        }
+
+        Ok(counts)
+    }
+
+    /// Approve a release by ID.
+    /// Returns the updated release, or None if not found.
+    pub fn approve_release(&self, id: &str, moderator_pubkey: &str) -> Result<Option<Release>> {
+        if let Some(mut release) = self.get_release(id)? {
+            release.approve(moderator_pubkey);
+            self.put_release(&release)?;
+            Ok(Some(release))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Reject a release by ID.
+    /// Returns the updated release, or None if not found.
+    pub fn reject_release(
+        &self,
+        id: &str,
+        moderator_pubkey: &str,
+        reason: Option<String>,
+    ) -> Result<Option<Release>> {
+        if let Some(mut release) = self.get_release(id)? {
+            release.reject(moderator_pubkey, reason);
+            self.put_release(&release)?;
+            Ok(Some(release))
+        } else {
+            Ok(None)
+        }
     }
 
     // --- Content Items ---

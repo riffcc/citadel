@@ -176,6 +176,8 @@ pub struct LensState {
     pub mesh_state: Option<Arc<RwLock<MeshState>>>,
     /// Flood sender for SPORE content propagation
     pub flood_tx: Option<tokio::sync::broadcast::Sender<crate::mesh::FloodMessage>>,
+    /// Admin event sender for real-time moderation updates via WebSocket
+    pub admin_event_tx: Option<crate::ws_admin::AdminEventSender>,
 }
 
 /// A Lens node instance.
@@ -213,6 +215,7 @@ impl LensNode {
             config: config.clone(),
             mesh_state: None,
             flood_tx: None,
+            admin_event_tx: None,
         }));
 
         Ok(Self { state, config })
@@ -267,11 +270,15 @@ impl LensNode {
             }
         });
 
-        // Share mesh state and flood_tx with API layer
+        // Create admin event channel for real-time moderation updates
+        let (admin_event_tx, _admin_event_rx) = crate::ws_admin::create_admin_channel();
+
+        // Share mesh state, flood_tx, and admin_event_tx with API layer
         {
             let mut state = self.state.write().await;
             state.mesh_state = Some(mesh_service.mesh_state());
             state.flood_tx = Some(flood_tx);
+            state.admin_event_tx = Some(admin_event_tx);
         }
 
         let mesh_clone = Arc::clone(&mesh_service);

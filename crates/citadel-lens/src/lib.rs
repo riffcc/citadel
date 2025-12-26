@@ -32,6 +32,7 @@ pub mod api;
 pub mod admin_socket;
 pub mod mesh;
 pub mod ws;
+pub mod ws_admin;
 pub mod error;
 pub mod vdf_race;
 pub mod proof_of_latency;

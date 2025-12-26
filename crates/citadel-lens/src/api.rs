@@ -1,12 +1,13 @@
 //! HTTP API for Lens.
 
 use crate::mesh::{double_hash_id, FloodMessage};
-use crate::models::{Category, FeaturedRelease, Release};
+use crate::models::{Category, FeaturedRelease, Release, ReleaseStatus};
 use crate::node::LensState;
 use crate::ws::ws_mesh_handler;
+use crate::ws_admin;
 use axum::{
     body::Bytes,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     routing::{delete, get, post, put},
     Json, Router,
@@ -167,6 +168,11 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/releases/:id", get(get_release))
         .route("/api/v1/releases/:id", put(update_release))
         .route("/api/v1/releases/:id", delete(delete_release))
+        // Moderation endpoints (admin only)
+        .route("/api/v1/releases/pending", get(list_pending_releases))
+        .route("/api/v1/releases/:id/approve", post(approve_release))
+        .route("/api/v1/releases/:id/reject", post(reject_release))
+        .route("/api/v1/moderation/stats", get(moderation_stats))
         // Categories
         .route("/api/v1/content-categories", get(list_categories))
         .route("/api/v1/content-categories", post(create_category))
@@ -190,6 +196,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/mesh/state", get(get_mesh_state))
         // WebSocket for real-time mesh updates
         .route("/api/v1/ws/mesh", get(ws_mesh_handler))
+        // WebSocket for real-time admin moderation updates
+        .route("/api/v1/ws/admin", get(ws_admin::ws_admin_handler))
         // Import/Export
         .route("/api/v1/import", post(import_releases))
         .route("/api/v1/export", get(export_releases))
@@ -252,18 +260,55 @@ async fn ready(
 
 // --- Release endpoints ---
 
+/// Query parameters for listing releases
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct ListReleasesQuery {
+    /// If true, include all releases (pending, approved, rejected) - admin only
+    #[serde(default)]
+    include_all: bool,
+    /// Filter by specific status
+    status: Option<String>,
+}
+
 async fn list_releases(
     State(state): State<AppState>,
+    Query(params): Query<ListReleasesQuery>,
+    headers: HeaderMap,
 ) -> Result<Json<Vec<Release>>, StatusCode> {
     let state = state.read().await;
+
+    // Check if caller is admin (for include_all)
+    let is_admin = headers
+        .get("X-Public-Key")
+        .and_then(|v| v.to_str().ok())
+        .map(|pk| state.storage.is_admin(pk).unwrap_or(false))
+        .unwrap_or(false);
+
     let releases = state
         .storage
         .list_releases()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .into_iter()
-        .map(|r| r.with_defaults())
-        .collect();
-    Ok(Json(releases))
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // Filter releases based on params
+    let filtered: Vec<Release> = if params.include_all && is_admin {
+        // Admin requested all releases
+        releases
+    } else if let Some(status_str) = params.status {
+        // Filter by specific status
+        let target_status = match status_str.to_lowercase().as_str() {
+            "pending" => ReleaseStatus::Pending,
+            "approved" => ReleaseStatus::Approved,
+            "rejected" => ReleaseStatus::Rejected,
+            _ => return Err(StatusCode::BAD_REQUEST),
+        };
+        releases.into_iter().filter(|r| r.status == target_status).collect()
+    } else {
+        // Default: return only approved releases (public catalog)
+        releases.into_iter().filter(|r| r.status == ReleaseStatus::Approved).collect()
+    };
+
+    Ok(Json(filtered.into_iter().map(|r| r.with_defaults()).collect()))
 }
 
 /// Request for creating a release.
@@ -287,13 +332,17 @@ struct CreateReleaseRequest {
     /// Tags (optional)
     tags: Option<Vec<String>>,
     /// Content CID (optional)
-    #[serde(alias = "content_cid")]
+    #[serde(alias = "content_cid", alias = "contentCID")]
     content_cid: Option<String>,
     /// Thumbnail CID (optional)
-    #[serde(alias = "thumbnail_cid")]
+    #[serde(alias = "thumbnail_cid", alias = "thumbnailCID")]
     thumbnail_cid: Option<String>,
     /// Arbitrary metadata (optional) - for artist type, series, etc.
     metadata: Option<serde_json::Value>,
+    /// Initial status (optional) - admins can create as "pending" for moderation
+    /// Defaults to "approved" for backward compatibility
+    #[serde(default)]
+    status: Option<String>,
 }
 
 async fn create_release(
@@ -372,6 +421,15 @@ async fn create_release(
     release.thumbnail_cid = req.thumbnail_cid;
     release.metadata = req.metadata;
 
+    // Set status if provided (admin can create as pending for moderation queue)
+    if let Some(status_str) = req.status {
+        release.status = match status_str.to_lowercase().as_str() {
+            "pending" => ReleaseStatus::Pending,
+            "rejected" => ReleaseStatus::Rejected,
+            _ => ReleaseStatus::Approved, // Default to approved
+        };
+    }
+
     let state = state.read().await;
     state
         .storage
@@ -394,6 +452,13 @@ async fn create_release(
                 peer_id: "api-create".to_string(),
                 release_ids,
             });
+        }
+    }
+
+    // Broadcast to admin WebSocket subscribers if release is pending moderation
+    if release.status == ReleaseStatus::Pending {
+        if let Some(ref admin_tx) = state.admin_event_tx {
+            ws_admin::broadcast_release_submitted(admin_tx, &release);
         }
     }
 
@@ -637,6 +702,260 @@ async fn delete_release(
     }
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+// --- Moderation endpoints ---
+
+/// GET /api/v1/releases/pending - List all pending releases (admin only)
+async fn list_pending_releases(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<Release>>, (StatusCode, Json<serde_json::Value>)> {
+    // Extract and verify admin
+    let public_key = headers
+        .get("X-Public-Key")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
+            "error": "Missing X-Public-Key header"
+        }))))?;
+
+    let state = state.read().await;
+
+    if !state.storage.is_admin(public_key).unwrap_or(false) {
+        return Err((StatusCode::FORBIDDEN, Json(serde_json::json!({
+            "error": "Admin permission required"
+        }))));
+    }
+
+    let releases = state
+        .storage
+        .list_pending_releases()
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": "Failed to list pending releases"
+        }))))?
+        .into_iter()
+        .map(|r| r.with_defaults())
+        .collect();
+
+    Ok(Json(releases))
+}
+
+/// Request body for approving a release
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ApproveReleaseRequest {
+    // Empty for now, but allows for future fields like notes
+}
+
+/// POST /api/v1/releases/:id/approve - Approve a pending release (admin only)
+async fn approve_release(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<Release>, (StatusCode, Json<serde_json::Value>)> {
+    // Extract authentication headers
+    let public_key = headers
+        .get("X-Public-Key")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
+            "error": "Missing X-Public-Key header"
+        }))))?;
+
+    let signature = headers
+        .get("X-Signature")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
+            "error": "Missing X-Signature header"
+        }))))?;
+
+    let timestamp = headers
+        .get("X-Timestamp")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
+            "error": "Missing X-Timestamp header"
+        }))))?;
+
+    // Verify signature and admin status
+    {
+        let state = state.read().await;
+        if let Err(e) = require_admin_signature(&state.storage, public_key, signature, timestamp, &body) {
+            tracing::warn!("Auth failed for approve_release: {}", e);
+            return Err((StatusCode::FORBIDDEN, Json(serde_json::json!({
+                "error": e
+            }))));
+        }
+    }
+
+    let state = state.read().await;
+
+    match state.storage.approve_release(&id, public_key) {
+        Ok(Some(release)) => {
+            tracing::info!("Release {} approved by {}", id, public_key);
+
+            // SPORE: Flood the approved release to propagate across mesh
+            if let Some(ref flood_tx) = state.flood_tx {
+                if let Ok(json) = serde_json::to_string(&release) {
+                    let _ = flood_tx.send(FloodMessage::Release { release_json: json });
+                    tracing::debug!("SPORE: Flooding approved release {}", release.id);
+                }
+            }
+
+            // Broadcast to admin WebSocket subscribers
+            if let Some(ref admin_tx) = state.admin_event_tx {
+                ws_admin::broadcast_release_approved(admin_tx, &id, public_key);
+            }
+
+            Ok(Json(release.with_defaults()))
+        }
+        Ok(None) => Err((StatusCode::NOT_FOUND, Json(serde_json::json!({
+            "error": "Release not found"
+        })))),
+        Err(e) => {
+            tracing::error!("Failed to approve release {}: {}", id, e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                "error": "Failed to approve release"
+            }))))
+        }
+    }
+}
+
+/// Request body for rejecting a release
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RejectReleaseRequest {
+    /// Optional reason for rejection
+    reason: Option<String>,
+}
+
+/// POST /api/v1/releases/:id/reject - Reject a pending release (admin only)
+async fn reject_release(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<Release>, (StatusCode, Json<serde_json::Value>)> {
+    // Extract authentication headers
+    let public_key = headers
+        .get("X-Public-Key")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
+            "error": "Missing X-Public-Key header"
+        }))))?;
+
+    let signature = headers
+        .get("X-Signature")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
+            "error": "Missing X-Signature header"
+        }))))?;
+
+    let timestamp = headers
+        .get("X-Timestamp")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
+            "error": "Missing X-Timestamp header"
+        }))))?;
+
+    // Verify signature and admin status
+    {
+        let state = state.read().await;
+        if let Err(e) = require_admin_signature(&state.storage, public_key, signature, timestamp, &body) {
+            tracing::warn!("Auth failed for reject_release: {}", e);
+            return Err((StatusCode::FORBIDDEN, Json(serde_json::json!({
+                "error": e
+            }))));
+        }
+    }
+
+    // Parse the request body for rejection reason
+    let req: RejectReleaseRequest = serde_json::from_slice(&body)
+        .unwrap_or(RejectReleaseRequest { reason: None });
+
+    let state = state.read().await;
+
+    match state.storage.reject_release(&id, public_key, req.reason.clone()) {
+        Ok(Some(release)) => {
+            tracing::info!(
+                "Release {} rejected by {} (reason: {:?})",
+                id, public_key, req.reason
+            );
+
+            // SPORE: Flood the updated release status to propagate across mesh
+            if let Some(ref flood_tx) = state.flood_tx {
+                if let Ok(json) = serde_json::to_string(&release) {
+                    let _ = flood_tx.send(FloodMessage::Release { release_json: json });
+                    tracing::debug!("SPORE: Flooding rejected release {}", release.id);
+                }
+            }
+
+            // Broadcast to admin WebSocket subscribers
+            if let Some(ref admin_tx) = state.admin_event_tx {
+                ws_admin::broadcast_release_rejected(admin_tx, &id, public_key, req.reason.clone());
+            }
+
+            Ok(Json(release.with_defaults()))
+        }
+        Ok(None) => Err((StatusCode::NOT_FOUND, Json(serde_json::json!({
+            "error": "Release not found"
+        })))),
+        Err(e) => {
+            tracing::error!("Failed to reject release {}: {}", id, e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                "error": "Failed to reject release"
+            }))))
+        }
+    }
+}
+
+/// Moderation statistics response
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ModerationStatsResponse {
+    pending: usize,
+    approved: usize,
+    rejected: usize,
+    total: usize,
+}
+
+/// GET /api/v1/moderation/stats - Get release counts by status (admin only)
+async fn moderation_stats(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<ModerationStatsResponse>, (StatusCode, Json<serde_json::Value>)> {
+    // Extract and verify admin
+    let public_key = headers
+        .get("X-Public-Key")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
+            "error": "Missing X-Public-Key header"
+        }))))?;
+
+    let state = state.read().await;
+
+    if !state.storage.is_admin(public_key).unwrap_or(false) {
+        return Err((StatusCode::FORBIDDEN, Json(serde_json::json!({
+            "error": "Admin permission required"
+        }))));
+    }
+
+    let counts = state
+        .storage
+        .count_releases_by_status()
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": "Failed to get moderation stats"
+        }))))?;
+
+    let pending = *counts.get("pending").unwrap_or(&0);
+    let approved = *counts.get("approved").unwrap_or(&0);
+    let rejected = *counts.get("rejected").unwrap_or(&0);
+
+    Ok(Json(ModerationStatsResponse {
+        pending,
+        approved,
+        rejected,
+        total: pending + approved + rejected,
+    }))
 }
 
 // --- Category endpoints ---
