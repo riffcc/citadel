@@ -19,6 +19,8 @@ citadel-topology = { path = "../citadel-topology" }
 citadel-dht = { path = "../citadel-dht" }
 citadel-protocols = { path = "../citadel-protocols" }
 citadel-spore = { path = "../citadel-spore" }
+citadel-crdt = { path = "../citadel-crdt" }
+citadel-docs = { path = "../citadel-docs" }
 
 # Async runtime
 tokio = { workspace = true }

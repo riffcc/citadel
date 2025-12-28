@@ -1,82 +1,27 @@
-//! Citadel Mesh Service
+//! MeshService implementation.
 //!
-//! # THE MESH IS THE SOURCE OF TRUTH
-//!
-//! There is no external oracle, coordinator, or database. The topology IS consensus.
-//! Your slot = the connections you have. The mesh = the sum of all connections.
-//!
-//! # THE KEY INSIGHT
-//!
-//! ```text
-//! "11/20" IS NOT THE MECHANISM.
-//! "11/20" IS THE RESULT.
-//!
-//! THE MECHANISM IS:
-//! ├── TGP at the base (bilateral consensus)
-//! ├── BFT emerges from TGP combinations
-//! ├── Threshold scales with network size
-//! └── 11/20 is what BFT LOOKS LIKE at 20 neighbors
-//!
-//! You don't "implement 11/20."
-//! You implement TGP + scaling thresholds.
-//! 11/20 emerges at maturity.
-//! ```
-//!
-//! # The Scaling Ladder
-//!
-//! ```text
-//! NODES    MECHANISM              THRESHOLD    HOW IT WORKS
-//! ─────────────────────────────────────────────────────────────
-//!   1      Genesis                1/1          First node auto-occupies slot 0
-//!   2      TGP (bilateral)        2/2          Both agree or neither does
-//!   3      TGP triad              2/3          Pairwise TGP, majority wins
-//!  4-6     BFT emergence          ⌈n/2⌉+1      TGP pairs + deterministic tiebreaker
-//!  7-11    Full BFT               2f+1         Threshold signatures (f = ⌊(n-1)/3⌋)
-//!  12-20   Neighbor validation    scaled       Growing toward 11/20
-//!  20+     Full SPIRAL            11/20        Mature mesh, all 20 neighbors exist
-//! ```
-//!
-//! # Slot Occupancy Through Connections
-//!
-//! YOU DON'T "CLAIM" A SLOT. YOU **BECOME** A SLOT BY HAVING THE CONNECTIONS.
-//!
-//! A node occupies slot N iff:
-//! 1. It has TGP agreements with ≥threshold neighbors of N
-//! 2. Those neighbors acknowledge its direction as "toward N"
-//! 3. Pigeonhole: Each neighbor has ONE "toward N" direction (exclusivity)
-//!
-//! # SPORE Principles
-//!
-//! ALL data transfer uses continuous flooding - no request/response patterns:
-//! - Peer discovery floods on connection
-//! - Slot announcements flood through mesh
-//! - Admin lists flood on change
-//! - XOR cancellation: sync_cost(A,B) = O(|A ⊕ B|) → 0 at convergence
-//!
-//! # 20-Neighbor Topology (SPIRAL)
-//!
-//! Each slot has exactly 20 theoretical neighbors:
-//! - 6 planar (hexagonal grid at same z-level)
-//! - 2 vertical (directly above/below)
-//! - 12 extended (6 above + 6 below diagonals)
+//! This module contains the core MeshService that manages:
+//! - Peer connections (TCP)
+//! - TGP coordination (UDP)
+//! - Slot claiming
+//! - VDF/CVDF consensus
+//! - SPORE sync
 
 use crate::error::Result;
+use crate::models::FeaturedRelease;
 use crate::storage::Storage;
-use crate::vdf_race::{VdfRace, VdfLink, AnchoredSlotClaim, claim_has_priority};
+use crate::vdf_race::{claim_has_priority, AnchoredSlotClaim, VdfLink, VdfRace};
 use crate::cvdf::{CvdfCoordinator, CvdfRound, RoundAttestation};
 use crate::accountability::{AccountabilityTracker, FailureType};
 use crate::liveness::{LivenessManager, MeshVouch, PropagationDecision};
+use citadel_docs::DocumentStore;
 use citadel_protocols::{
-    CoordinatorConfig, FloodRateConfig, KeyPair, Message as TgpMessage, MessagePayload, PeerCoordinator, PublicKey,
-    QuadProof, SporeSyncManager,
+    CoordinatorConfig, FloodRateConfig, KeyPair, Message as TgpMessage, MessagePayload,
+    PeerCoordinator, PublicKey, QuadProof, SporeSyncManager,
 };
-use citadel_spore::{U256, Spore, Range256, SyncState as SporeSyncState, SporeMessage};
-use citadel_topology::{
-    HexCoord, Neighbors, Spiral3DIndex, spiral3d_to_coord, coord_to_spiral3d,
-    // Gap-and-Wrap: toroidal mesh with ghost connections
-    Direction, Connection, compute_all_connections, ghost_target,
-};
-use ed25519_dalek::{SigningKey, VerifyingKey};
+use citadel_spore::{Spore, U256};
+use citadel_topology::{spiral3d_to_coord, Direction, HexCoord, Neighbors, Spiral3DIndex};
+use ed25519_dalek::SigningKey;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -85,765 +30,13 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{broadcast, mpsc, oneshot, Notify, RwLock};
 use tracing::{debug, error, info, warn};
 
-/// Compute PeerID from ed25519 public key using double-BLAKE3 (Archivist/IPFS style)
-/// hash₁ = BLAKE3(pubkey), hash₂ = BLAKE3(hash₁), PeerID = "b3b3/{hash₂}"
-pub fn compute_peer_id(pubkey: &VerifyingKey) -> String {
-    let hash1 = blake3::hash(pubkey.as_bytes());
-    let hash2 = blake3::hash(hash1.as_bytes());
-    format!("b3b3/{}", hex::encode(hash2.as_bytes()))
-}
-
-/// Compute PeerID from raw public key bytes
-pub fn compute_peer_id_from_bytes(pubkey_bytes: &[u8]) -> String {
-    let hash1 = blake3::hash(pubkey_bytes);
-    let hash2 = blake3::hash(hash1.as_bytes());
-    format!("b3b3/{}", hex::encode(hash2.as_bytes()))
-}
-
-/// Verify that a claimed PeerID matches the given public key
-pub fn verify_peer_id(claimed_id: &str, pubkey: &VerifyingKey) -> bool {
-    compute_peer_id(pubkey) == claimed_id
-}
-
-/// Compute double-hash of an ID for DoNotWantList (proof of absence)
-/// H(H(id)) prevents enumeration while allowing verification
-/// Only someone with the original ID can verify a deletion matches
-pub fn double_hash_id(id: &str) -> [u8; 32] {
-    let hash1 = blake3::hash(id.as_bytes());
-    let hash2 = blake3::hash(hash1.as_bytes());
-    *hash2.as_bytes()
-}
-
-/// Verify if an ID matches a double-hash (for tombstone checking)
-pub fn matches_tombstone(id: &str, tombstone: &[u8; 32]) -> bool {
-    double_hash_id(id) == *tombstone
-}
-
-/// Convert a release ID to U256 for SPORE range operations
-/// Uses BLAKE3 hash to map string IDs into 256-bit hash space
-pub fn release_id_to_u256(id: &str) -> U256 {
-    let hash = blake3::hash(id.as_bytes());
-    U256::from_be_bytes(hash.as_bytes())
-}
-
-/// Build a Spore HaveList from a list of release IDs
-/// Each release ID becomes a point range [hash, hash+1)
-/// Ranges automatically merge when adjacent (rare for random UUIDs but happens)
-pub fn build_spore_havelist(release_ids: &[String]) -> Spore {
-    if release_ids.is_empty() {
-        return Spore::empty();
-    }
-
-    let ranges: Vec<Range256> = release_ids.iter()
-        .filter_map(|id| {
-            let start = release_id_to_u256(id);
-            // Point range: [hash, hash+1)
-            start.checked_add(&U256::from_u64(1))
-                .map(|stop| Range256::new(start, stop))
-        })
-        .collect();
-
-    Spore::from_ranges(ranges)
-}
-
-/// Build WantList from HaveList
-/// WantList = complement of HaveList = everything I DON'T have
-/// A new node wants everything: Spore::full()
-/// A synced node wants: HaveList.complement()
-pub fn build_spore_wantlist(have_list: &Spore) -> Spore {
-    have_list.complement()
-}
-
-/// Mesh node identity and state
-#[derive(Debug, Clone)]
-pub struct MeshPeer {
-    pub id: String,
-    pub addr: SocketAddr,
-    pub public_key: Option<Vec<u8>>,
-    pub last_seen: std::time::Instant,
-    pub coordinated: bool,
-    /// The SPIRAL slot this peer has claimed (if known)
-    pub slot: Option<SlotClaim>,
-    /// True if this peer is an entry/bootstrap peer (from CITADEL_PEERS)
-    /// Entry peers should be disconnected once we have enough SPIRAL neighbors
-    pub is_entry_peer: bool,
-    /// SPORE: True if WE have all content THIS peer has (our WantList from them = ∅)
-    /// When all peers are content_synced, this node is "ready" to serve traffic
-    pub content_synced: bool,
-    /// SPORE: Their HaveList (what they possess) - received via SporeSync
-    /// Their WantList = their_have.complement() - derived, not stored
-    pub their_have: Option<Spore>,
-}
-
-/// A claimed SPIRAL slot in the mesh
-#[derive(Debug, Clone)]
-pub struct SlotClaim {
-    /// SPIRAL index (deterministic ordering)
-    pub index: u64,
-    /// 3D hex coordinate
-    pub coord: HexCoord,
-    /// PeerID that claimed this slot
-    pub peer_id: String,
-    /// Public key of the claiming peer (for TGP)
-    pub public_key: Option<Vec<u8>>,
-    /// Number of validators who confirmed this claim
-    pub confirmations: u32,
-}
-
-impl SlotClaim {
-    /// Create a new slot claim (without public key)
-    pub fn new(index: u64, peer_id: String) -> Self {
-        let coord = spiral3d_to_coord(Spiral3DIndex::new(index));
-        Self {
-            index,
-            coord,
-            peer_id,
-            public_key: None,
-            confirmations: 0,
-        }
-    }
-
-    /// Create a new slot claim with public key
-    pub fn with_public_key(index: u64, peer_id: String, public_key: Option<Vec<u8>>) -> Self {
-        let coord = spiral3d_to_coord(Spiral3DIndex::new(index));
-        Self {
-            index,
-            coord,
-            peer_id,
-            public_key,
-            confirmations: 0,
-        }
-    }
-
-    /// Get the 20 theoretical neighbor coordinates of this slot.
-    ///
-    /// This returns the "ideal" neighbors assuming all slots are occupied.
-    /// Used for slot validation: to claim slot N, you need TGP with its theoretical neighbors.
-    pub fn neighbor_coords(&self) -> [HexCoord; 20] {
-        Neighbors::of(self.coord)
-    }
-
-    /// Get the actual connections for this slot using Gap-and-Wrap.
-    ///
-    /// In a sparse mesh, some theoretical neighbors may be empty. GnW creates
-    /// "ghost connections" that span gaps to the next occupied slot in each direction.
-    /// This ensures every node has up to 20 logical connections regardless of density.
-    ///
-    /// Returns connections sorted by direction (6 planar + 2 vertical + 12 extended).
-    pub fn ghost_connections(&self, occupied: &HashSet<HexCoord>) -> Vec<Connection> {
-        compute_all_connections(occupied, self.coord)
-    }
-
-    /// Get the ghost target for a specific direction.
-    ///
-    /// Returns the actual connection target in the given direction:
-    /// - If theoretical neighbor is occupied → normal connection
-    /// - Otherwise → ghost connection to next occupied slot in that direction
-    pub fn ghost_target_in_direction(&self, occupied: &HashSet<HexCoord>, direction: Direction) -> Option<HexCoord> {
-        ghost_target(occupied, self.coord, direction)
-    }
-}
-
-/// A single latency measurement sample
-#[derive(Debug, Clone)]
-pub struct LatencySample {
-    pub latency_ms: u64,
-    pub timestamp: std::time::Instant,
-}
-
-/// Latency history for a single neighbor - tracks samples over time windows
-/// Uses VecDeque for O(1) push/pop. Memory-optimized: 360 samples (10s intervals)
-#[derive(Debug, Clone, Default)]
-pub struct LatencyHistory {
-    /// Recent samples (circular buffer, 360 samples = 1h at 10s resolution)
-    samples: std::collections::VecDeque<LatencySample>,
-    /// Maximum samples to keep (reduced to save memory)
-    max_samples: usize,
-}
-
-impl LatencyHistory {
-    pub fn new() -> Self {
-        Self {
-            samples: std::collections::VecDeque::with_capacity(64), // Start small, grow as needed
-            max_samples: 360, // 1 hour at 10-second resolution
-        }
-    }
-
-    /// Record a new latency sample - O(1) amortized
-    pub fn record(&mut self, latency_ms: u64) {
-        let sample = LatencySample {
-            latency_ms,
-            timestamp: std::time::Instant::now(),
-        };
-
-        if self.samples.len() >= self.max_samples {
-            self.samples.pop_front(); // O(1) with VecDeque
-        }
-        self.samples.push_back(sample);
-    }
-
-    /// Compute latency statistics over multiple time windows
-    pub fn compute_stats(&self) -> crate::api::LatencyStats {
-        use std::time::Duration;
-
-        let now = std::time::Instant::now();
-        let one_sec = Duration::from_secs(1);
-        let one_min = Duration::from_secs(60);
-        let one_hour = Duration::from_secs(3600);
-
-        let mut sum_1s = 0u64;
-        let mut count_1s = 0u32;
-        let mut sum_60s = 0u64;
-        let mut count_60s = 0u32;
-        let mut sum_1h = 0u64;
-        let mut count_1h = 0u32;
-
-        for sample in &self.samples {
-            let age = now.duration_since(sample.timestamp);
-
-            if age <= one_hour {
-                sum_1h += sample.latency_ms;
-                count_1h += 1;
-
-                if age <= one_min {
-                    sum_60s += sample.latency_ms;
-                    count_60s += 1;
-
-                    if age <= one_sec {
-                        sum_1s += sample.latency_ms;
-                        count_1s += 1;
-                    }
-                }
-            }
-        }
-
-        crate::api::LatencyStats {
-            last_1s_ms: if count_1s > 0 { Some(sum_1s as f64 / count_1s as f64) } else { None },
-            last_60s_ms: if count_60s > 0 { Some(sum_60s as f64 / count_60s as f64) } else { None },
-            last_1h_ms: if count_1h > 0 { Some(sum_1h as f64 / count_1h as f64) } else { None },
-            samples_1s: count_1s,
-            samples_60s: count_60s,
-            samples_1h: count_1h,
-        }
-    }
-
-    /// Get the most recent latency measurement
-    pub fn latest(&self) -> Option<u64> {
-        self.samples.back().map(|s| s.latency_ms)
-    }
-}
-
-/// Calculate consensus threshold based on mesh size.
-///
-/// # THE MECHANISM
-///
-/// This is NOT arbitrary - these are the minimum thresholds for Byzantine fault
-/// tolerance at each scale:
-///
-/// ```text
-/// NODES   THRESHOLD   BYZANTINE TOLERANCE   MECHANISM
-/// ─────────────────────────────────────────────────────────
-///   1       1/1       0 faults              Genesis (trivial)
-///   2       2/2       0 faults              Pure TGP bilateral
-///   3       2/3       1 fault               TGP triad
-///   4       3/4       1 fault               BFT: 2f+1 = 3
-///  5-6      4/n       1 fault               Growing BFT
-///  7-9      2f+1      2 faults              Full BFT formula
-/// 10-14     2f+1      3-4 faults            Scaling BFT
-/// 15-19     2f+1      4-6 faults            Approaching 11/20
-///  20+      11/20     9 faults              Mature mesh BFT
-/// ```
-///
-/// # BFT Formula
-///
-/// For `n` nodes, Byzantine fault tolerance requires:
-/// - Maximum faults tolerated: `f = ⌊(n-1)/3⌋`
-/// - Threshold: `2f + 1` (need honest majority of non-faulty)
-///
-/// At 20 neighbors: `f = ⌊19/3⌋ = 6`, but we use f=9 (11/20) because:
-/// - Each neighbor independently validates via their own TGP
-/// - We need >50% of TOTAL neighbors, not just non-faulty
-///
-/// # Security Scaling
-///
-/// Security GROWS with the network:
-/// - 2 nodes: Both must agree (trivial to attack, but trivial network)
-/// - 7 nodes: 5/7 must agree (2 Byzantine tolerated)
-/// - 20 nodes: 11/20 must agree (9 Byzantine tolerated!)
-pub fn consensus_threshold(mesh_size: usize) -> usize {
-    match mesh_size {
-        0 | 1 => 1,           // Genesis: auto-occupy slot 0
-        2 => 2,               // Pure TGP: 2/2 bilateral (both agree or neither)
-        3 => 2,               // Triad: 2/3 (one Byzantine tolerated)
-        4 => 3,               // BFT emerges: 3/4 (f=1, 2f+1=3)
-        5 => 4,               // f=1, 2f+1=3, but need >50% so 4/5
-        6 => 4,               // f=1, 2f+1=3, but need >50% so 4/6
-        7 => 5,               // f=2, 2f+1=5 (two Byzantine tolerated)
-        8 => 6,               // f=2, need >50%
-        9 => 6,               // f=2, need >50%
-        10 => 7,              // f=3, 2f+1=7
-        11..=13 => 8,         // f=3-4, scaling
-        14..=16 => 9,         // f=4-5, approaching full mesh
-        17..=19 => 10,        // f=5-6, almost there
-        _ => 11,              // Full mesh: 11/20 (9 Byzantine tolerated)
-    }
-}
-
-/// Active TGP coordination session with a peer
-pub struct TgpSession {
-    /// The TGP coordinator
-    pub coordinator: PeerCoordinator,
-    /// Commitment message (e.g., slot claim details)
-    pub commitment: String,
-    /// Channel to notify when coordination completes
-    pub result_tx: Option<oneshot::Sender<bool>>,
-    /// Peer's TGP UDP address (stored here for contention-free access)
-    pub peer_tgp_addr: SocketAddr,
-}
-
-/// A peer authorized via TGP QuadProof.
-///
-/// # TGP-Native Architecture
-///
-/// In TGP-native mesh, **connection isn't a socket—it's a proof**.
-/// Once two peers complete the TGP handshake (C→D→T→Q), they have
-/// bilateral QuadProofs that serve as permanent authorization.
-///
-/// Benefits over TCP connection state:
-/// - **No phantom peers**: A peer exists iff QuadProof exists
-/// - **No reconnection logic**: Proofs are permanent, UDP can retry freely
-/// - **No keepalive**: Proof validity doesn't depend on connection liveness
-/// - **No half-open state**: QuadProof is bilateral—both have it or neither does
-#[derive(Debug, Clone)]
-pub struct AuthorizedPeer {
-    /// The peer's unique identifier (b3b3/{double-blake3})
-    pub peer_id: String,
-    /// The peer's Ed25519 public key (for signature verification)
-    pub public_key: [u8; 32],
-    /// Our QuadProof for this peer (proves we completed TGP with them)
-    pub our_quad: QuadProof,
-    /// Their QuadProof for us (proves they completed TGP with us)
-    /// Both proofs must exist—this is the bilateral construction property
-    pub their_quad: QuadProof,
-    /// Last known UDP address for this peer (can change, doesn't affect authorization)
-    pub last_addr: SocketAddr,
-    /// The SPIRAL slot this peer has claimed (if known)
-    pub slot: Option<SlotClaim>,
-    /// When this authorization was established
-    pub established: std::time::Instant,
-}
-
-impl AuthorizedPeer {
-    /// Create a new authorized peer from bilateral QuadProofs.
-    ///
-    /// Both QuadProofs must exist—this is enforced by TGP's bilateral construction property.
-    pub fn new(
-        peer_id: String,
-        public_key: [u8; 32],
-        our_quad: QuadProof,
-        their_quad: QuadProof,
-        last_addr: SocketAddr,
-    ) -> Self {
-        Self {
-            peer_id,
-            public_key,
-            our_quad,
-            their_quad,
-            last_addr,
-            slot: None,
-            established: std::time::Instant::now(),
-        }
-    }
-
-    /// Check if this peer is authorized (always true if struct exists).
-    ///
-    /// This is a no-op that documents the TGP-native invariant:
-    /// existence of AuthorizedPeer IS authorization.
-    #[inline]
-    pub const fn is_authorized(&self) -> bool {
-        // Existence is authorization. No connection state to check.
-        true
-    }
-}
-
-/// Mesh service state
-pub struct MeshState {
-    /// Our node ID (PeerID)
-    pub self_id: String,
-    /// Our signing key for authentication
-    pub signing_key: SigningKey,
-    /// Cached TGP keypair (derived from signing_key once, reused for all sessions)
-    /// This enables zerocopy/CoW responder sessions - creating a responder is just cloning Arc
-    pub tgp_keypair: Arc<KeyPair>,
-    /// UDP socket for TGP (set when run() is called)
-    pub udp_socket: Option<Arc<UdpSocket>>,
-    /// TGP-native: Peers authorized via completed QuadProof (PeerId -> AuthorizedPeer)
-    ///
-    /// This is the TGP-native source of truth for peer authorization.
-    /// A peer exists in this map iff we have completed bilateral TGP coordination.
-    /// Unlike TCP `peers` map, there are no "phantom" or "connecting" states.
-    pub authorized_peers: HashMap<String, AuthorizedPeer>,
-    /// Our claimed slot in the mesh
-    pub self_slot: Option<SlotClaim>,
-    /// Slot we're currently trying to claim via TGP (event-driven, no waiting)
-    pub pending_slot_claim: Option<u64>,
-    /// Known peers in the mesh (by PeerID)
-    pub peers: HashMap<String, MeshPeer>,
-    /// Claimed slots (by SPIRAL index)
-    pub claimed_slots: HashMap<u64, SlotClaim>,
-    /// Coordinates with claimed slots (for neighbor lookup)
-    pub slot_coords: HashSet<HexCoord>,
-    /// SPORE sync manager for content replication (Full mesh strategy)
-    pub spore_sync: Option<SporeSyncManager>,
-    /// VDF race for bootstrap coordination and split-brain merge
-    /// Uses collaborative VDF chain - longest chain = largest swarm
-    pub vdf_race: Option<VdfRace>,
-    /// VDF-anchored slot claims (slot -> best claim we've seen)
-    /// These have VDF priority ordering for deterministic conflict resolution
-    pub vdf_claims: HashMap<u64, AnchoredSlotClaim>,
-    /// Proof of Latency manager for automatic mesh optimization
-    /// Enables atomic slot swapping when it improves both parties' latency
-    pub pol_manager: Option<crate::proof_of_latency::PoLManager>,
-    /// Pending PoL ping nonces (nonce -> target node)
-    pub pol_pending_pings: HashMap<u64, [u8; 32]>,
-    /// CVDF coordinator for collaborative VDF consensus
-    /// Weight-based chain comparison (heavier wins, not taller)
-    pub cvdf: Option<CvdfCoordinator>,
-    /// Latency history for each neighbor (from_node -> to_node -> history)
-    /// Used for map visualization and swap optimization
-    pub latency_history: HashMap<String, HashMap<String, LatencyHistory>>,
-    /// Our observed public IP (learned from peers who connect to us)
-    /// This is what other nodes see us as - used instead of hardcoded announce_addr
-    pub observed_public_addr: Option<SocketAddr>,
-    /// SPORE: DoNotWantList - accumulated double-hashes of deleted content
-    /// H(H(id)) prevents enumeration while allowing deletion propagation
-    pub do_not_want: HashSet<[u8; 32]>,
-    /// SPORE: ErasureConfirmed - tombstones we have locally confirmed erasing
-    /// Syncs via SPORE XOR (ErasureHaveList) - when XOR=0, all peers agree
-    /// Once all peers have same ErasureConfirmed, tombstones can be garbage collected from DoNotWantList
-    pub erasure_confirmed: HashSet<[u8; 32]>,
-    /// SPORE: Peers' erasure sync status (peer_id -> their_erasure_xor_with_ours == 0)
-    /// When all peers are erasure_synced, we can garbage collect tombstones
-    pub erasure_synced: HashMap<String, bool>,
-    /// BadBits: PERMANENT blocklist of double-hashed CIDs H(H(cid))
-    /// Unlike DoNotWantList (GDPR - GC'd after erasure), BadBits are forever
-    /// Used for: copyright violations (DMCA), abuse material, illegal content
-    /// Checked on upload - matching CIDs are rejected before storage
-    /// Can sync from external sources like https://badbits.dwebops.pub/
-    pub bad_bits: HashSet<[u8; 32]>,
-    /// Accountability tracker for neighbor monitoring and misbehaviour detection
-    /// Tracks latency proofs, vouches, and failure witnesses
-    pub accountability: Option<AccountabilityTracker>,
-    /// Liveness manager for structure-aware vouch propagation
-    /// Handles 2-hop vouches: Origin → Judged → Witness → STOP
-    /// Event-driven: zero traffic at steady state
-    pub liveness: Option<LivenessManager>,
-    // NOTE: tgp_sessions moved to MeshService for contention-free access
-}
-
-impl MeshState {
-    /// Record a latency measurement between two nodes
-    pub fn record_latency(&mut self, from_node: &str, to_node: &str, latency_ms: u64) {
-        let from_map = self.latency_history
-            .entry(from_node.to_string())
-            .or_insert_with(HashMap::new);
-
-        let history = from_map
-            .entry(to_node.to_string())
-            .or_insert_with(LatencyHistory::new);
-
-        history.record(latency_ms);
-    }
-
-    /// Get latency history between two nodes
-    pub fn get_latency_history(&self, from_node: &str, to_node: &str) -> Option<&LatencyHistory> {
-        self.latency_history.get(from_node)?.get(to_node)
-    }
-
-    /// Find the next available SPIRAL slot
-    pub fn next_available_slot(&self) -> u64 {
-        let mut index = 0u64;
-        while self.claimed_slots.contains_key(&index) {
-            index += 1;
-        }
-        index
-    }
-
-    /// Check if a coordinate has a claimed slot
-    pub fn is_slot_claimed(&self, coord: &HexCoord) -> bool {
-        self.slot_coords.contains(coord)
-    }
-
-    /// Get neighbors of our slot that are present in the mesh
-    pub fn present_neighbors(&self) -> Vec<&SlotClaim> {
-        let Some(ref self_slot) = self.self_slot else {
-            return Vec::new();
-        };
-
-        self_slot.neighbor_coords()
-            .iter()
-            .filter_map(|coord| {
-                // Find claimed slot at this coordinate
-                self.claimed_slots.values()
-                    .find(|s| s.coord == *coord)
-            })
-            .collect()
-    }
-
-    /// Count how many of our 20 neighbors are present
-    pub fn neighbor_count(&self) -> usize {
-        self.present_neighbors().len()
-    }
-
-    /// Check if a peer is in our SPIRAL neighborhood (one of 20 possible neighbors)
-    pub fn is_spiral_neighbor(&self, peer_id: &str) -> bool {
-        let Some(ref self_slot) = self.self_slot else {
-            return false;
-        };
-
-        // Check if this peer has claimed a slot that is adjacent to ours
-        let neighbor_coords: std::collections::HashSet<_> = self_slot.neighbor_coords().into_iter().collect();
-
-        self.claimed_slots.values()
-            .any(|claim| claim.peer_id == peer_id && neighbor_coords.contains(&claim.coord))
-    }
-
-    /// Count connected SPIRAL neighbors (not entry peers)
-    pub fn connected_neighbor_count(&self) -> usize {
-        let Some(ref self_slot) = self.self_slot else {
-            return 0;
-        };
-
-        let neighbor_coords: std::collections::HashSet<_> = self_slot.neighbor_coords().into_iter().collect();
-
-        // Count peers whose slots are in our neighborhood
-        self.peers.values()
-            .filter(|peer| {
-                if let Some(ref slot) = peer.slot {
-                    neighbor_coords.contains(&slot.coord)
-                } else {
-                    false
-                }
-            })
-            .count()
-    }
-
-    /// SPORE: Check if this node has all content from all peers (WantList = ∅)
-    /// Returns true when we have everything that any peer has - our HaveList ⊇ ∪(all peer HaveLists)
-    /// This is used by /api/v1/ready to indicate the node is caught up with the mesh
-    ///
-    /// Note: This is about US having everything, not about peers being synced with each other.
-    /// One peer going offline or having extra content doesn't affect our readiness.
-    pub fn is_content_ready(&self) -> bool {
-        // If no peers, we're trivially ready (genesis node)
-        if self.peers.is_empty() {
-            return true;
-        }
-
-        // Ready when we have all content from ALL peers (our WantList for each is empty)
-        self.peers.values().all(|peer| peer.content_synced)
-    }
-
-    /// SPORE: Get sync status breakdown for debugging
-    pub fn sync_status(&self) -> (usize, usize) {
-        let synced = self.peers.values().filter(|p| p.content_synced).count();
-        let total = self.peers.len();
-        (synced, total)
-    }
-
-    /// Get entry peers that should be disconnected (have enough SPIRAL neighbors)
-    pub fn entry_peers_to_disconnect(&self) -> Vec<String> {
-        // Need at least 3 SPIRAL neighbors before we can safely disconnect from entry peers
-        const MIN_NEIGHBORS_FOR_DISCONNECT: usize = 3;
-
-        if self.connected_neighbor_count() < MIN_NEIGHBORS_FOR_DISCONNECT {
-            return Vec::new();
-        }
-
-        // Return entry peers that are NOT also SPIRAL neighbors
-        self.peers.iter()
-            .filter(|(id, peer)| peer.is_entry_peer && !self.is_spiral_neighbor(id))
-            .map(|(id, _)| id.clone())
-            .collect()
-    }
-
-    // =========================================================================
-    // Gap-and-Wrap: Toroidal mesh with ghost connections
-    // =========================================================================
-    //
-    // In a sparse mesh, theoretical neighbors may be empty. Gap-and-Wrap creates
-    // "ghost connections" that span gaps to the next occupied slot in each direction.
-    // This ensures every node has up to 20 logical connections regardless of density.
-    //
-    // Properties (proven in Lean: CitadelProofs.GapAndWrap):
-    // - ghost_bidirectional: A→B in d implies B→A in opposite(d)
-    // - full_connectivity: Every node has 20 connections (if mesh > 1)
-    // - connections_symmetric: The connection graph is undirected
-    // - self_healing: Connections auto-resolve when nodes leave
-
-    /// Get our ghost connections using Gap-and-Wrap.
-    ///
-    /// Returns all actual connections for our slot, including ghost connections
-    /// that span gaps in the mesh. In a dense mesh, these match theoretical neighbors.
-    /// In a sparse mesh, ghost connections may span multiple slots.
-    pub fn ghost_connections(&self) -> Vec<Connection> {
-        let Some(ref self_slot) = self.self_slot else {
-            return Vec::new();
-        };
-        self_slot.ghost_connections(&self.slot_coords)
-    }
-
-    /// Get ghost connection targets as (Direction, HexCoord, is_ghost, gap_size).
-    ///
-    /// Useful for routing: "forward in direction D" uses the ghost target for D.
-    /// Works identically for normal and ghost connections - routing is direction-based.
-    pub fn ghost_connection_targets(&self) -> Vec<(Direction, HexCoord, bool, u32)> {
-        self.ghost_connections()
-            .into_iter()
-            .map(|c| (c.direction, c.target, c.is_ghost, c.gap_size))
-            .collect()
-    }
-
-    /// Get the peer at a ghost connection target in a specific direction.
-    ///
-    /// This is the GnW-aware version of "who is my neighbor in direction D?"
-    /// Unlike theoretical neighbors, this accounts for gaps in the mesh.
-    pub fn ghost_neighbor_peer(&self, direction: Direction) -> Option<&MeshPeer> {
-        let self_slot = self.self_slot.as_ref()?;
-        let target_coord = ghost_target(&self.slot_coords, self_slot.coord, direction)?;
-
-        // Find the slot at target_coord
-        let target_slot_index = self.claimed_slots.values()
-            .find(|s| s.coord == target_coord)?
-            .index;
-
-        // Find peer with this slot
-        self.peers.values()
-            .find(|p| p.slot.as_ref().map(|s| s.index) == Some(target_slot_index))
-    }
-
-    /// Get all ghost neighbor peers.
-    ///
-    /// Returns peers at each ghost connection target. In a sparse mesh,
-    /// these may be far away in slot index but are our logical neighbors.
-    pub fn ghost_neighbor_peers(&self) -> Vec<&MeshPeer> {
-        Direction::all()
-            .iter()
-            .filter_map(|&d| self.ghost_neighbor_peer(d))
-            .collect()
-    }
-
-    /// Count ghost connections (should be 20 in a mesh with > 1 node).
-    pub fn ghost_connection_count(&self) -> usize {
-        self.ghost_connections().len()
-    }
-
-    /// Count ghost connections that are actual ghosts (span gaps).
-    pub fn ghost_gap_count(&self) -> usize {
-        self.ghost_connections().iter().filter(|c| c.is_ghost).count()
-    }
-
-    /// Get total gap size across all ghost connections.
-    ///
-    /// In a dense mesh, this is 0. In a sparse mesh, this indicates
-    /// how many empty slots our connections span.
-    pub fn total_gap_size(&self) -> u32 {
-        self.ghost_connections().iter().map(|c| c.gap_size).sum()
-    }
-
-    /// Convert a HexCoord to its slot index (if claimed).
-    pub fn coord_to_slot_index(&self, coord: HexCoord) -> Option<u64> {
-        self.claimed_slots.values()
-            .find(|s| s.coord == coord)
-            .map(|s| s.index)
-    }
-
-    /// Get the peer_id at a given coordinate (if any).
-    pub fn peer_at_coord(&self, coord: HexCoord) -> Option<&str> {
-        self.claimed_slots.values()
-            .find(|s| s.coord == coord)
-            .map(|s| s.peer_id.as_str())
-    }
-}
-
-/// Broadcast message for continuous flooding
-#[derive(Clone, Debug)]
-pub enum FloodMessage {
-    /// Peer discovery (id, addr, slot_index, public_key)
-    Peers(Vec<(String, String, Option<u64>, Option<Vec<u8>>)>),
-    /// Admin list sync
-    Admins(Vec<String>),
-    /// Slot claim announcement (index, peer_id, coord as (q, r, z), public_key)
-    SlotClaim { index: u64, peer_id: String, coord: (i64, i64, i64), public_key: Option<Vec<u8>> },
-    /// Slot claim validation response
-    SlotValidation { index: u64, peer_id: String, validator_id: String, accepted: bool },
-    /// SPORE HaveList - advertise what slots we know about (for targeted sync)
-    SporeHaveList { peer_id: String, slots: Vec<u64> },
-    /// VDF chain sync - broadcast chain links for collaborative VDF
-    VdfChain { links: Vec<VdfLink> },
-    /// VDF-anchored slot claim - deterministic priority ordering
-    VdfSlotClaim { claim: AnchoredSlotClaim },
-    /// Proof of Latency ping request (for measuring RTT)
-    PoLPing { from: [u8; 32], nonce: u64, vdf_height: u64 },
-    /// Proof of Latency pong response
-    PoLPong { from: [u8; 32], nonce: u64, vdf_height: u64 },
-    /// Proof of Latency swap proposal
-    PoLSwapProposal { proposal: crate::proof_of_latency::SwapProposal },
-    /// Proof of Latency swap response
-    PoLSwapResponse { response: crate::proof_of_latency::SwapResponse },
-    /// CVDF attestation for current round
-    /// Optionally carries a MeshVouch (liveness proof for all neighbors)
-    /// Vouches piggyback on attestations - zero extra traffic at steady state
-    CvdfAttestation {
-        att: RoundAttestation,
-        /// Stapled liveness vouch (2-hop propagation: Origin → Judged → Witness → STOP)
-        vouch: Option<MeshVouch>,
-    },
-    /// CVDF new round produced (with stapled SPORE proof for zero-overhead sync)
-    CvdfNewRound {
-        round: CvdfRound,
-        /// SPORE XOR proof - empty at convergence (zero overhead)
-        spore_proof: citadel_spore::Spore,
-    },
-    /// CVDF chain sync request
-    CvdfSyncRequest { from_node: String, from_height: u64 },
-    /// CVDF chain sync response (all rounds)
-    CvdfSyncResponse { rounds: Vec<CvdfRound>, slots: Vec<(u64, [u8; 32])> },
-    /// SPORE: Content HaveList - advertise release IDs we have (for content sync)
-    ContentHaveList { peer_id: String, release_ids: Vec<String> },
-    /// SPORE: Release flood - propagate a release across the mesh
-    Release { release_json: String },
-    /// SPORE: DoNotWantList - double-hashed IDs of deleted content (proof of absence)
-    /// H(H(id)) is shared to prevent enumeration while allowing verification
-    DoNotWantList { peer_id: String, double_hashes: Vec<[u8; 32]> },
-    /// SPORE: ErasureConfirmation - bilateral proof that a node has deleted content
-    /// Used for GDPR-compliant "right to erasure" with cryptographic proof
-    ErasureConfirmation { peer_id: String, tombstones: Vec<[u8; 32]> },
-    /// BadBits: PERMANENT blocklist of double-hashed CIDs H(H(cid))
-    /// Unlike DoNotWantList (GDPR), BadBits prevent future uploads forever
-    /// For: copyright violations, abuse material, illegal content
-    /// See: https://badbits.dwebops.pub/
-    BadBits { double_hashes: Vec<[u8; 32]> },
-    /// SPORE: Sync proof with XOR difference (range-based)
-    /// At convergence: xor_diff = [] (empty, zero cost)
-    /// Only contains ranges that differ between peers
-    SporeSync {
-        peer_id: String,
-        /// Full HaveList on first exchange, then XOR diff for updates
-        have_list: Spore,
-    },
-    /// SPORE: Delta transfer - actual content for the XOR difference
-    /// Contains releases that match ranges in the XOR diff
-    SporeDelta {
-        releases: Vec<String>, // JSON-serialized releases
-    },
-    /// SPORE: Featured releases sync - separate from regular releases
-    /// These control homepage/hero display and have their own sync lifecycle
-    FeaturedSync {
-        peer_id: String,
-        featured: Vec<String>, // JSON-serialized FeaturedRelease
-    },
-}
+// Import types from sibling modules
+use super::flood::FloodMessage;
+use super::peer::{compute_peer_id, compute_peer_id_from_bytes, double_hash_id, AuthorizedPeer, MeshPeer};
+use super::slot::{consensus_threshold, SlotClaim};
+use super::spore::{build_spore_havelist, release_id_to_u256};
+use super::state::MeshState;
+use super::tgp::TgpSession;
 
 /// Citadel Mesh Service
 pub struct MeshService {
@@ -856,6 +49,9 @@ pub struct MeshService {
     entry_peers: Vec<String>,
     /// Shared storage for replication
     storage: Arc<Storage>,
+    /// Document store for CRDT documents with SPORE sync (featured releases, etc.)
+    /// Uses rich semantic merges (NOT LWW) - proven convergent in Lean.
+    doc_store: Arc<tokio::sync::RwLock<DocumentStore>>,
     /// Mesh state (peers, slots, etc.)
     state: Arc<RwLock<MeshState>>,
     /// TGP sessions - SEPARATE lock for contention-free TGP operations
@@ -879,6 +75,7 @@ impl MeshService {
         announce_addr: Option<SocketAddr>,
         entry_peers: Vec<String>,
         storage: Arc<Storage>,
+        doc_store: DocumentStore,
     ) -> Self {
         // Generate or load node keypair for peer identity
         let signing_key = storage.get_or_create_node_key()
@@ -919,6 +116,7 @@ impl MeshService {
             announce_addr,
             entry_peers,
             storage,
+            doc_store: Arc::new(tokio::sync::RwLock::new(doc_store)),
             state: Arc::new(RwLock::new(MeshState {
                 self_id,
                 signing_key: signing_key.clone(),
@@ -938,10 +136,12 @@ impl MeshService {
                 cvdf: None,        // Initialized as genesis or when joining mesh
                 latency_history: HashMap::new(),
                 observed_public_addr: None,  // Learned from peers via hello
-                do_not_want: HashSet::new(),  // SPORE: DoNotWantList for deletion sync
-                erasure_confirmed: HashSet::new(),  // SPORE: ErasureConfirmed for GDPR compliance
-                erasure_synced: HashMap::new(),  // SPORE: Peer erasure sync status
-                bad_bits: HashSet::new(),  // BadBits: permanent blocklist (DMCA, abuse, illegal)
+                // SPORE⁻¹: Deletion sync (inverse of SPORE) - GDPR Art. 17 compliant
+                do_not_want: Spore::empty(),      // Deletions as ranges in 256-bit space
+                erasure_confirmed: Spore::empty(), // Ranges peers confirmed they deleted
+                erasure_synced: HashMap::new(),   // Peer sync status for GC/audit
+                // BadBits: Permanent blocklist (NOT for normal deletes)
+                bad_bits: HashSet::new(),         // DMCA, abuse - never GC, blocks re-upload
                 accountability: Some(AccountabilityTracker::new(signing_key.clone())),  // Misbehaviour tracking
                 liveness: Some(LivenessManager::new(signing_key)),  // Structure-aware liveness (2-hop vouches)
             })),
@@ -1526,6 +726,12 @@ impl MeshService {
     pub async fn cvdf_initialized(&self) -> bool {
         let state = self.state.read().await;
         state.cvdf.is_some()
+    }
+
+    /// Check if this node has claimed a slot
+    pub async fn has_claimed_slot(&self) -> bool {
+        let state = self.state.read().await;
+        state.self_slot.is_some()
     }
 
     /// Run CVDF coordination loop
@@ -2239,6 +1445,18 @@ impl MeshService {
         self.flood_tx.clone()
     }
 
+    /// Get access to the DocumentStore for CRDT document operations.
+    ///
+    /// Documents stored here use rich semantic merges (NOT LWW):
+    /// - Counters: max(a, b)
+    /// - Sets: union(a, b)
+    /// - Booleans: or(a, b)
+    ///
+    /// Proven convergent in proofs/CitadelProofs/CRDT/Convergence.lean
+    pub fn doc_store(&self) -> Arc<tokio::sync::RwLock<DocumentStore>> {
+        Arc::clone(&self.doc_store)
+    }
+
     /// Run TGP UDP listener - receives incoming TGP messages from any peer
     /// This is connectionless - we can receive from anyone who knows our address
     /// Event-driven: immediately responds after receiving each message
@@ -2510,6 +1728,14 @@ impl MeshService {
                     info!("Slot {} was claimed by someone else during TGP, will retry", target_slot);
                     drop(state);
                     // Trigger retry for next available slot
+                    self.start_slot_claim_tgp().await;
+                }
+            } else {
+                // TGP completed but pending_slot_claim was None (sniped during coordination)
+                // If we don't have a slot yet, retry
+                if state.self_slot.is_none() {
+                    info!("TGP completed but pending claim was sniped, retrying for next slot");
+                    drop(state);
                     self.start_slot_claim_tgp().await;
                 }
             }
@@ -2912,7 +2138,8 @@ impl MeshService {
         // Sync cost = O(|XOR difference|), converges to 0 at steady state
         // WantList = HaveList.complement() - receiver derives it
         {
-            let releases = self.storage.list_releases().unwrap_or_default();
+            let doc_store = self.doc_store.read().await;
+            let releases = doc_store.list::<crate::models::Release>().unwrap_or_default();
             let release_ids: Vec<String> = releases.iter().map(|r| r.id.clone()).collect();
             let have_list = build_spore_havelist(&release_ids);
             let self_id = self.state.read().await.self_id.clone();
@@ -2927,10 +2154,12 @@ impl MeshService {
             debug!("SPORE: Sent HaveList with {} ranges to peer {}", have_list.range_count(), peer_id);
         }
 
-        // SPORE: Send featured releases for homepage sync
-        // Featured releases are admin-curated, synced separately from regular releases
+        // SPORE: Send featured releases for homepage sync (from DocumentStore)
+        // Featured releases use rich semantic merges (NOT LWW) - proven convergent in Lean
+        // When peers receive, they merge via TotalMerge, ensuring no data loss
         {
-            let featured = self.storage.list_featured_releases().unwrap_or_default();
+            let doc_store = self.doc_store.read().await;
+            let featured = doc_store.list::<FeaturedRelease>().unwrap_or_default();
             if !featured.is_empty() {
                 let self_id = self.state.read().await.self_id.clone();
                 let featured_json: Vec<String> = featured.iter()
@@ -2947,39 +2176,35 @@ impl MeshService {
             }
         }
 
-        // SPORE: Send DoNotWantList (tombstones) for deletion sync
-        // H(H(id)) prevents enumeration while allowing verification
+        // SPORE⁻¹: Send DoNotWantList (deletion ranges) for deletion sync
+        // Uses range-based Spore for O(|diff|) → 0 convergence
         {
             let state = self.state.read().await;
             if !state.do_not_want.is_empty() {
-                let tombstones: Vec<String> = state.do_not_want.iter()
-                    .map(|h| hex::encode(h))
-                    .collect();
                 let do_not_want_list = serde_json::json!({
                     "type": "do_not_want_list",
-                    "double_hashes": tombstones,
+                    "ranges": state.do_not_want_spore(),
                 });
                 writer.write_all(do_not_want_list.to_string().as_bytes()).await?;
                 writer.write_all(b"\n").await?;
-                debug!("Sent DoNotWantList with {} tombstones to peer {}", tombstones.len(), peer_id);
+                debug!("SPORE⁻¹: Sent DoNotWantList with {} ranges to peer {}",
+                    state.do_not_want.range_count(), peer_id);
             }
         }
 
-        // SPORE: Send ErasureConfirmation (confirmed deletions) for GDPR sync
+        // SPORE⁻¹: Send ErasureConfirmation (confirmed deletion ranges) for GDPR sync
         // Enables XOR-based erasure convergence detection
         {
             let state = self.state.read().await;
             if !state.erasure_confirmed.is_empty() {
-                let confirmed: Vec<String> = state.erasure_confirmed.iter()
-                    .map(|h| hex::encode(h))
-                    .collect();
                 let erasure_msg = serde_json::json!({
                     "type": "erasure_confirmation",
-                    "tombstones": confirmed,
+                    "ranges": &state.erasure_confirmed,
                 });
                 writer.write_all(erasure_msg.to_string().as_bytes()).await?;
                 writer.write_all(b"\n").await?;
-                debug!("Sent ErasureConfirmation with {} tombstones to peer {}", confirmed.len(), peer_id);
+                debug!("SPORE⁻¹: Sent ErasureConfirmation with {} ranges to peer {}",
+                    state.erasure_confirmed.range_count(), peer_id);
             }
         }
 
@@ -3371,28 +2596,22 @@ impl MeshService {
                             let _ = writer.write_all(flood_msg.to_string().as_bytes()).await;
                             let _ = writer.write_all(b"\n").await;
                         }
-                        Ok(FloodMessage::DoNotWantList { peer_id, double_hashes }) => {
-                            // Encode double-hashes as hex strings for JSON transport
-                            let hashes_hex: Vec<String> = double_hashes.iter()
-                                .map(|h| hex::encode(h))
-                                .collect();
+                        Ok(FloodMessage::DoNotWantList { peer_id, do_not_want }) => {
+                            // SPORE⁻¹: Send deletion ranges directly as Spore
                             let flood_msg = serde_json::json!({
                                 "type": "do_not_want_list",
                                 "peer_id": peer_id,
-                                "double_hashes": hashes_hex,
+                                "ranges": do_not_want,
                             });
                             let _ = writer.write_all(flood_msg.to_string().as_bytes()).await;
                             let _ = writer.write_all(b"\n").await;
                         }
-                        Ok(FloodMessage::ErasureConfirmation { peer_id, tombstones }) => {
-                            // GDPR erasure confirmation: peer confirms they deleted these tombstones
-                            let tombstones_hex: Vec<String> = tombstones.iter()
-                                .map(|h| hex::encode(h))
-                                .collect();
+                        Ok(FloodMessage::ErasureConfirmation { peer_id, confirmed }) => {
+                            // SPORE⁻¹: GDPR erasure confirmation with ranges
                             let flood_msg = serde_json::json!({
                                 "type": "erasure_confirmation",
                                 "peer_id": peer_id,
-                                "tombstones": tombstones_hex,
+                                "ranges": confirmed,
                             });
                             let _ = writer.write_all(flood_msg.to_string().as_bytes()).await;
                             let _ = writer.write_all(b"\n").await;
@@ -4227,87 +3446,43 @@ impl MeshService {
             // See run_tgp_udp_listener() and handle_tgp_message()
 
             // ==================== SPORE CONTENT SYNC HANDLERS ====================
-            "content_have_list" => {
-                // Peer is advertising what releases they have
-                // Compare with our releases: XOR = 0 means fully synced
-                if let Some(their_ids) = msg.get("release_ids").and_then(|r| r.as_array()) {
-                    let their_set: std::collections::HashSet<String> = their_ids.iter()
-                        .filter_map(|id| id.as_str().map(|s| s.to_string()))
-                        .collect();
+            // NOTE: Legacy "content_have_list" removed - use "spore_sync" for O(|XOR diff|) sync
+            // The old handler did O(n²) comparisons; SPORE uses range-based set operations
 
-                    // Get our releases
-                    if let Ok(our_releases) = self.storage.list_releases() {
-                        let our_set: std::collections::HashSet<String> = our_releases.iter()
-                            .map(|r| r.id.clone())
-                            .collect();
-
-                        // Check what they're missing (we have, they don't)
-                        let mut we_sent_releases = false;
-                        for release in &our_releases {
-                            if !their_set.contains(&release.id) {
-                                if let Ok(json) = serde_json::to_string(&release) {
-                                    info!("SPORE: Sending missing release {} to {}", release.id, peer_id);
-                                    self.flood(FloodMessage::Release { release_json: json });
-                                    we_sent_releases = true;
-                                }
-                            }
-                        }
-
-                        // Check what we're missing (they have, we don't)
-                        // This is our WantList for this peer - if empty, we have everything they have
-                        let we_want_from_them: Vec<&String> = their_set.iter()
-                            .filter(|id| !our_set.contains(*id))
-                            .collect();
-
-                        // We consider ourselves "synced" with this peer if our WantList is empty
-                        // (we have all the content they have - our HaveList ⊇ their HaveList)
-                        let we_have_all_their_content = we_want_from_them.is_empty();
-
-                        // Update peer's sync status (tracks if WE have everything THEY have)
-                        {
-                            let mut state = self.state.write().await;
-                            if let Some(peer) = state.peers.get_mut(peer_id) {
-                                if we_have_all_their_content != peer.content_synced {
-                                    peer.content_synced = we_have_all_their_content;
-                                    if we_have_all_their_content {
-                                        info!("SPORE: We have all content from peer {} (WantList=∅)", peer_id);
-                                    } else {
-                                        debug!("SPORE: Missing {} items from peer {}", we_want_from_them.len(), peer_id);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
             "release_flood" => {
                 // Receive a release flooded through the mesh
                 if let Some(release_data) = msg.get("release") {
                     // Try to parse as Release
                     if let Ok(release) = serde_json::from_value::<crate::models::Release>(release_data.clone()) {
-                        // SPORE: Check if this release is in our DoNotWantList (tombstoned)
+                        // SPORE⁻¹: Check if this release is in our DoNotWantList (tombstoned)
                         let tombstone = double_hash_id(&release.id);
-                        let is_tombstoned = self.state.read().await.do_not_want.contains(&tombstone);
+                        let is_tombstoned = self.state.read().await.is_tombstoned(&tombstone);
 
                         if is_tombstoned {
                             debug!("SPORE: Ignoring tombstoned release {} (in DoNotWantList)", release.id);
-                        } else if self.storage.get_release(&release.id).ok().flatten().is_none() {
-                            // Store it
-                            if let Err(e) = self.storage.put_release(&release) {
-                                warn!("Failed to store flooded release {}: {}", release.id, e);
-                            } else {
-                                info!("SPORE: Received and stored release {} from mesh", release.id);
+                        } else {
+                            // Use DocumentStore for CRDT merge (automatic LWW based on modified_at)
+                            let mut doc_store = self.doc_store.write().await;
+                            match doc_store.put(&release) {
+                                Ok((_, changed)) => {
+                                    if changed {
+                                        info!("SPORE: Merged release {} from mesh (CRDT)", release.id);
 
-                                // SPORE: Broadcast updated HaveList so peers know our new state
-                                // This enables continuous sync as our state changes
-                                if let Ok(all_releases) = self.storage.list_releases() {
-                                    let self_id = self.state.read().await.self_id.clone();
-                                    let release_ids: Vec<String> = all_releases.iter().map(|r| r.id.clone()).collect();
-                                    let have_list = build_spore_havelist(&release_ids);
-                                    self.flood(FloodMessage::SporeSync {
-                                        peer_id: self_id,
-                                        have_list,
-                                    });
+                                        // SPORE: Broadcast updated HaveList so peers know our new state
+                                        // This enables continuous sync as our state changes
+                                        if let Ok(all_releases) = doc_store.list::<crate::models::Release>() {
+                                            let self_id = self.state.read().await.self_id.clone();
+                                            let release_ids: Vec<String> = all_releases.iter().map(|r| r.id.clone()).collect();
+                                            let have_list = build_spore_havelist(&release_ids);
+                                            self.flood(FloodMessage::SporeSync {
+                                                peer_id: self_id,
+                                                have_list,
+                                            });
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("Failed to merge flooded release {}: {:?}", release.id, e);
                                 }
                             }
                         }
@@ -4322,8 +3497,9 @@ impl MeshService {
                         // Compute their WantList (what they don't have)
                         let their_want = their_have.complement();
 
-                        // Build our HaveList
-                        let our_releases = self.storage.list_releases().unwrap_or_default();
+                        // Build our HaveList from doc_store
+                        let doc_store = self.doc_store.read().await;
+                        let our_releases = doc_store.list::<crate::models::Release>().unwrap_or_default();
                         let our_release_ids: Vec<String> = our_releases.iter().map(|r| r.id.clone()).collect();
                         let our_have = build_spore_havelist(&our_release_ids);
 
@@ -4372,20 +3548,28 @@ impl MeshService {
                 // SPORE: Receive delta transfer - releases we were missing
                 if let Some(releases_value) = msg.get("releases").and_then(|r| r.as_array()) {
                     let mut stored_count = 0;
+                    let mut doc_store = self.doc_store.write().await;
+
                     for release_json in releases_value {
                         if let Some(json_str) = release_json.as_str() {
                             if let Ok(release) = serde_json::from_str::<crate::models::Release>(json_str) {
-                                // Check tombstone
+                                // SPORE⁻¹: Check tombstone
                                 let tombstone = double_hash_id(&release.id);
-                                let is_tombstoned = self.state.read().await.do_not_want.contains(&tombstone);
+                                let is_tombstoned = self.state.read().await.is_tombstoned(&tombstone);
 
                                 if is_tombstoned {
                                     debug!("SPORE: Ignoring tombstoned release {} from delta", release.id);
-                                } else if self.storage.get_release(&release.id).ok().flatten().is_none() {
-                                    if let Err(e) = self.storage.put_release(&release) {
-                                        warn!("SPORE: Failed to store delta release {}: {}", release.id, e);
-                                    } else {
-                                        stored_count += 1;
+                                } else {
+                                    // Use DocumentStore for CRDT merge
+                                    match doc_store.put(&release) {
+                                        Ok((_, changed)) => {
+                                            if changed {
+                                                stored_count += 1;
+                                            }
+                                        }
+                                        Err(e) => {
+                                            warn!("SPORE: Failed to merge delta release {}: {:?}", release.id, e);
+                                        }
                                     }
                                 }
                             }
@@ -4393,132 +3577,103 @@ impl MeshService {
                     }
 
                     if stored_count > 0 {
-                        info!("SPORE: Stored {} releases from delta transfer", stored_count);
+                        info!("SPORE: Merged {} releases from delta transfer (CRDT)", stored_count);
                         // NOTE: Don't broadcast HaveList here - would cause feedback loop
                         // HaveLists are exchanged on connection, not on every state change
                     }
                 }
             }
             "do_not_want_list" => {
-                // SPORE: Receive DoNotWantList (tombstones) from peer
-                // These are double-hashed IDs: H(H(id)) - prevents enumeration
-                if let Some(hashes) = msg.get("double_hashes").and_then(|h| h.as_array()) {
-                    let mut state = self.state.write().await;
-                    let mut new_tombstones = Vec::new();
+                // SPORE⁻¹: Receive DoNotWantList (deletion ranges) from peer
+                // Uses Spore (range-based) for O(|diff|) → 0 convergence
+                if let Some(ranges_value) = msg.get("ranges") {
+                    if let Ok(their_do_not_want) = serde_json::from_value::<Spore>(ranges_value.clone()) {
+                        // Compute XOR to find new deletions we didn't know about
+                        let our_do_not_want = self.state.read().await.do_not_want_spore().clone();
+                        let diff = their_do_not_want.subtract(&our_do_not_want);
 
-                    for hash_val in hashes {
-                        if let Some(hash_hex) = hash_val.as_str() {
-                            if let Ok(hash_bytes) = hex::decode(hash_hex) {
-                                if hash_bytes.len() == 32 {
-                                    let mut tombstone = [0u8; 32];
-                                    tombstone.copy_from_slice(&hash_bytes);
-                                    if state.do_not_want.insert(tombstone) {
-                                        new_tombstones.push(tombstone);
+                        if !diff.is_empty() {
+                            info!("SPORE⁻¹: Received {} new deletion ranges from peer {}",
+                                diff.range_count(), peer_id);
+
+                            // Merge their deletions into ours
+                            let self_id = {
+                                let mut state = self.state.write().await;
+                                state.merge_do_not_want(&their_do_not_want);
+                                state.self_id.clone()
+                            };
+
+                            // Delete any releases we have that are now tombstoned
+                            let mut doc_store = self.doc_store.write().await;
+                            if let Ok(releases) = doc_store.list::<crate::models::Release>() {
+                                for release in releases {
+                                    let tombstone = double_hash_id(&release.id);
+                                    if self.state.read().await.is_tombstoned(&tombstone) {
+                                        let content_id = citadel_crdt::ContentId::hash(release.id.as_bytes());
+                                        if let Err(e) = doc_store.delete::<crate::models::Release>(&content_id) {
+                                            warn!("Failed to delete tombstoned release {}: {:?}", release.id, e);
+                                        } else {
+                                            info!("SPORE⁻¹: Deleted tombstoned release {}", release.id);
+                                        }
                                     }
                                 }
                             }
-                        }
-                    }
+                            drop(doc_store);
 
-                    if !new_tombstones.is_empty() {
-                        info!("SPORE: Added {} new tombstones from peer {}", new_tombstones.len(), peer_id);
-
-                        // Delete any releases we have that match the new tombstones
-                        // And add to erasure_confirmed to confirm we deleted them
-                        let self_id = state.self_id.clone();
-                        drop(state); // Release lock before storage operations
-
-                        let mut confirmed_tombstones = Vec::new();
-                        if let Ok(releases) = self.storage.list_releases() {
-                            for release in releases {
-                                let tombstone = double_hash_id(&release.id);
-                                if new_tombstones.contains(&tombstone) {
-                                    if let Err(e) = self.storage.delete_release(&release.id) {
-                                        warn!("Failed to delete tombstoned release {}: {}", release.id, e);
-                                    } else {
-                                        info!("SPORE: Deleted tombstoned release {}", release.id);
-                                        confirmed_tombstones.push(tombstone);
-                                    }
-                                }
+                            // Update our erasure_confirmed with the new ranges
+                            // This confirms we've processed the deletion request
+                            {
+                                let mut state = self.state.write().await;
+                                state.erasure_confirmed = state.erasure_confirmed.union(&diff);
                             }
+
+                            // Re-flood our updated do_not_want to propagate through mesh
+                            let updated_do_not_want = self.state.read().await.do_not_want_spore().clone();
+                            self.flood(FloodMessage::DoNotWantList {
+                                peer_id: self_id.clone(),
+                                do_not_want: updated_do_not_want,
+                            });
+
+                            // GDPR: Send erasure confirmation - we've processed these deletions
+                            let confirmed = self.state.read().await.erasure_confirmed.clone();
+                            self.flood(FloodMessage::ErasureConfirmation {
+                                peer_id: self_id,
+                                confirmed,
+                            });
                         }
-
-                        // Add ALL tombstones to erasure_confirmed (even if we didn't have the content)
-                        // This confirms we've processed the deletion request
-                        {
-                            let mut state = self.state.write().await;
-                            for tombstone in &new_tombstones {
-                                state.erasure_confirmed.insert(*tombstone);
-                            }
-                        }
-
-                        // Re-flood the tombstones to propagate through mesh
-                        self.flood(FloodMessage::DoNotWantList {
-                            peer_id: self_id.clone(),
-                            double_hashes: new_tombstones.clone(),
-                        });
-
-                        // GDPR: Send erasure confirmation - we've processed these deletions
-                        self.flood(FloodMessage::ErasureConfirmation {
-                            peer_id: self_id,
-                            tombstones: new_tombstones,
-                        });
                     }
                 }
             }
             "erasure_confirmation" => {
-                // SPORE: Receive erasure confirmation from peer
-                // Track which tombstones this peer has confirmed deleting
-                if let Some(tombstones) = msg.get("tombstones").and_then(|t| t.as_array()) {
-                    let mut new_confirmations = Vec::new();
-
-                    for ts_val in tombstones {
-                        if let Some(ts_hex) = ts_val.as_str() {
-                            if let Ok(ts_bytes) = hex::decode(ts_hex) {
-                                if ts_bytes.len() == 32 {
-                                    let mut tombstone = [0u8; 32];
-                                    tombstone.copy_from_slice(&ts_bytes);
-                                    new_confirmations.push(tombstone);
-                                }
-                            }
-                        }
-                    }
-
-                    if !new_confirmations.is_empty() {
+                // SPORE⁻¹: Receive erasure confirmation (ranges) from peer
+                // Track which deletion ranges this peer has confirmed processing
+                if let Some(ranges_value) = msg.get("ranges") {
+                    if let Ok(their_confirmed) = serde_json::from_value::<Spore>(ranges_value.clone()) {
                         let mut state = self.state.write().await;
 
-                        // Check if peer's erasure confirmations now match ours (XOR sync)
-                        let their_confirmed: HashSet<[u8; 32]> = new_confirmations.iter().cloned().collect();
+                        // Update sync status using XOR
+                        state.confirm_erasure(peer_id, &their_confirmed);
 
-                        // Compute XOR diff count before modifying state
-                        let diff_count = their_confirmed.symmetric_difference(&state.erasure_confirmed).count();
-                        let xor_empty = diff_count == 0;
-
-                        // Update sync status
-                        state.erasure_synced.insert(peer_id.to_string(), xor_empty);
-
-                        if xor_empty {
-                            debug!("SPORE: Erasure synced with peer {} (XOR=0)", peer_id);
+                        let is_synced = state.erasure_synced.get(peer_id).copied().unwrap_or(false);
+                        if is_synced {
+                            debug!("SPORE⁻¹: Erasure synced with peer {} (XOR=∅)", peer_id);
                         } else {
-                            debug!("SPORE: Erasure not synced with peer {} ({} differences)", peer_id, diff_count);
+                            let diff = state.do_not_want.xor(&their_confirmed);
+                            debug!("SPORE⁻¹: Erasure not synced with peer {} ({} range diffs)",
+                                peer_id, diff.range_count());
                         }
 
-                        // Check if ALL peers are synced - if so, we can garbage collect tombstones
-                        let peer_ids: Vec<String> = state.peers.keys().cloned().collect();
-                        let all_synced = peer_ids.iter().all(|p| {
-                            state.erasure_synced.get(p).copied().unwrap_or(false)
-                        });
-
-                        if all_synced && !state.erasure_confirmed.is_empty() {
+                        // Check if ALL peers are synced - if so, we can garbage collect
+                        if state.all_erasures_confirmed() && !state.erasure_confirmed.is_empty() {
                             // GDPR: All peers confirmed - tombstones can be garbage collected
-                            let gc_tombstones: Vec<[u8; 32]> = state.erasure_confirmed.iter().cloned().collect();
-                            let gc_count = gc_tombstones.len();
-                            for tombstone in gc_tombstones {
-                                state.erasure_confirmed.remove(&tombstone);
-                                state.do_not_want.remove(&tombstone);
-                            }
+                            let gc_range_count = state.erasure_confirmed.range_count();
+
+                            // Clear erasure tracking (keep do_not_want for future sync)
+                            state.erasure_confirmed = Spore::empty();
                             state.erasure_synced.clear();
-                            info!("SPORE: GDPR erasure complete - garbage collected {} tombstones", gc_count);
+
+                            info!("SPORE⁻¹: GDPR erasure complete - confirmed {} ranges across all peers",
+                                gc_range_count);
                         }
                     }
                 }
@@ -4552,18 +3707,21 @@ impl MeshService {
                         let self_id = state.self_id.clone();
                         drop(state); // Release lock before storage operations
 
-                        if let Ok(releases) = self.storage.list_releases() {
+                        let mut doc_store = self.doc_store.write().await;
+                        if let Ok(releases) = doc_store.list::<crate::models::Release>() {
                             for release in releases {
                                 let release_hash = double_hash_id(&release.id);
                                 if new_bad_bits.contains(&release_hash) {
-                                    if let Err(e) = self.storage.delete_release(&release.id) {
-                                        warn!("BadBits: Failed to delete blocked release {}: {}", release.id, e);
+                                    let content_id = citadel_crdt::ContentId::hash(release.id.as_bytes());
+                                    if let Err(e) = doc_store.delete::<crate::models::Release>(&content_id) {
+                                        warn!("BadBits: Failed to delete blocked release {}: {:?}", release.id, e);
                                     } else {
                                         info!("BadBits: Deleted blocked release {}", release.id);
                                     }
                                 }
                             }
                         }
+                        drop(doc_store);
 
                         // Re-flood the bad bits to propagate through mesh
                         self.flood(FloodMessage::BadBits {
@@ -4573,29 +3731,42 @@ impl MeshService {
                 }
             }
             "featured_sync" => {
-                // SPORE: Receive featured releases from peer
-                // These are admin-curated homepage entries, synced independently
+                // SPORE: Receive featured releases from peer (via DocumentStore with merge)
+                // Rich semantic merges (NOT LWW) - proven convergent in Lean
+                // put() automatically merges via TotalMerge - no data loss
                 if let Some(featured_arr) = msg.get("featured").and_then(|f| f.as_array()) {
-                    let mut stored_count = 0;
+                    let mut changed_count = 0;
+                    let mut doc_store = self.doc_store.write().await;
+
                     for featured_json in featured_arr {
                         if let Some(json_str) = featured_json.as_str() {
-                            if let Ok(featured) = serde_json::from_str::<crate::models::FeaturedRelease>(json_str) {
-                                // Check if we already have this featured release
-                                if self.storage.get_featured_release(&featured.id).ok().flatten().is_none() {
-                                    if let Err(e) = self.storage.put_featured_release(&featured) {
-                                        warn!("SPORE: Failed to store featured release {}: {}", featured.id, e);
-                                    } else {
-                                        stored_count += 1;
+                            if let Ok(featured) = serde_json::from_str::<FeaturedRelease>(json_str) {
+                                // put() merges with existing via TotalMerge:
+                                // - Counters: max(a, b) - both increments preserved
+                                // - Sets: union(a, b) - all elements preserved
+                                // - Booleans: or(a, b) - if either promotes, promoted
+                                // - Time windows: (min(start), max(end))
+                                match doc_store.put(&featured) {
+                                    Ok((_, changed)) => {
+                                        if changed {
+                                            changed_count += 1;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!("SPORE: Failed to store/merge featured release {}: {}", featured.id, e);
                                     }
                                 }
                             }
                         }
                     }
-                    if stored_count > 0 {
-                        info!("SPORE: Stored {} featured releases from peer {}", stored_count, peer_id);
-                        // Re-flood to propagate
+
+                    // Only re-flood if we actually got NEW data (XOR was non-empty)
+                    if changed_count > 0 {
+                        info!("SPORE: Merged {} new featured releases from peer {}", changed_count, peer_id);
+
+                        // Re-flood merged state to propagate convergence
                         let self_id = self.state.read().await.self_id.clone();
-                        if let Ok(all_featured) = self.storage.list_featured_releases() {
+                        if let Ok(all_featured) = doc_store.list::<FeaturedRelease>() {
                             let featured_json: Vec<String> = all_featured.iter()
                                 .filter_map(|f| serde_json::to_string(f).ok())
                                 .collect();

@@ -675,11 +675,11 @@ dependencies = [
 name = "citadel-docs"
 version = "0.1.0"
 dependencies = [
- "bincode",
  "citadel-crdt",
  "citadel-spore",
  "rocksdb",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.17",
  "tracing",
@@ -710,7 +710,9 @@ dependencies = [
  "axum 0.7.9",
  "blake3",
  "chrono",
+ "citadel-crdt",
  "citadel-dht",
+ "citadel-docs",
  "citadel-protocols",
  "citadel-spore",
  "citadel-topology",

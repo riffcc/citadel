@@ -3,6 +3,8 @@
 use crate::mesh::{double_hash_id, FloodMessage};
 use crate::models::{Category, FeaturedRelease, Release, ReleaseStatus};
 use crate::node::LensState;
+use citadel_crdt::ContentId;
+use citadel_docs::Document;
 use crate::ws::ws_mesh_handler;
 use crate::ws_admin;
 use axum::{
@@ -285,10 +287,19 @@ async fn list_releases(
         .map(|pk| state.storage.is_admin(pk).unwrap_or(false))
         .unwrap_or(false);
 
-    let releases = state
-        .storage
-        .list_releases()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    // Use DocumentStore for CRDT-based sync (no legacy fallback - use import/export to migrate)
+    let releases = if let Some(ref doc_store) = state.doc_store {
+        let doc_store = doc_store.read().await;
+        doc_store
+            .list::<Release>()
+            .map_err(|e| {
+                tracing::error!("DocumentStore list failed: {:?}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
+    } else {
+        tracing::warn!("doc_store not initialized");
+        Vec::new()
+    };
 
     // Filter releases based on params
     let filtered: Vec<Release> = if params.include_all && is_admin {
@@ -431,12 +442,26 @@ async fn create_release(
     }
 
     let state = state.read().await;
-    state
-        .storage
-        .put_release(&release)
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-            "error": "Failed to save release"
-        }))))?;
+
+    // Use DocumentStore if available (CRDT path with automatic merge)
+    if let Some(ref doc_store) = state.doc_store {
+        let mut doc_store = doc_store.write().await;
+        let (_, _changed) = doc_store.put(&release).map_err(|e| {
+            tracing::error!("DocumentStore put failed: {:?}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                "error": "Failed to save release"
+            })))
+        })?;
+        tracing::info!("Created release {} in DocumentStore", release.id);
+    } else {
+        // Fallback to legacy storage
+        state
+            .storage
+            .put_release(&release)
+            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                "error": "Failed to save release"
+            }))))?;
+    }
 
     // SPORE: Flood the release to propagate across mesh
     if let Some(ref flood_tx) = state.flood_tx {
@@ -446,12 +471,15 @@ async fn create_release(
         }
 
         // SPORE: Broadcast our updated ContentHaveList so peers know our new state
-        if let Ok(all_releases) = state.storage.list_releases() {
-            let release_ids: Vec<String> = all_releases.iter().map(|r| r.id.clone()).collect();
-            let _ = flood_tx.send(FloodMessage::ContentHaveList {
-                peer_id: "api-create".to_string(),
-                release_ids,
-            });
+        if let Some(ref doc_store) = state.doc_store {
+            let doc_store = doc_store.read().await;
+            if let Ok(all_releases) = doc_store.list::<Release>() {
+                let release_ids: Vec<String> = all_releases.iter().map(|r| r.id.clone()).collect();
+                let _ = flood_tx.send(FloodMessage::ContentHaveList {
+                    peer_id: "api-create".to_string(),
+                    release_ids,
+                });
+            }
         }
     }
 
@@ -470,10 +498,19 @@ async fn get_release(
     Path(id): Path<String>,
 ) -> Result<Json<Release>, StatusCode> {
     let state = state.read().await;
-    match state.storage.get_release(&id) {
-        Ok(Some(release)) => Ok(Json(release.with_defaults())),
-        Ok(None) => Err(StatusCode::NOT_FOUND),
-        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+
+    // Use DocumentStore only (no legacy fallback - use import/export to migrate)
+    if let Some(ref doc_store) = state.doc_store {
+        let doc_store = doc_store.read().await;
+        let content_id = citadel_crdt::ContentId::hash(id.as_bytes());
+        match doc_store.get::<Release>(&content_id) {
+            Ok(Some(release)) => Ok(Json(release.with_defaults())),
+            Ok(None) => Err(StatusCode::NOT_FOUND),
+            Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+        }
+    } else {
+        tracing::warn!("doc_store not initialized");
+        Err(StatusCode::INTERNAL_SERVER_ERROR)
     }
 }
 
@@ -556,15 +593,24 @@ async fn update_release(
 
     let state = state.read().await;
 
-    // Get existing release
-    let mut release = match state.storage.get_release(&id) {
-        Ok(Some(r)) => r,
-        Ok(None) => return Err((StatusCode::NOT_FOUND, Json(serde_json::json!({
-            "error": "Release not found"
-        })))),
-        Err(_) => return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-            "error": "Failed to get release"
-        })))),
+    // Get existing release - check doc_store first, then legacy
+    let mut release = if let Some(ref doc_store) = state.doc_store {
+        let doc_store = doc_store.read().await;
+        let content_id = citadel_crdt::ContentId::hash(id.as_bytes());
+        match doc_store.get::<Release>(&content_id) {
+            Ok(Some(r)) => r,
+            Ok(None) => return Err((StatusCode::NOT_FOUND, Json(serde_json::json!({
+                "error": "Release not found"
+            })))),
+            Err(_) => return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                "error": "Failed to get release"
+            })))),
+        }
+    } else {
+        tracing::warn!("doc_store not initialized");
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": "doc_store not initialized"
+        }))));
     };
 
     // Update fields if provided
@@ -612,13 +658,27 @@ async fn update_release(
         }
     }
 
-    // Save updated release
-    state
-        .storage
-        .put_release(&release)
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-            "error": "Failed to save release"
-        }))))?;
+    // Update modified_at for LWW merge semantics
+    release.modified_at = chrono::Utc::now().to_rfc3339();
+
+    // Save updated release - use DocumentStore if available (CRDT merge)
+    if let Some(ref doc_store) = state.doc_store {
+        let mut doc_store = doc_store.write().await;
+        let (_, _changed) = doc_store.put(&release).map_err(|e| {
+            tracing::error!("DocumentStore put failed: {:?}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                "error": "Failed to save release"
+            })))
+        })?;
+        tracing::debug!("Updated release {} in DocumentStore", release.id);
+    } else {
+        state
+            .storage
+            .put_release(&release)
+            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                "error": "Failed to save release"
+            }))))?;
+    }
 
     // SPORE: Flood the updated release to propagate across mesh
     if let Some(ref flood_tx) = state.flood_tx {
@@ -674,30 +734,44 @@ async fn delete_release(
 
     let state = state.read().await;
 
-    // Delete from storage
-    if let Err(_) = state.storage.delete_release(&id) {
+    // Delete from DocumentStore
+    if let Some(ref doc_store) = state.doc_store {
+        let content_id = citadel_crdt::ContentId::hash(id.as_bytes());
+        let mut doc_store = doc_store.write().await;
+        if let Err(e) = doc_store.delete::<Release>(&content_id) {
+            tracing::warn!("Failed to delete release from DocumentStore: {:?}", e);
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                "error": "Failed to delete release"
+            }))));
+        }
+        tracing::debug!("Deleted release {} from DocumentStore", id);
+    } else {
+        tracing::warn!("doc_store not initialized");
         return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-            "error": "Failed to delete release"
+            "error": "doc_store not initialized"
         }))));
     }
 
-    // SPORE: Compute double-hash tombstone and add to DoNotWantList
+    // SPORE⁻¹: Compute double-hash tombstone and add to DoNotWantList
     let tombstone = double_hash_id(&id);
 
-    // Add to mesh state's do_not_want set
+    // Add to mesh state's do_not_want set using SPORE⁻¹
     if let Some(ref mesh_state) = state.mesh_state {
         let mut mesh = mesh_state.write().await;
-        mesh.do_not_want.insert(tombstone);
+        let is_new = mesh.add_tombstone(tombstone);
         let self_id = mesh.self_id.clone();
+        let do_not_want = mesh.do_not_want_spore().clone();
         drop(mesh); // Release lock before flooding
 
-        // Flood the tombstone to propagate deletion through mesh
-        if let Some(ref flood_tx) = state.flood_tx {
-            let _ = flood_tx.send(FloodMessage::DoNotWantList {
-                peer_id: self_id,
-                double_hashes: vec![tombstone],
-            });
-            tracing::info!("SPORE: Flooding tombstone for deleted release {}", id);
+        // Flood the do_not_want Spore to propagate deletion through mesh
+        if is_new {
+            if let Some(ref flood_tx) = state.flood_tx {
+                let _ = flood_tx.send(FloodMessage::DoNotWantList {
+                    peer_id: self_id,
+                    do_not_want,
+                });
+                tracing::info!("SPORE⁻¹: Flooding tombstone for deleted release {}", id);
+            }
         }
     }
 
@@ -789,35 +863,65 @@ async fn approve_release(
 
     let state = state.read().await;
 
-    match state.storage.approve_release(&id, public_key) {
-        Ok(Some(release)) => {
-            tracing::info!("Release {} approved by {}", id, public_key);
-
-            // SPORE: Flood the approved release to propagate across mesh
-            if let Some(ref flood_tx) = state.flood_tx {
-                if let Ok(json) = serde_json::to_string(&release) {
-                    let _ = flood_tx.send(FloodMessage::Release { release_json: json });
-                    tracing::debug!("SPORE: Flooding approved release {}", release.id);
-                }
-            }
-
-            // Broadcast to admin WebSocket subscribers
-            if let Some(ref admin_tx) = state.admin_event_tx {
-                ws_admin::broadcast_release_approved(admin_tx, &id, public_key);
-            }
-
-            Ok(Json(release.with_defaults()))
+    // Get release from doc_store
+    let mut release = if let Some(ref doc_store) = state.doc_store {
+        let doc_store = doc_store.read().await;
+        let content_id = citadel_crdt::ContentId::hash(id.as_bytes());
+        match doc_store.get::<Release>(&content_id) {
+            Ok(Some(r)) => r,
+            Ok(None) => return Err((StatusCode::NOT_FOUND, Json(serde_json::json!({
+                "error": "Release not found"
+            })))),
+            Err(_) => return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                "error": "Failed to get release"
+            })))),
         }
-        Ok(None) => Err((StatusCode::NOT_FOUND, Json(serde_json::json!({
-            "error": "Release not found"
-        })))),
-        Err(e) => {
-            tracing::error!("Failed to approve release {}: {}", id, e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-                "error": "Failed to approve release"
-            }))))
+    } else {
+        tracing::warn!("doc_store not initialized");
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": "doc_store not initialized"
+        }))));
+    };
+
+    // Approve the release
+    release.approve(public_key);
+    release.modified_at = chrono::Utc::now().to_rfc3339();
+
+    // Save to doc_store
+    if let Some(ref doc_store) = state.doc_store {
+        let mut doc_store = doc_store.write().await;
+        match doc_store.put(&release) {
+            Ok(_) => {}
+            Err(e) => {
+                tracing::error!("Failed to save approved release to DocumentStore: {:?}", e);
+                return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                    "error": "Failed to approve release"
+                }))));
+            }
+        }
+    } else {
+        tracing::warn!("doc_store not initialized");
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": "doc_store not initialized"
+        }))));
+    }
+
+    tracing::info!("Release {} approved by {}", id, public_key);
+
+    // SPORE: Flood the approved release to propagate across mesh
+    if let Some(ref flood_tx) = state.flood_tx {
+        if let Ok(json) = serde_json::to_string(&release) {
+            let _ = flood_tx.send(FloodMessage::Release { release_json: json });
+            tracing::debug!("SPORE: Flooding approved release {}", release.id);
         }
     }
+
+    // Broadcast to admin WebSocket subscribers
+    if let Some(ref admin_tx) = state.admin_event_tx {
+        ws_admin::broadcast_release_approved(admin_tx, &id, public_key);
+    }
+
+    Ok(Json(release.with_defaults()))
 }
 
 /// Request body for rejecting a release
@@ -874,38 +978,68 @@ async fn reject_release(
 
     let state = state.read().await;
 
-    match state.storage.reject_release(&id, public_key, req.reason.clone()) {
-        Ok(Some(release)) => {
-            tracing::info!(
-                "Release {} rejected by {} (reason: {:?})",
-                id, public_key, req.reason
-            );
-
-            // SPORE: Flood the updated release status to propagate across mesh
-            if let Some(ref flood_tx) = state.flood_tx {
-                if let Ok(json) = serde_json::to_string(&release) {
-                    let _ = flood_tx.send(FloodMessage::Release { release_json: json });
-                    tracing::debug!("SPORE: Flooding rejected release {}", release.id);
-                }
-            }
-
-            // Broadcast to admin WebSocket subscribers
-            if let Some(ref admin_tx) = state.admin_event_tx {
-                ws_admin::broadcast_release_rejected(admin_tx, &id, public_key, req.reason.clone());
-            }
-
-            Ok(Json(release.with_defaults()))
+    // Get release from doc_store
+    let mut release = if let Some(ref doc_store) = state.doc_store {
+        let doc_store = doc_store.read().await;
+        let content_id = citadel_crdt::ContentId::hash(id.as_bytes());
+        match doc_store.get::<Release>(&content_id) {
+            Ok(Some(r)) => r,
+            Ok(None) => return Err((StatusCode::NOT_FOUND, Json(serde_json::json!({
+                "error": "Release not found"
+            })))),
+            Err(_) => return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                "error": "Failed to get release"
+            })))),
         }
-        Ok(None) => Err((StatusCode::NOT_FOUND, Json(serde_json::json!({
-            "error": "Release not found"
-        })))),
-        Err(e) => {
-            tracing::error!("Failed to reject release {}: {}", id, e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-                "error": "Failed to reject release"
-            }))))
+    } else {
+        tracing::warn!("doc_store not initialized");
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": "doc_store not initialized"
+        }))));
+    };
+
+    // Reject the release
+    release.reject(public_key, req.reason.clone());
+    release.modified_at = chrono::Utc::now().to_rfc3339();
+
+    // Save to doc_store
+    if let Some(ref doc_store) = state.doc_store {
+        let mut doc_store = doc_store.write().await;
+        match doc_store.put(&release) {
+            Ok(_) => {}
+            Err(e) => {
+                tracing::error!("Failed to save rejected release to DocumentStore: {:?}", e);
+                return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                    "error": "Failed to reject release"
+                }))));
+            }
+        }
+    } else {
+        tracing::warn!("doc_store not initialized");
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": "doc_store not initialized"
+        }))));
+    }
+
+    tracing::info!(
+        "Release {} rejected by {} (reason: {:?})",
+        id, public_key, req.reason
+    );
+
+    // SPORE: Flood the updated release status to propagate across mesh
+    if let Some(ref flood_tx) = state.flood_tx {
+        if let Ok(json) = serde_json::to_string(&release) {
+            let _ = flood_tx.send(FloodMessage::Release { release_json: json });
+            tracing::debug!("SPORE: Flooding rejected release {}", release.id);
         }
     }
+
+    // Broadcast to admin WebSocket subscribers
+    if let Some(ref admin_tx) = state.admin_event_tx {
+        ws_admin::broadcast_release_rejected(admin_tx, &id, public_key, req.reason.clone());
+    }
+
+    Ok(Json(release.with_defaults()))
 }
 
 /// Moderation statistics response
@@ -1129,6 +1263,22 @@ async fn list_featured_releases(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<FeaturedRelease>>, StatusCode> {
     let state = state.read().await;
+
+    // Use DocumentStore if available (new CRDT-based sync)
+    if let Some(ref doc_store) = state.doc_store {
+        let doc_store = doc_store.read().await;
+        let featured = doc_store
+            .list::<FeaturedRelease>()
+            .map_err(|e| {
+                tracing::error!("DocumentStore list failed: {:?}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+        tracing::debug!("Listed {} featured releases from DocumentStore", featured.len());
+        return Ok(Json(featured));
+    }
+
+    // Fallback to legacy storage
+    tracing::debug!("doc_store is None, listing from legacy storage");
     let featured = state
         .storage
         .list_featured_releases()
@@ -1142,6 +1292,20 @@ async fn get_featured_release(
     Path(id): Path<String>,
 ) -> Result<Json<FeaturedRelease>, StatusCode> {
     let state = state.read().await;
+
+    // Use DocumentStore if available (new CRDT-based sync)
+    if let Some(ref doc_store) = state.doc_store {
+        let doc_store = doc_store.read().await;
+        // ContentId is computed from the string ID (same as FeaturedRelease::content_id)
+        let content_id = ContentId::hash(id.as_bytes());
+        return doc_store
+            .get::<FeaturedRelease>(&content_id)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .map(Json)
+            .ok_or(StatusCode::NOT_FOUND);
+    }
+
+    // Fallback to legacy storage
     state
         .storage
         .get_featured_release(&id)
@@ -1188,7 +1352,14 @@ async fn create_featured_release(
     // Verify the release exists
     {
         let state = state.read().await;
-        if state.storage.get_release(&req.release_id).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?.is_none() {
+        let release_exists = if let Some(ref doc_store) = state.doc_store {
+            let doc_store = doc_store.read().await;
+            let content_id = citadel_crdt::ContentId::hash(req.release_id.as_bytes());
+            doc_store.get::<Release>(&content_id).ok().flatten().is_some()
+        } else {
+            false
+        };
+        if !release_exists {
             return Err(StatusCode::BAD_REQUEST); // Release doesn't exist
         }
     }
@@ -1215,6 +1386,23 @@ async fn create_featured_release(
     featured.metadata = req.metadata;
 
     let state = state.read().await;
+
+    // Use DocumentStore if available (new CRDT-based sync with rich semantic merges)
+    if let Some(ref doc_store) = state.doc_store {
+        tracing::info!("Creating featured release in DocumentStore");
+        let mut doc_store = doc_store.write().await;
+        doc_store
+            .put(&featured)
+            .map_err(|e| {
+                tracing::error!("DocumentStore put failed: {:?}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+        tracing::info!("Featured release created successfully: {}", featured.id);
+        return Ok((StatusCode::CREATED, Json(featured)));
+    }
+
+    // Fallback to legacy storage
+    tracing::warn!("doc_store is None, falling back to legacy storage for featured release");
     state
         .storage
         .put_featured_release(&featured)
@@ -1224,6 +1412,12 @@ async fn create_featured_release(
 }
 
 /// Update an existing featured release (admin only)
+///
+/// With DocumentStore (CRDT), updates are merged using rich semantic merges:
+/// - Counters: max(old, new)
+/// - Sets (regions, languages, tags): union(old, new)
+/// - Booleans (promoted): or(old, new)
+/// - Time windows: (min(start), max(end))
 async fn update_featured_release(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -1231,7 +1425,69 @@ async fn update_featured_release(
 ) -> Result<Json<FeaturedRelease>, StatusCode> {
     let state = state.read().await;
 
-    // Get existing featured release
+    // Use DocumentStore if available (new CRDT-based sync with rich semantic merges)
+    if let Some(ref doc_store) = state.doc_store {
+        let content_id = ContentId::hash(id.as_bytes());
+
+        // Get existing to verify it exists
+        {
+            let doc_store_read = doc_store.read().await;
+            if doc_store_read
+                .get::<FeaturedRelease>(&content_id)
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+                .is_none()
+            {
+                return Err(StatusCode::NOT_FOUND);
+            }
+        }
+
+        // Verify the release exists if changing releaseId
+        let release_exists = if let Some(ref doc_store) = state.doc_store {
+            let doc_store = doc_store.read().await;
+            let content_id = citadel_crdt::ContentId::hash(req.release_id.as_bytes());
+            doc_store.get::<Release>(&content_id).ok().flatten().is_some()
+        } else {
+            false
+        };
+        if !release_exists {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+
+        // Create updated featured release with the same ID
+        let mut featured = FeaturedRelease::new(
+            id.clone(),
+            req.release_id,
+            req.start_time,
+            req.end_time,
+        );
+        featured.promoted = req.promoted;
+        featured.priority = req.priority;
+        featured.order = req.order;
+        featured.custom_title = req.custom_title;
+        featured.custom_description = req.custom_description;
+        featured.custom_thumbnail = req.custom_thumbnail;
+        featured.regions = req.regions;
+        featured.languages = req.languages;
+        featured.tags = req.tags;
+        featured.variant = req.variant;
+        featured.metadata = req.metadata;
+
+        // Put will automatically merge with existing using TotalMerge
+        let mut doc_store = doc_store.write().await;
+        doc_store
+            .put(&featured)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        // Return the merged result
+        let merged = doc_store
+            .get::<FeaturedRelease>(&content_id)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        return Ok(Json(merged));
+    }
+
+    // Fallback to legacy storage (no merge semantics)
     let mut featured = state
         .storage
         .get_featured_release(&id)
@@ -1240,7 +1496,14 @@ async fn update_featured_release(
 
     // Verify the release exists if changing releaseId
     if featured.release_id != req.release_id {
-        if state.storage.get_release(&req.release_id).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?.is_none() {
+        let release_exists = if let Some(ref doc_store) = state.doc_store {
+            let doc_store = doc_store.read().await;
+            let content_id = citadel_crdt::ContentId::hash(req.release_id.as_bytes());
+            doc_store.get::<Release>(&content_id).ok().flatten().is_some()
+        } else {
+            false
+        };
+        if !release_exists {
             return Err(StatusCode::BAD_REQUEST);
         }
     }
@@ -1270,13 +1533,36 @@ async fn update_featured_release(
 }
 
 /// Delete a featured release (admin only)
+///
+/// Note: In CRDT context, deletion creates a tombstone for sync.
 async fn delete_featured_release(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> StatusCode {
     let state = state.read().await;
+    let content_id = ContentId::hash(id.as_bytes());
 
-    // Check if exists
+    // Use DocumentStore if available (new CRDT-based sync)
+    if let Some(ref doc_store) = state.doc_store {
+        let doc_store_read = doc_store.read().await;
+
+        // Check if exists
+        match doc_store_read.get::<FeaturedRelease>(&content_id) {
+            Ok(Some(_)) => {
+                drop(doc_store_read); // Release read lock before write
+                let mut doc_store_write = doc_store.write().await;
+                if doc_store_write.delete::<FeaturedRelease>(&content_id).is_ok() {
+                    return StatusCode::NO_CONTENT;
+                } else {
+                    return StatusCode::INTERNAL_SERVER_ERROR;
+                }
+            }
+            Ok(None) => return StatusCode::NOT_FOUND,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+
+    // Fallback to legacy storage
     match state.storage.get_featured_release(&id) {
         Ok(Some(_)) => {
             if state.storage.delete_featured_release(&id).is_ok() {
@@ -1849,10 +2135,13 @@ struct ExportData {
 
 /// Import response
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ImportResponse {
     success: bool,
     imported: usize,
     skipped: usize,
+    featured_imported: usize,
+    featured_skipped: usize,
     errors: Vec<String>,
 }
 
@@ -1914,12 +2203,26 @@ async fn import_releases(
         legacy_export.version
     );
 
+    // Get doc_store reference for imports
+    let doc_store = match state.doc_store.as_ref() {
+        Some(ds) => ds,
+        None => {
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                "error": "doc_store not initialized"
+            }))));
+        }
+    };
+
     for legacy_release in legacy_export.releases {
-        // Check if release already exists
-        if state.storage.get_release(&legacy_release.id).ok().flatten().is_some() {
-            tracing::debug!("Skipping existing release: {}", legacy_release.id);
-            skipped += 1;
-            continue;
+        // Check if release already exists in doc_store
+        let content_id = citadel_crdt::ContentId::hash(legacy_release.id.as_bytes());
+        {
+            let doc_store_read = doc_store.read().await;
+            if doc_store_read.get::<Release>(&content_id).ok().flatten().is_some() {
+                tracing::debug!("Skipping existing release: {}", legacy_release.id);
+                skipped += 1;
+                continue;
+            }
         }
 
         // Use posted_by directly (already converted by deserializer)
@@ -1947,10 +2250,13 @@ async fn import_releases(
             }
         }
 
-        // Save release
-        if let Err(e) = state.storage.put_release(&release) {
-            errors.push(format!("Failed to save release {}: {}", legacy_release.id, e));
-            continue;
+        // Save release to doc_store
+        {
+            let mut doc_store_write = doc_store.write().await;
+            if let Err(e) = doc_store_write.put(&release) {
+                errors.push(format!("Failed to save release {}: {:?}", legacy_release.id, e));
+                continue;
+            }
         }
 
         // SPORE: Flood the release to propagate across mesh
@@ -1990,10 +2296,31 @@ async fn import_releases(
         tracing::info!("Featured releases import: {} imported, {} skipped", featured_imported, featured_skipped);
     }
 
+    // SPORE: Flood imported featured releases so they propagate across mesh
+    if featured_imported > 0 {
+        if let Some(ref flood_tx) = state.flood_tx {
+            if let Ok(all_featured) = state.storage.list_featured_releases() {
+                let featured_json: Vec<String> = all_featured
+                    .iter()
+                    .filter_map(|f| serde_json::to_string(f).ok())
+                    .collect();
+                let _ = flood_tx.send(FloodMessage::FeaturedSync {
+                    peer_id: "api-import".to_string(),
+                    featured: featured_json,
+                });
+                tracing::info!(
+                    "SPORE: Flooding {} featured releases after import",
+                    all_featured.len()
+                );
+            }
+        }
+    }
+
     // SPORE: Broadcast our updated ContentHaveList so peers know our complete state
     if imported > 0 {
         if let Some(ref flood_tx) = state.flood_tx {
-            if let Ok(all_releases) = state.storage.list_releases() {
+            let doc_store_read = doc_store.read().await;
+            if let Ok(all_releases) = doc_store_read.list::<Release>() {
                 let release_ids: Vec<String> = all_releases.iter().map(|r| r.id.clone()).collect();
                 let _ = flood_tx.send(FloodMessage::ContentHaveList {
                     peer_id: "api-import".to_string(), // API doesn't have mesh identity
@@ -2008,6 +2335,8 @@ async fn import_releases(
         success: errors.is_empty(),
         imported,
         skipped,
+        featured_imported,
+        featured_skipped,
         errors,
     }))
 }
