@@ -23,12 +23,42 @@
 //! - **T (Triple)**: Immediate - you ran the merge locally
 //! - **Q (Quaternary)**: Inherent - determinism IS bilateral construction
 //!
+//! ### Rich Merges, NOT LWW
+//!
+//! Last-Writer-Wins (LWW) is the simplest merge strategy:
+//! ```text
+//! Conflict? → Whoever has latest timestamp wins → Loser's data is LOST
+//! ```
+//!
+//! Bilateral CRDTs use **rich semantic merges** that preserve ALL data:
+//! - Counters: `max(a, b)` - both increments preserved
+//! - Sets: `union(a, b)` - all elements preserved
+//! - Booleans: `or(a, b)` - if either is true, result is true
+//! - Time windows: `(min(start), max(end))` - union of active periods
+//!
+//! **LWW loses data. Rich merges preserve it.**
+//!
+//! ### Practical CAP (from proofs/CitadelProofs/CRDT/PracticalCAP.lean)
+//!
+//! The CAP theorem says you can't have Consistency + Availability + Partition tolerance.
+//! But CAP's "Consistency" means linearizability. Most apps don't need that.
+//!
+//! CRDTs achieve **Practical CAP**:
+//! 1. **Zero-latency writes** - operations complete locally, no network
+//! 2. **Partition tolerant** - works during network failures
+//! 3. **Always available** - every operation succeeds
+//! 4. **Proven convergence** - same operations → same state (mathematically verified)
+//!
+//! CAP is not violated. CAP is **transcended**.
+//!
 //! ## Proven Properties (from proofs/CitadelProofs/CRDT/)
 //!
 //! 1. `merge_cannot_disagree` - Same inputs → same outputs
 //! 2. `no_merge_failure` - Merge is total, cannot fail
 //! 3. `full_sync_convergence` - Same operations → same state
 //! 4. `offline_op_always_possible` - Works without network
+//! 5. `crdt_achieves_practical_cap` - Zero latency + partition tolerant + available + convergent
+//! 6. `lww_loses_data` - LWW can lose data (counterexample proving why we avoid it)
 //!
 //! ## Example
 //!
@@ -275,7 +305,26 @@ impl<T: Ord + Clone> IdempotentMerge for GSet<T> {}
 /// LWW (Last-Writer-Wins) Register.
 ///
 /// Stores a single value with a timestamp. Higher timestamp wins.
-/// Note: This CAN lose data - use carefully.
+///
+/// ## WARNING: LWW Loses Data
+///
+/// From `proofs/CitadelProofs/CRDT/Convergence.lean` theorem `lww_loses_data`:
+/// ```text
+/// If two nodes concurrently update with timestamps t1 < t2:
+///   - Node A sets value="first" at t1
+///   - Node B sets value="second" at t2
+///   - After merge: value="second", "first" is PERMANENTLY LOST
+/// ```
+///
+/// **Prefer rich merges over LWW whenever possible:**
+/// - Use `GSet` for tags/collections (union preserves all)
+/// - Use `MaxRegister` for counters (max preserves increments)
+/// - Use field-by-field merge for records
+///
+/// LWW is only appropriate when:
+/// 1. Truly last-write semantics are desired (rare)
+/// 2. The application can tolerate data loss
+/// 3. Conflicts are expected to be extremely rare
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LWWRegister<T: Clone> {
     pub value: T,
