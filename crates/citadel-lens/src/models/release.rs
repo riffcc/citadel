@@ -1,5 +1,23 @@
 //! Release model - albums, movies, TV series, etc.
+//!
+//! ## CRDT Semantics
+//!
+//! Release uses **LWW (Last-Writer-Wins)** merge based on `modified_at`.
+//!
+//! This is appropriate because:
+//! - Release content is typically edited by a single owner
+//! - Concurrent edits are rare
+//! - Later edit = correct state
+//!
+//! | Field Type | Merge Strategy | Fields |
+//! |------------|----------------|--------|
+//! | LWW        | later modified_at wins | all content and moderation fields |
+//! | Timestamp  | min | created_at |
+//!
+//! **Future**: Can upgrade to rich merges (union for tags, etc.) by changing merge() impl.
 
+use citadel_crdt::{AssociativeMerge, CommutativeMerge, ContentId, IdempotentMerge, TotalMerge};
+use citadel_docs::Document;
 use serde::{Deserialize, Serialize};
 
 /// Moderation status for a release.
@@ -18,6 +36,8 @@ pub enum ReleaseStatus {
     Approved,
     /// Rejected by moderator
     Rejected,
+    /// Deleted by owner/admin (still exists in mesh, just hidden)
+    Deleted,
 }
 
 impl std::fmt::Display for ReleaseStatus {
@@ -26,6 +46,7 @@ impl std::fmt::Display for ReleaseStatus {
             ReleaseStatus::Pending => write!(f, "pending"),
             ReleaseStatus::Approved => write!(f, "approved"),
             ReleaseStatus::Rejected => write!(f, "rejected"),
+            ReleaseStatus::Deleted => write!(f, "deleted"),
         }
     }
 }
@@ -109,10 +130,18 @@ pub struct Release {
     /// Reason for rejection (if status is Rejected)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rejection_reason: Option<String>,
+
+    /// Last modification timestamp (ISO 8601) - for LWW merge
+    #[serde(default = "default_modified_at")]
+    pub modified_at: String,
 }
 
 fn default_schema_version() -> String {
     "1.0.0".to_string()
+}
+
+fn default_modified_at() -> String {
+    chrono::Utc::now().to_rfc3339()
 }
 
 impl Release {
@@ -120,6 +149,7 @@ impl Release {
     /// Status defaults to Approved for backward compatibility.
     pub fn new(id: String, title: String, category_id: String) -> Self {
         let category_slug = Some(category_id.clone());
+        let now = chrono::Utc::now().to_rfc3339();
         Self {
             id,
             title,
@@ -133,12 +163,13 @@ impl Release {
             tags: Vec::new(),
             schema_version: default_schema_version(),
             site_address: None,
-            created_at: None,
+            created_at: Some(now.clone()),
             metadata: None,
             status: ReleaseStatus::default(),
             moderated_by: None,
             moderated_at: None,
             rejection_reason: None,
+            modified_at: now,
         }
     }
 
@@ -239,6 +270,7 @@ mod tests {
             moderated_by: None,
             moderated_at: None,
             rejection_reason: None,
+            modified_at: "2024-01-01T00:00:00Z".to_string(),
         };
 
         let json = serde_json::to_string(&release).unwrap();
@@ -307,5 +339,160 @@ mod tests {
         let release: Release = serde_json::from_str(json).unwrap();
         assert_eq!(release.status, ReleaseStatus::Approved);
         assert!(release.is_public());
+    }
+
+    #[test]
+    fn test_merge_lww_semantics() {
+        // Release uses LWW (Last-Writer-Wins) based on modified_at
+        let mut older = Release::new(
+            "release-123".to_string(),
+            "Original Title".to_string(),
+            "music".to_string(),
+        );
+        older.modified_at = "2025-06-01T00:00:00Z".to_string();
+        older.created_at = Some("2025-06-01T00:00:00Z".to_string()); // Earlier created_at
+        older.description = Some("Original description".to_string());
+        older.tags = vec!["rock".to_string()];
+
+        let mut newer = Release::new(
+            "release-123".to_string(),
+            "Updated Title".to_string(),
+            "music".to_string(),
+        );
+        newer.modified_at = "2025-06-02T00:00:00Z".to_string();
+        newer.description = Some("Updated description".to_string());
+        newer.tags = vec!["indie".to_string()];
+        newer.created_at = Some("2025-06-02T00:00:00Z".to_string()); // Later created_at
+
+        // Merge: newer modified_at wins for all fields
+        let merged = older.merge(&newer);
+
+        // LWW: content from newer
+        assert_eq!(merged.title, "Updated Title");
+        assert_eq!(merged.description, Some("Updated description".to_string()));
+        assert_eq!(merged.tags, vec!["indie".to_string()]);
+
+        // modified_at from newer
+        assert_eq!(merged.modified_at, "2025-06-02T00:00:00Z");
+
+        // created_at uses min (preserve original creation time)
+        assert_eq!(merged.created_at, Some("2025-06-01T00:00:00Z".to_string()));
+    }
+
+    #[test]
+    fn test_merge_commutativity() {
+        let mut a = Release::new(
+            "release-123".to_string(),
+            "Title A".to_string(),
+            "music".to_string(),
+        );
+        a.modified_at = "2025-06-01T00:00:00Z".to_string();
+
+        let mut b = Release::new(
+            "release-123".to_string(),
+            "Title B".to_string(),
+            "music".to_string(),
+        );
+        b.modified_at = "2025-06-02T00:00:00Z".to_string();
+
+        // merge(a, b) == merge(b, a)
+        let ab = a.merge(&b);
+        let ba = b.merge(&a);
+
+        assert_eq!(ab.title, ba.title);
+        assert_eq!(ab.modified_at, ba.modified_at);
+    }
+
+    #[test]
+    fn test_merge_idempotency() {
+        let release = Release::new(
+            "release-123".to_string(),
+            "Test Title".to_string(),
+            "music".to_string(),
+        );
+
+        // merge(a, a) == a
+        let merged = release.merge(&release);
+
+        assert_eq!(merged.title, release.title);
+        assert_eq!(merged.modified_at, release.modified_at);
+    }
+}
+
+// ============================================================================
+// CRDT Implementation: LWW (Last-Writer-Wins)
+// ============================================================================
+
+/// Merge Option<String> timestamps: pick the earlier one (min).
+fn merge_timestamp_min(a: &Option<String>, b: &Option<String>) -> Option<String> {
+    match (a, b) {
+        (None, None) => None,
+        (Some(v), None) | (None, Some(v)) => Some(v.clone()),
+        (Some(va), Some(vb)) => Some(std::cmp::min(va, vb).clone()),
+    }
+}
+
+impl TotalMerge for Release {
+    /// LWW merge for release content.
+    ///
+    /// - All fields: later modified_at wins
+    /// - created_at: min (preserve original creation time)
+    fn merge(&self, other: &Self) -> Self {
+        // Determine which document is newer
+        let (newer, older) = if self.modified_at >= other.modified_at {
+            (self, other)
+        } else {
+            (other, self)
+        };
+
+        Release {
+            // Identity - always preserve
+            id: self.id.clone(),
+
+            // LWW: all content fields from newer document
+            title: newer.title.clone(),
+            creator: newer.creator.clone(),
+            year: newer.year,
+            category_id: newer.category_id.clone(),
+            category_slug: newer.category_slug.clone(),
+            thumbnail_cid: newer.thumbnail_cid.clone(),
+            content_cid: newer.content_cid.clone(),
+            description: newer.description.clone(),
+            tags: newer.tags.clone(),
+            schema_version: newer.schema_version.clone(),
+            site_address: newer.site_address.clone(),
+            metadata: newer.metadata.clone(),
+
+            // LWW: moderation fields from newer
+            status: newer.status,
+            moderated_by: newer.moderated_by.clone(),
+            moderated_at: newer.moderated_at.clone(),
+            rejection_reason: newer.rejection_reason.clone(),
+
+            // modified_at from newer
+            modified_at: newer.modified_at.clone(),
+
+            // created_at: min (preserve original creation time)
+            created_at: merge_timestamp_min(&self.created_at, &other.created_at),
+        }
+    }
+}
+
+// Marker traits for IsCRDT - proves merge is commutative, associative, idempotent
+impl CommutativeMerge for Release {}
+impl AssociativeMerge for Release {}
+impl IdempotentMerge for Release {}
+
+// ============================================================================
+// Document Implementation for SPORE sync
+// ============================================================================
+
+impl Document for Release {
+    /// Type prefix for storage keys
+    const TYPE_PREFIX: &'static str = "release";
+
+    /// Content ID is hash of the stable identifier (id field)
+    fn content_id(&self) -> ContentId {
+        ContentId::hash(self.id.as_bytes())
     }
 }
