@@ -15,12 +15,33 @@
 //!
 //! Documents are stored in RocksDB with:
 //! - Key: `{type_prefix}:{content_id}`
-//! - Value: bincode-serialized document
+//! - Value: JSON-serialized document
 //!
 //! ### SPORE Integration
 //!
 //! The DocumentStore maintains a SPORE HaveList of all stored documents.
 //! This enables O(k) sync where k = documents differing between peers.
+//!
+//! From `proofs/CitadelProofs/Spore.lean`:
+//! - **XOR Cancellation**: Matching documents cancel in XOR. If nodes have 99% overlap,
+//!   only 1% shows up in the diff. At 100% convergence, sync cost is ZERO.
+//! - **Optimality**: SPORE size ∝ boundary transitions, not data size. One range
+//!   covering 2^255 values costs the same as one range covering 1 value: 512 bits.
+//!
+//! ### Rich Merge Semantics (NOT LWW)
+//!
+//! Documents use **rich semantic merges**, NOT Last-Writer-Wins. For a document
+//! with multiple field types, the merge is field-by-field:
+//!
+//! | Field Type | Merge Strategy | Example |
+//! |------------|----------------|---------|
+//! | Counter    | `max(a, b)`    | views, clicks |
+//! | Set        | `union(a, b)`  | tags, regions |
+//! | Boolean    | `or(a, b)`     | promoted |
+//! | Timestamp  | `min(a, b)`    | created_at |
+//! | Time window| `(min(start), max(end))` | active period |
+//!
+//! **LWW loses concurrent edits. Rich merges preserve ALL data.**
 //!
 //! ## Proven Properties
 //!
@@ -28,6 +49,19 @@
 //! - `merge_cannot_disagree` - Same inputs → same outputs
 //! - `no_merge_failure` - Merge is total, cannot fail
 //! - `full_sync_convergence` - Same operations → same state
+//! - `crdt_bilateral` - All CRDT merges have the bilateral property
+//! - `convergence_dominates` - At 100% convergence, XOR is empty (zero sync cost)
+//!
+//! ## The Bilateral Property
+//!
+//! The "bilateral property" means: if YOU compute `merge(a, b) = result`, then
+//! EVERYONE computing `merge(a, b)` gets the SAME result. This is trivially true
+//! for pure functions, but profoundly useful:
+//!
+//! **No network needed. Offline-first. Instantly bilateral.**
+//!
+//! Traditional TGP (network): `C → D → T → Q` (4 phases, latency)
+//! Bilateral CRDT (local):   `C=D=T=Q` (1 computation, instant)
 
 use citadel_crdt::{ContentId, TotalMerge};
 use citadel_spore::{Range256, Spore, U256};
@@ -65,7 +99,7 @@ pub enum DocError {
     NotFound(String),
 
     #[error("Serialization error: {0}")]
-    Serialization(#[from] bincode::Error),
+    Serialization(#[from] serde_json::Error),
 
     #[error("Storage error: {0}")]
     Storage(#[from] rocksdb::Error),
@@ -91,7 +125,7 @@ pub trait Document: Serialize + DeserializeOwned + TotalMerge + Clone {
 
     /// Compute content ID from serialized form
     fn compute_content_id(&self) -> ContentId {
-        let bytes = bincode::serialize(self).expect("serialization cannot fail");
+        let bytes = serde_json::to_vec(self).expect("serialization cannot fail");
         ContentId::hash(&bytes)
     }
 }
@@ -161,21 +195,29 @@ impl DocumentStore {
     /// 2. Merges (TotalMerge - cannot fail)
     /// 3. Stores the result
     /// 4. Updates SPORE HaveList
-    pub fn put<D: Document>(&mut self, doc: &D) -> Result<ContentId> {
+    ///
+    /// Returns `(content_id, changed)` where `changed` is true if the stored
+    /// document differs from what was previously stored (or is new).
+    pub fn put<D: Document>(&mut self, doc: &D) -> Result<(ContentId, bool)> {
         let content_id = doc.content_id();
         let key = self.make_key::<D>(&content_id);
 
         // Check for existing document
-        let merged = if let Some(existing_bytes) = self.db.get(&key)? {
-            let existing: D = bincode::deserialize(&existing_bytes)?;
+        let (merged, changed) = if let Some(existing_bytes) = self.db.get(&key)? {
+            let existing: D = serde_json::from_slice(&existing_bytes)?;
             // TotalMerge - this CANNOT fail (proven in Lean)
-            existing.merge(doc)
+            let merged = existing.merge(doc);
+            let merged_bytes = serde_json::to_vec(&merged)?;
+            // Changed if merged differs from existing
+            let changed = merged_bytes.as_slice() != &existing_bytes[..];
+            (merged, changed)
         } else {
-            doc.clone()
+            // New document = always changed
+            (doc.clone(), true)
         };
 
         // Serialize and store
-        let bytes = bincode::serialize(&merged)?;
+        let bytes = serde_json::to_vec(&merged)?;
         self.db.put(&key, &bytes)?;
 
         // Update SPORE HaveList
@@ -185,10 +227,11 @@ impl DocumentStore {
         trace!(
             doc_type = D::TYPE_PREFIX,
             id = %content_id,
+            changed = changed,
             "Stored document"
         );
 
-        Ok(content_id)
+        Ok((content_id, changed))
     }
 
     /// Get a document by content ID.
@@ -197,7 +240,7 @@ impl DocumentStore {
 
         match self.db.get(&key)? {
             Some(bytes) => {
-                let doc: D = bincode::deserialize(&bytes)?;
+                let doc: D = serde_json::from_slice(&bytes)?;
                 Ok(Some(doc))
             }
             None => Ok(None),
@@ -218,7 +261,7 @@ impl DocumentStore {
         let iter = db_prefix_iterator(&self.db, &prefix);
         for item in iter {
             let (_, value) = item?;
-            let doc: D = bincode::deserialize(&value)?;
+            let doc: D = serde_json::from_slice(&value)?;
             docs.push(doc);
         }
 
@@ -255,7 +298,7 @@ impl DocumentStore {
                 BatchOp::Put(doc) => {
                     let content_id = doc.content_id();
                     let key = self.make_key::<D>(&content_id);
-                    let bytes = bincode::serialize(&doc)?;
+                    let bytes = serde_json::to_vec(&doc)?;
                     batch.put(&key, &bytes);
 
                     let range = point_range(&content_id);
@@ -340,7 +383,7 @@ impl<'a, D: Document> Collection<'a, D> {
         }
     }
 
-    pub fn put(&mut self, doc: &D) -> Result<ContentId> {
+    pub fn put(&mut self, doc: &D) -> Result<(ContentId, bool)> {
         self.store.put(doc)
     }
 
@@ -374,7 +417,7 @@ mod tests {
     impl TagDoc {
         fn new(tags: &[&str]) -> Self {
             let tags: BTreeSet<String> = tags.iter().map(|s| s.to_string()).collect();
-            let id = ContentId::hash(&bincode::serialize(&tags).unwrap());
+            let id = ContentId::hash(&serde_json::to_vec(&tags).unwrap());
             Self { id, tags }
         }
     }
