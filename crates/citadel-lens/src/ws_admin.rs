@@ -228,10 +228,22 @@ async fn handle_admin_socket(
             _ = heartbeat_interval.tick() => {
                 // Check for pending count changes (fallback if no event channel)
                 let current_pending = {
+                    use crate::models::{Release, ReleaseStatus};
                     let state = state.read().await;
-                    state.storage.list_pending_releases()
-                        .map(|r| r.len())
-                        .unwrap_or(0)
+
+                    // Use DocumentStore if available
+                    if let Some(ref doc_store) = state.doc_store {
+                        let doc_store = doc_store.read().await;
+                        doc_store.list::<Release>()
+                            .unwrap_or_default()
+                            .iter()
+                            .filter(|r| r.status == ReleaseStatus::Pending)
+                            .count()
+                    } else {
+                        state.storage.list_pending_releases()
+                            .map(|r| r.len())
+                            .unwrap_or(0)
+                    }
                 };
 
                 if current_pending != last_pending_count {
@@ -261,19 +273,54 @@ async fn handle_admin_socket(
 
 /// Create a snapshot of current moderation state
 async fn create_admin_snapshot(state: &Arc<RwLock<LensState>>) -> AdminEvent {
+    use crate::models::{Release, ReleaseStatus};
+
     let state = state.read().await;
 
-    let counts = state.storage.count_releases_by_status().unwrap_or_default();
-    let pending_releases = state.storage.list_pending_releases()
-        .unwrap_or_default()
-        .iter()
-        .map(ReleaseInfo::from)
-        .collect();
+    // Use DocumentStore if available (CRDT path)
+    let (pending_count, approved_count, rejected_count, pending_releases) = if let Some(ref doc_store) = state.doc_store {
+        let doc_store = doc_store.read().await;
+        let all_releases: Vec<Release> = doc_store.list().unwrap_or_default();
+
+        let mut pending = 0usize;
+        let mut approved = 0usize;
+        let mut rejected = 0usize;
+        let mut pending_list = Vec::new();
+
+        for release in all_releases {
+            match release.status {
+                ReleaseStatus::Pending => {
+                    pending += 1;
+                    pending_list.push(ReleaseInfo::from(&release));
+                }
+                ReleaseStatus::Approved => approved += 1,
+                ReleaseStatus::Rejected => rejected += 1,
+                ReleaseStatus::Deleted => {}
+            }
+        }
+
+        (pending, approved, rejected, pending_list)
+    } else {
+        // Fallback to legacy storage
+        let counts = state.storage.count_releases_by_status().unwrap_or_default();
+        let pending_releases = state.storage.list_pending_releases()
+            .unwrap_or_default()
+            .iter()
+            .map(ReleaseInfo::from)
+            .collect();
+
+        (
+            *counts.get("pending").unwrap_or(&0),
+            *counts.get("approved").unwrap_or(&0),
+            *counts.get("rejected").unwrap_or(&0),
+            pending_releases,
+        )
+    };
 
     AdminEvent::Snapshot {
-        pending_count: *counts.get("pending").unwrap_or(&0),
-        approved_count: *counts.get("approved").unwrap_or(&0),
-        rejected_count: *counts.get("rejected").unwrap_or(&0),
+        pending_count,
+        approved_count,
+        rejected_count,
         pending_releases,
     }
 }

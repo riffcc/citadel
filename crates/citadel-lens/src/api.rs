@@ -801,15 +801,27 @@ async fn list_pending_releases(
         }))));
     }
 
-    let releases = state
-        .storage
-        .list_pending_releases()
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-            "error": "Failed to list pending releases"
-        }))))?
-        .into_iter()
-        .map(|r| r.with_defaults())
-        .collect();
+    // Use DocumentStore if available (CRDT path)
+    let releases: Vec<Release> = if let Some(ref doc_store) = state.doc_store {
+        let doc_store = doc_store.read().await;
+        doc_store.list::<Release>()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.status == ReleaseStatus::Pending)
+            .map(|r| r.with_defaults())
+            .collect()
+    } else {
+        // Fallback to legacy storage
+        state
+            .storage
+            .list_pending_releases()
+            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                "error": "Failed to list pending releases"
+            }))))?
+            .into_iter()
+            .map(|r| r.with_defaults())
+            .collect()
+    };
 
     Ok(Json(releases))
 }
