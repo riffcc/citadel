@@ -1,22 +1,111 @@
 //! lens-admin CLI tool
 //!
-//! Manages users, uploaders, and admins for the Lens node.
+//! Manages Lens nodes locally (via Unix socket) or remotely (via HTTP API).
 //!
-//! Usage:
-//!   lens-admin add-admin <public_key>
-//!   lens-admin remove-admin <public_key>
-//!   lens-admin grant-upload <public_key>
-//!   lens-admin revoke-upload <public_key>
-//!   lens-admin list-admins
-//!   lens-admin is-admin <public_key>
+//! # Configuration
+//!
+//! On first run of `lens-admin init`, creates ~/.citadel/ with:
+//! - auth.key: Ed25519 keypair for signing API requests
+//!
+//! # Usage
+//!
+//! Local (Unix socket):
 //!   lens-admin ping
+//!   lens-admin add-admin <public_key>
+//!
+//! Remote (HTTP API):
+//!   lens-admin --url https://lens.example.com ping
+//!   lens-admin --url https://lens.example.com upload ./folder/
+//!
+//! Setup:
+//!   lens-admin init     # Generate keypair
+//!   lens-admin show     # Show configuration
 
+use clap::{Parser, Subcommand};
+use ed25519_dalek::{SigningKey, Signer, SECRET_KEY_LENGTH};
 use serde::{Deserialize, Serialize};
+use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
-/// Admin command sent over the socket.
+/// Lens node administration tool
+#[derive(Parser)]
+#[command(name = "lens-admin")]
+#[command(about = "Manage Lens nodes locally or remotely")]
+struct Cli {
+    /// Remote Lens API URL (if not provided, uses local Unix socket)
+    #[arg(long, short, env = "LENS_URL")]
+    url: Option<String>,
+
+    /// Archivist base URL for uploads (e.g. https://archivist.example.com)
+    #[arg(long, env = "ARCHIVIST_URL")]
+    archivist: Option<String>,
+
+    /// Path to config directory (default: ~/.citadel)
+    #[arg(long, env = "CITADEL_CONFIG")]
+    config: Option<PathBuf>,
+
+    /// Path to lens-node data directory (for local socket mode)
+    #[arg(short = 'd', long, env = "LENS_DATA_DIR")]
+    data_dir: Option<PathBuf>,
+
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Initialize configuration (generate keypair)
+    Init,
+
+    /// Show configuration (public key, API URL, etc.)
+    Show,
+
+    /// Check if node is running
+    Ping,
+
+    /// Add an admin by public key
+    AddAdmin {
+        /// Hex-encoded public key
+        public_key: String,
+    },
+
+    /// Remove an admin by public key
+    RemoveAdmin {
+        /// Hex-encoded public key
+        public_key: String,
+    },
+
+    /// Grant upload permission to a public key
+    GrantUpload {
+        /// Hex-encoded public key
+        public_key: String,
+    },
+
+    /// Revoke upload permission from a public key
+    RevokeUpload {
+        /// Hex-encoded public key
+        public_key: String,
+    },
+
+    /// List all admins
+    ListAdmins,
+
+    /// Check if a public key is an admin
+    IsAdmin {
+        /// Hex-encoded public key
+        public_key: String,
+    },
+
+    /// Upload a file or folder to the node
+    Upload {
+        /// Path to file or folder to upload
+        path: PathBuf,
+    },
+}
+
+/// Admin command sent over the socket (legacy local mode)
 #[derive(Debug, Serialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 enum AdminCommand {
@@ -29,7 +118,7 @@ enum AdminCommand {
     Ping,
 }
 
-/// Response from admin command.
+/// Response from admin command
 #[derive(Debug, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 enum AdminResponse {
@@ -40,30 +129,142 @@ enum AdminResponse {
     Pong,
 }
 
-fn print_usage() {
-    eprintln!("lens-admin - Manage Lens node users and permissions");
-    eprintln!();
-    eprintln!("Usage:");
-    eprintln!("  lens-admin add-admin <public_key>      Add an admin");
-    eprintln!("  lens-admin remove-admin <public_key>   Remove an admin");
-    eprintln!("  lens-admin grant-upload <public_key>   Grant upload permission");
-    eprintln!("  lens-admin revoke-upload <public_key>  Revoke upload permission");
-    eprintln!("  lens-admin list-admins                 List all admins");
-    eprintln!("  lens-admin is-admin <public_key>       Check if key is admin");
-    eprintln!("  lens-admin ping                        Check if daemon is running");
-    eprintln!();
-    eprintln!("Environment:");
-    eprintln!("  LENS_SOCKET  Path to admin socket (default: ./lens-data/admin.sock)");
+/// Get the config directory path
+fn get_config_dir(cli_config: Option<&PathBuf>) -> PathBuf {
+    if let Some(config) = cli_config {
+        config.clone()
+    } else {
+        dirs::home_dir()
+            .expect("Could not find home directory")
+            .join(".citadel")
+    }
 }
 
-fn get_socket_path() -> PathBuf {
-    std::env::var("LENS_SOCKET")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("./lens-data/admin.sock"))
+/// Get the keypair file path
+fn get_keypair_path(config_dir: &PathBuf) -> PathBuf {
+    config_dir.join("auth.key")
 }
 
-fn send_command(cmd: AdminCommand) -> Result<AdminResponse, String> {
-    let socket_path = get_socket_path();
+/// Load or generate keypair
+fn load_keypair(config_dir: &PathBuf) -> Result<SigningKey, String> {
+    let keypair_path = get_keypair_path(config_dir);
+
+    if keypair_path.exists() {
+        let key_bytes = fs::read(&keypair_path)
+            .map_err(|e| format!("Failed to read keypair: {}", e))?;
+
+        if key_bytes.len() != SECRET_KEY_LENGTH {
+            return Err(format!(
+                "Invalid keypair file: expected {} bytes, got {}",
+                SECRET_KEY_LENGTH,
+                key_bytes.len()
+            ));
+        }
+
+        let mut secret_bytes = [0u8; SECRET_KEY_LENGTH];
+        secret_bytes.copy_from_slice(&key_bytes);
+        Ok(SigningKey::from_bytes(&secret_bytes))
+    } else {
+        Err(format!(
+            "No keypair found at {:?}\nRun 'lens-admin init' first",
+            keypair_path
+        ))
+    }
+}
+
+/// Initialize configuration
+fn cmd_init(config_dir: &PathBuf) -> Result<(), String> {
+    // Create config directory
+    fs::create_dir_all(config_dir)
+        .map_err(|e| format!("Failed to create config directory: {}", e))?;
+
+    let keypair_path = get_keypair_path(config_dir);
+
+    if keypair_path.exists() {
+        return Err(format!(
+            "Keypair already exists at {:?}\nDelete it first if you want to regenerate",
+            keypair_path
+        ));
+    }
+
+    // Generate new keypair
+    let mut csprng = rand::rngs::OsRng;
+    let signing_key = SigningKey::generate(&mut csprng);
+    let verifying_key = signing_key.verifying_key();
+
+    // Save private key
+    fs::write(&keypair_path, signing_key.to_bytes())
+        .map_err(|e| format!("Failed to write keypair: {}", e))?;
+
+    // Set restrictive permissions (Unix only)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        fs::set_permissions(&keypair_path, perms)
+            .map_err(|e| format!("Failed to set keypair permissions: {}", e))?;
+    }
+
+    println!("Initialized lens-admin configuration");
+    println!();
+    println!("Config directory: {:?}", config_dir);
+    println!("Keypair file:     {:?}", keypair_path);
+    println!();
+    println!("Your public key:");
+    println!("  ed25519p/{}", hex::encode(verifying_key.to_bytes()));
+    println!();
+    println!("Add this key as an admin on your Lens node to authenticate.");
+
+    Ok(())
+}
+
+/// Show configuration
+fn cmd_show(config_dir: &PathBuf, api_url: Option<&String>, data_dir: Option<&PathBuf>) -> Result<(), String> {
+    println!("lens-admin configuration");
+    println!("========================");
+    println!();
+    println!("Config directory: {:?}", config_dir);
+
+    let keypair_path = get_keypair_path(config_dir);
+    if keypair_path.exists() {
+        let signing_key = load_keypair(config_dir)?;
+        let verifying_key = signing_key.verifying_key();
+        println!("Keypair file:     {:?}", keypair_path);
+        println!();
+        println!("Public key:");
+        println!("  ed25519p/{}", hex::encode(verifying_key.to_bytes()));
+    } else {
+        println!("Keypair file:     (not initialized)");
+        println!();
+        println!("Run 'lens-admin init' to generate a keypair.");
+    }
+
+    println!();
+    if let Some(url) = api_url {
+        println!("API URL: {}", url);
+    } else {
+        let socket_path = get_socket_path(data_dir);
+        println!("Mode: Local (Unix socket)");
+        println!("Socket: {:?}", socket_path);
+    }
+
+    Ok(())
+}
+
+fn get_socket_path(data_dir: Option<&PathBuf>) -> PathBuf {
+    // Priority: LENS_SOCKET env > --data-dir flag > default
+    if let Ok(socket) = std::env::var("LENS_SOCKET") {
+        return PathBuf::from(socket);
+    }
+    if let Some(dir) = data_dir {
+        return dir.join("admin.sock");
+    }
+    PathBuf::from("./lens-data/admin.sock")
+}
+
+/// Send command via local Unix socket
+fn send_socket_command(cmd: AdminCommand, data_dir: Option<&PathBuf>) -> Result<AdminResponse, String> {
+    let socket_path = get_socket_path(data_dir);
 
     let mut stream = UnixStream::connect(&socket_path).map_err(|e| {
         format!(
@@ -87,104 +288,355 @@ fn send_command(cmd: AdminCommand) -> Result<AdminResponse, String> {
     serde_json::from_str(&response_line).map_err(|e| format!("Invalid response: {}", e))
 }
 
-fn main() {
-    let args: Vec<String> = std::env::args().collect();
+/// Create signed request headers for upload API
+fn create_auth_headers(signing_key: &SigningKey) -> Result<Vec<(String, String)>, String> {
+    let timestamp = chrono::Utc::now().timestamp().to_string();
+    let verifying_key = signing_key.verifying_key();
+    let public_key_hex = format!("ed25519p/{}", hex::encode(verifying_key.to_bytes()));
 
-    if args.len() < 2 {
-        print_usage();
-        std::process::exit(1);
-    }
+    // Sign "{timestamp}:UPLOAD" as expected by validate_upload endpoint
+    let message = format!("{}:UPLOAD", timestamp);
+    let signature = signing_key.sign(message.as_bytes());
+    let signature_hex = hex::encode(signature.to_bytes());
 
-    let cmd = match args[1].as_str() {
-        "add-admin" => {
-            if args.len() < 3 {
-                eprintln!("Error: add-admin requires a public_key argument");
-                std::process::exit(1);
-            }
-            AdminCommand::AddAdmin {
-                public_key: args[2].clone(),
-            }
-        }
-        "remove-admin" => {
-            if args.len() < 3 {
-                eprintln!("Error: remove-admin requires a public_key argument");
-                std::process::exit(1);
-            }
-            AdminCommand::RemoveAdmin {
-                public_key: args[2].clone(),
-            }
-        }
-        "grant-upload" => {
-            if args.len() < 3 {
-                eprintln!("Error: grant-upload requires a public_key argument");
-                std::process::exit(1);
-            }
-            AdminCommand::GrantUpload {
-                public_key: args[2].clone(),
-            }
-        }
-        "revoke-upload" => {
-            if args.len() < 3 {
-                eprintln!("Error: revoke-upload requires a public_key argument");
-                std::process::exit(1);
-            }
-            AdminCommand::RevokeUpload {
-                public_key: args[2].clone(),
-            }
-        }
-        "list-admins" => AdminCommand::ListAdmins,
-        "is-admin" => {
-            if args.len() < 3 {
-                eprintln!("Error: is-admin requires a public_key argument");
-                std::process::exit(1);
-            }
-            AdminCommand::IsAdmin {
-                public_key: args[2].clone(),
-            }
-        }
-        "ping" => AdminCommand::Ping,
-        "-h" | "--help" | "help" => {
-            print_usage();
-            std::process::exit(0);
-        }
-        other => {
-            eprintln!("Unknown command: {}", other);
-            print_usage();
-            std::process::exit(1);
-        }
+    Ok(vec![
+        ("X-Pubkey".to_string(), public_key_hex),
+        ("X-Timestamp".to_string(), timestamp),
+        ("X-Signature".to_string(), signature_hex),
+    ])
+}
+
+/// Send command via HTTP API
+async fn send_http_command(
+    client: &reqwest::Client,
+    base_url: &str,
+    signing_key: &SigningKey,
+    cmd: AdminCommand,
+) -> Result<AdminResponse, String> {
+    let headers = create_auth_headers(signing_key)?;
+
+    let endpoint = match &cmd {
+        AdminCommand::Ping => "/api/admin/ping",
+        AdminCommand::AddAdmin { .. } => "/api/admin/add-admin",
+        AdminCommand::RemoveAdmin { .. } => "/api/admin/remove-admin",
+        AdminCommand::GrantUpload { .. } => "/api/admin/grant-upload",
+        AdminCommand::RevokeUpload { .. } => "/api/admin/revoke-upload",
+        AdminCommand::ListAdmins => "/api/admin/list-admins",
+        AdminCommand::IsAdmin { .. } => "/api/admin/is-admin",
     };
 
-    match send_command(cmd) {
-        Ok(response) => match response {
-            AdminResponse::Ok { message } => {
-                println!("{}", message);
+    let url = format!("{}{}", base_url.trim_end_matches('/'), endpoint);
+
+    let mut req = client.post(&url);
+    for (key, value) in headers {
+        req = req.header(&key, &value);
+    }
+
+    let response = req
+        .json(&cmd)
+        .send()
+        .await
+        .map_err(|e| format!("HTTP request failed: {}", e))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("API error ({}): {}", status, body));
+    }
+
+    response
+        .json()
+        .await
+        .map_err(|e| format!("Invalid response: {}", e))
+}
+
+/// Upload a file or folder to Archivist
+async fn cmd_upload(
+    client: &reqwest::Client,
+    archivist_url: &str,
+    signing_key: &SigningKey,
+    path: &PathBuf,
+) -> Result<(), String> {
+    if !path.exists() {
+        return Err(format!("Path does not exist: {:?}", path));
+    }
+
+    let headers = create_auth_headers(signing_key)?;
+
+    if path.is_file() {
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file");
+
+        let cid = upload_file(client, archivist_url, &headers, path).await?;
+        println!("Uploaded: {}", file_name);
+        println!("CID: {}", cid);
+        Ok(())
+    } else if path.is_dir() {
+        upload_directory(client, archivist_url, &headers, path).await
+    } else {
+        Err(format!("Path is neither a file nor directory: {:?}", path))
+    }
+}
+
+/// Upload a single file to Archivist
+async fn upload_file(
+    client: &reqwest::Client,
+    archivist_url: &str,
+    headers: &[(String, String)],
+    path: &PathBuf,
+) -> Result<String, String> {
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("file")
+        .to_string();
+
+    let file_bytes = fs::read(path)
+        .map_err(|e| format!("Failed to read file: {}", e))?;
+
+    // Guess content type from extension
+    let content_type = match path.extension().and_then(|e| e.to_str()) {
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("mp4") => "video/mp4",
+        Some("webm") => "video/webm",
+        Some("mp3") => "audio/mpeg",
+        Some("flac") => "audio/flac",
+        Some("ogg") => "audio/ogg",
+        Some("pdf") => "application/pdf",
+        Some("json") => "application/json",
+        Some("txt") => "text/plain",
+        Some("html") => "text/html",
+        Some("css") => "text/css",
+        Some("js") => "application/javascript",
+        _ => "application/octet-stream",
+    };
+
+    // Archivist upload endpoint: POST /api/archivist/v1/data
+    let url = format!("{}/api/archivist/v1/data", archivist_url.trim_end_matches('/'));
+
+    let mut req = client.post(&url);
+
+    // Add auth headers (X-Pubkey, X-Signature, X-Timestamp)
+    for (key, value) in headers {
+        req = req.header(key, value);
+    }
+
+    // Add content headers
+    req = req
+        .header("content-type", content_type)
+        .header("content-disposition", format!("attachment; filename=\"{}\"", file_name));
+
+    let response = req
+        .body(file_bytes)
+        .send()
+        .await
+        .map_err(|e| format!("Upload failed: {}", e))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("Upload failed ({}): {}", status, body));
+    }
+
+    // Archivist returns CID as plain text
+    let cid = response
+        .text()
+        .await
+        .map_err(|e| format!("Invalid response: {}", e))?
+        .trim()
+        .to_string();
+
+    Ok(cid)
+}
+
+/// Upload a directory recursively
+async fn upload_directory(
+    client: &reqwest::Client,
+    archivist_url: &str,
+    headers: &[(String, String)],
+    path: &PathBuf,
+) -> Result<(), String> {
+    let entries: Vec<_> = walkdir(path)?;
+    let file_count = entries.iter().filter(|e| e.is_file()).count();
+
+    println!("Uploading {} files from {:?}", file_count, path);
+    println!();
+
+    let mut success_count = 0;
+    let mut fail_count = 0;
+
+    for entry in entries {
+        if entry.is_file() {
+            let relative = entry.strip_prefix(path).unwrap_or(&entry);
+            print!("  {} ... ", relative.display());
+            std::io::stdout().flush().ok();
+
+            match upload_file(client, archivist_url, headers, &entry).await {
+                Ok(cid) => {
+                    println!("{}", cid);
+                    success_count += 1;
+                }
+                Err(e) => {
+                    println!("FAILED: {}", e);
+                    fail_count += 1;
+                }
             }
-            AdminResponse::Error { error } => {
-                eprintln!("Error: {}", error);
+        }
+    }
+
+    println!();
+    println!("Done: {} succeeded, {} failed", success_count, fail_count);
+
+    if fail_count > 0 {
+        Err(format!("{} uploads failed", fail_count))
+    } else {
+        Ok(())
+    }
+}
+
+/// Walk directory recursively
+fn walkdir(path: &PathBuf) -> Result<Vec<PathBuf>, String> {
+    let mut entries = Vec::new();
+
+    fn walk_recursive(dir: &PathBuf, entries: &mut Vec<PathBuf>) -> Result<(), String> {
+        let read_dir = fs::read_dir(dir)
+            .map_err(|e| format!("Failed to read directory {:?}: {}", dir, e))?;
+
+        for entry in read_dir {
+            let entry = entry.map_err(|e| format!("Failed to read entry: {}", e))?;
+            let path = entry.path();
+
+            if path.is_dir() {
+                walk_recursive(&path, entries)?;
+            } else {
+                entries.push(path);
+            }
+        }
+        Ok(())
+    }
+
+    walk_recursive(path, &mut entries)?;
+    Ok(entries)
+}
+
+/// Handle admin response
+fn handle_response(response: AdminResponse) -> Result<(), String> {
+    match response {
+        AdminResponse::Ok { message } => {
+            println!("{}", message);
+            Ok(())
+        }
+        AdminResponse::Error { error } => Err(error),
+        AdminResponse::List { items } => {
+            if items.is_empty() {
+                println!("(none)");
+            } else {
+                for item in items {
+                    println!("{}", item);
+                }
+            }
+            Ok(())
+        }
+        AdminResponse::Bool { value } => {
+            println!("{}", value);
+            if !value {
                 std::process::exit(1);
             }
-            AdminResponse::List { items } => {
-                if items.is_empty() {
-                    println!("(none)");
-                } else {
-                    for item in items {
-                        println!("{}", item);
+            Ok(())
+        }
+        AdminResponse::Pong => {
+            println!("pong - lens-node is running");
+            Ok(())
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    if let Err(e) = run().await {
+        eprintln!("Error: {}", e);
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> Result<(), String> {
+    let cli = Cli::parse();
+    let config_dir = get_config_dir(cli.config.as_ref());
+    let data_dir = cli.data_dir.as_ref();
+
+    match cli.command {
+        Commands::Init => cmd_init(&config_dir),
+        Commands::Show => cmd_show(&config_dir, cli.url.as_ref(), data_dir),
+
+        // Upload goes directly to Archivist (auth validated by Lens via forward_auth)
+        Commands::Upload { path } => {
+            let archivist_url = cli.archivist.as_ref()
+                .ok_or("Upload requires --archivist <URL> for the Archivist endpoint")?;
+
+            let signing_key = load_keypair(&config_dir)?;
+            let client = reqwest::Client::new();
+            cmd_upload(&client, archivist_url, &signing_key, &path).await
+        }
+
+        // Admin commands go to Lens
+        cmd => {
+            if let Some(ref url) = cli.url {
+                // Remote HTTP mode
+                let signing_key = load_keypair(&config_dir)?;
+                let client = reqwest::Client::new();
+
+                match cmd {
+                    Commands::Ping => {
+                        let resp = send_http_command(&client, url, &signing_key, AdminCommand::Ping).await?;
+                        handle_response(resp)
                     }
+                    Commands::AddAdmin { public_key } => {
+                        let resp = send_http_command(&client, url, &signing_key, AdminCommand::AddAdmin { public_key }).await?;
+                        handle_response(resp)
+                    }
+                    Commands::RemoveAdmin { public_key } => {
+                        let resp = send_http_command(&client, url, &signing_key, AdminCommand::RemoveAdmin { public_key }).await?;
+                        handle_response(resp)
+                    }
+                    Commands::GrantUpload { public_key } => {
+                        let resp = send_http_command(&client, url, &signing_key, AdminCommand::GrantUpload { public_key }).await?;
+                        handle_response(resp)
+                    }
+                    Commands::RevokeUpload { public_key } => {
+                        let resp = send_http_command(&client, url, &signing_key, AdminCommand::RevokeUpload { public_key }).await?;
+                        handle_response(resp)
+                    }
+                    Commands::ListAdmins => {
+                        let resp = send_http_command(&client, url, &signing_key, AdminCommand::ListAdmins).await?;
+                        handle_response(resp)
+                    }
+                    Commands::IsAdmin { public_key } => {
+                        let resp = send_http_command(&client, url, &signing_key, AdminCommand::IsAdmin { public_key }).await?;
+                        handle_response(resp)
+                    }
+                    Commands::Init | Commands::Show | Commands::Upload { .. } => unreachable!(),
                 }
+            } else {
+                // Local socket mode
+                let admin_cmd = match cmd {
+                    Commands::Ping => AdminCommand::Ping,
+                    Commands::AddAdmin { public_key } => AdminCommand::AddAdmin { public_key },
+                    Commands::RemoveAdmin { public_key } => AdminCommand::RemoveAdmin { public_key },
+                    Commands::GrantUpload { public_key } => AdminCommand::GrantUpload { public_key },
+                    Commands::RevokeUpload { public_key } => AdminCommand::RevokeUpload { public_key },
+                    Commands::ListAdmins => AdminCommand::ListAdmins,
+                    Commands::IsAdmin { public_key } => AdminCommand::IsAdmin { public_key },
+                    Commands::Init | Commands::Show | Commands::Upload { .. } => unreachable!(),
+                };
+
+                let response = send_socket_command(admin_cmd, data_dir)?;
+                handle_response(response)
             }
-            AdminResponse::Bool { value } => {
-                println!("{}", value);
-                if !value {
-                    std::process::exit(1);
-                }
-            }
-            AdminResponse::Pong => {
-                println!("pong - lens-node is running");
-            }
-        },
-        Err(e) => {
-            eprintln!("{}", e);
-            std::process::exit(1);
         }
     }
 }
