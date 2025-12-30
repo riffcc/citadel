@@ -619,8 +619,9 @@ impl MeshState {
     pub fn record_latency(&mut self, from_node: &str, to_node: &str, latency_ms: u64) {
         let from_map = self.latency_history
             .entry(from_node.to_string())
-            .or_insert_with(HashMap::new);
+            .or_default();
 
+        #[allow(clippy::unwrap_or_default)]
         let history = from_map
             .entry(to_node.to_string())
             .or_insert_with(LatencyHistory::new);
@@ -1477,7 +1478,7 @@ impl MeshService {
             threshold
         } else {
             // Scale proportionally but require at least 1
-            std::cmp::max(1, (existing_neighbor_count * threshold + 19) / 20)
+            std::cmp::max(1, (existing_neighbor_count * threshold).div_ceil(20))
         };
 
         info!(
@@ -1615,8 +1616,8 @@ impl MeshService {
 
         // XOR the hashes
         let mut xored = [0u8; 32];
-        for i in 0..32 {
-            xored[i] = peer_hash.as_bytes()[i] ^ tx_hash.as_bytes()[i];
+        for (i, entries) in xored.iter_mut().enumerate() {
+            *entries = peer_hash.as_bytes()[i] ^ tx_hash.as_bytes()[i];
         }
 
         // Hash the XOR result for final priority
@@ -3075,7 +3076,7 @@ impl MeshService {
             let state = self.state.read().await;
             if !state.do_not_want.is_empty() {
                 let tombstones: Vec<String> = state.do_not_want.iter()
-                    .map(|h| hex::encode(h))
+                    .map(hex::encode)
                     .collect();
                 let do_not_want_list = serde_json::json!({
                     "type": "do_not_want_list",
@@ -3093,7 +3094,7 @@ impl MeshService {
             let state = self.state.read().await;
             if !state.erasure_confirmed.is_empty() {
                 let confirmed: Vec<String> = state.erasure_confirmed.iter()
-                    .map(|h| hex::encode(h))
+                    .map(hex::encode)
                     .collect();
                 let erasure_msg = serde_json::json!({
                     "type": "erasure_confirmation",
@@ -3111,7 +3112,7 @@ impl MeshService {
             let state = self.state.read().await;
             if !state.bad_bits.is_empty() {
                 let bad_bits_hex: Vec<String> = state.bad_bits.iter()
-                    .map(|h| hex::encode(h))
+                    .map(hex::encode)
                     .collect();
                 let bad_bits_msg = serde_json::json!({
                     "type": "bad_bits",
@@ -3157,7 +3158,7 @@ impl MeshService {
                 "rounds": rounds_json,
                 "slots": slots_json,
                 "height": rounds.last().map(|r| r.round).unwrap_or(0),
-                "total_weight": rounds.iter().map(|r| r.weight() as u64).sum::<u64>(),
+                "total_weight": rounds.iter().map(|r| r.weight()).sum::<u64>(),
             });
             writer.write_all(cvdf_sync.to_string().as_bytes()).await?;
             writer.write_all(b"\n").await?;
@@ -3457,7 +3458,7 @@ impl MeshService {
                                 "rounds": rounds_json,
                                 "slots": slots_json,
                                 "height": rounds.last().map(|r| r.round).unwrap_or(0),
-                                "total_weight": rounds.iter().map(|r| r.weight() as u64).sum::<u64>(),
+                                "total_weight": rounds.iter().map(|r| r.weight()).sum::<u64>(),
                             });
                             let _ = writer.write_all(flood_msg.to_string().as_bytes()).await;
                             let _ = writer.write_all(b"\n").await;
@@ -3482,7 +3483,7 @@ impl MeshService {
                         Ok(FloodMessage::DoNotWantList { peer_id, double_hashes }) => {
                             // Encode double-hashes as hex strings for JSON transport
                             let hashes_hex: Vec<String> = double_hashes.iter()
-                                .map(|h| hex::encode(h))
+                                .map(hex::encode)
                                 .collect();
                             let flood_msg = serde_json::json!({
                                 "type": "do_not_want_list",
@@ -3495,7 +3496,7 @@ impl MeshService {
                         Ok(FloodMessage::ErasureConfirmation { peer_id, tombstones }) => {
                             // GDPR erasure confirmation: peer confirms they deleted these tombstones
                             let tombstones_hex: Vec<String> = tombstones.iter()
-                                .map(|h| hex::encode(h))
+                                .map(hex::encode)
                                 .collect();
                             let flood_msg = serde_json::json!({
                                 "type": "erasure_confirmation",
@@ -3508,7 +3509,7 @@ impl MeshService {
                         Ok(FloodMessage::BadBits { double_hashes }) => {
                             // BadBits: PERMANENT blocklist (DMCA, abuse, illegal content)
                             let hashes_hex: Vec<String> = double_hashes.iter()
-                                .map(|h| hex::encode(h))
+                                .map(hex::encode)
                                 .collect();
                             let flood_msg = serde_json::json!({
                                 "type": "bad_bits",
@@ -4020,7 +4021,7 @@ impl MeshService {
                                             // Record latency in history for map visualization
                                             let self_id = state.self_id.clone();
                                             let short_self = crate::api::short_peer_id(&self_id);
-                                            let short_peer = crate::api::short_peer_id(&peer_id);
+                                            let short_peer = crate::api::short_peer_id(peer_id);
                                             state.record_latency(&short_self, &short_peer, latency_ms);
                                         }
                                     }
@@ -4195,7 +4196,7 @@ impl MeshService {
                 // Check if we should adopt this chain
                 if !parsed_rounds.is_empty() && self.cvdf_should_adopt(&parsed_rounds).await {
                     let their_height = parsed_rounds.last().map(|r| r.round).unwrap_or(0);
-                    let their_weight: u64 = parsed_rounds.iter().map(|r| r.weight() as u64).sum();
+                    let their_weight: u64 = parsed_rounds.iter().map(|r| r.weight()).sum();
                     info!("Adopting heavier CVDF chain from {} (height {}, weight {})",
                         peer_id, their_height, their_weight);
 
@@ -4897,7 +4898,7 @@ mod tests {
 
                 // Scale threshold: at full mesh 11/20, but proportional for smaller meshes
                 // Formula: max(1, ceil(existing_neighbors * 11 / 20))
-                std::cmp::max(1, (existing_neighbors * 11 + 19) / 20)
+                std::cmp::max(1, (existing_neighbors * 11).div_ceil(20))
             }
         }
 
@@ -4982,7 +4983,7 @@ mod tests {
             let required = if node.neighbors_at_join == 0 {
                 0 // Genesis node
             } else {
-                std::cmp::max(1, (node.neighbors_at_join * 11 + 19) / 20)
+                std::cmp::max(1, (node.neighbors_at_join * 11).div_ceil(20))
             };
 
             // Each neighbor at join time sends a validation, so received should equal neighbors_at_join

@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Content type discriminator - extensible enum for all possible content types.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Default, Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContentType {
     // Media - Video
@@ -83,6 +83,7 @@ pub enum ContentType {
     // Other
     Website,
     WebPage,
+    #[default]
     Document,
     Presentation,
     Spreadsheet,
@@ -92,14 +93,8 @@ pub enum ContentType {
     Custom(String),
 }
 
-impl Default for ContentType {
-    fn default() -> Self {
-        Self::Document
-    }
-}
-
 /// Creator/contributor role.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Default, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CreatorRole {
     Author,
@@ -118,17 +113,12 @@ pub enum CreatorRole {
     Narrator,
     Developer,
     Maintainer,
+    #[default]
     Contributor,
     Curator,
     Researcher,
     DataCollector,
     Custom(String),
-}
-
-impl Default for CreatorRole {
-    fn default() -> Self {
-        Self::Contributor
-    }
 }
 
 /// A creator/contributor with their role.

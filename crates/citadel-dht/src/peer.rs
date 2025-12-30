@@ -93,8 +93,8 @@ impl PeerId {
     /// XOR distance (for hash-space routing).
     pub fn xor_distance(&self, other: &PeerId) -> [u8; 32] {
         let mut result = [0u8; 32];
-        for i in 0..32 {
-            result[i] = self.0[i] ^ other.0[i];
+        for (i, res) in result.iter_mut().enumerate() {
+            *res = self.0[i] ^ other.0[i];
         }
         result
     }

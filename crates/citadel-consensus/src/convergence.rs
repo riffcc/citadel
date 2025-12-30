@@ -116,11 +116,7 @@ pub const fn max_toward_n_bindings() -> usize {
 /// - 9 < 11 (threshold)
 /// - Therefore Y cannot occupy N
 pub const fn max_remaining_bindings_after(occupied_bindings: usize) -> usize {
-    if occupied_bindings > MAX_NEIGHBORS {
-        0
-    } else {
-        MAX_NEIGHBORS - occupied_bindings
-    }
+    MAX_NEIGHBORS.saturating_sub(occupied_bindings)
 }
 
 /// Check if exclusivity is violated (impossible if protocol followed).
@@ -207,7 +203,7 @@ mod tests {
     fn exclusivity_math() {
         // If X has 11 bindings, Y can have at most 9
         assert_eq!(max_remaining_bindings_after(11), 9);
-        assert!(9 < FULL_THRESHOLD);
+        const { assert!(9 < FULL_THRESHOLD); }
 
         // If X has 15 bindings, Y can have at most 5
         assert_eq!(max_remaining_bindings_after(15), 5);

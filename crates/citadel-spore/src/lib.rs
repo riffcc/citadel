@@ -75,9 +75,9 @@ impl U256 {
     pub fn from_be_bytes(bytes: &[u8; 32]) -> Self {
         let mut limbs = [0u64; 4];
         // Big endian: bytes[0..8] is most significant
-        for i in 0..4 {
+        for (i, limb) in limbs.iter_mut().enumerate() {
             let offset = (3 - i) * 8;
-            limbs[i] = u64::from_be_bytes([
+            *limb = u64::from_be_bytes([
                 bytes[offset],
                 bytes[offset + 1],
                 bytes[offset + 2],
@@ -112,9 +112,9 @@ impl U256 {
         let mut result = [0u64; 4];
         let mut carry = 0u128;
 
-        for i in 0..4 {
+        for (i, res) in result.iter_mut().enumerate() {
             let sum = self.limbs[i] as u128 + other.limbs[i] as u128 + carry;
-            result[i] = sum as u64;
+            *res = sum as u64;
             carry = sum >> 64;
         }
 
@@ -134,13 +134,13 @@ impl U256 {
         let mut result = [0u64; 4];
         let mut borrow = 0i128;
 
-        for i in 0..4 {
+        for (i, res) in result.iter_mut().enumerate() {
             let diff = self.limbs[i] as i128 - other.limbs[i] as i128 - borrow;
             if diff < 0 {
-                result[i] = (diff + (1i128 << 64)) as u64;
+                *res = (diff + (1i128 << 64)) as u64;
                 borrow = 1;
             } else {
-                result[i] = diff as u64;
+                *res = diff as u64;
                 borrow = 0;
             }
         }

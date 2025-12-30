@@ -688,7 +688,7 @@ mod tests {
     fn traffic_simulation_creates_packets() {
         let mut sim = TrafficSimulation::new(100);
         sim.spawn_unicast(0.5);
-        assert!(sim.packets.len() > 0);
+        assert!(!sim.packets.is_empty());
     }
 
     #[test]
@@ -704,6 +704,6 @@ mod tests {
 
         // Step forward
         sim.update(0.5);
-        assert!(sim.packets.len() > 0);
+        assert!(!sim.packets.is_empty());
     }
 }

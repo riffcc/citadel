@@ -206,10 +206,10 @@ impl TestNetwork {
         // Get bootstrap's chain and slots
         let bootstrap_rounds = bootstrap.rounds().to_vec();
         let bootstrap_slots: Vec<(u64, [u8; 32])> = self.nodes.iter()
-            .filter_map(|n| {
+            .map(|n| {
                 let slot = n.id as u64;
                 let pubkey = n.signing_key.verifying_key().to_bytes();
-                Some((slot, pubkey))
+                (slot, pubkey)
             })
             .collect();
 

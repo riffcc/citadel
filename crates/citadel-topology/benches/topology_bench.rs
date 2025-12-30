@@ -47,7 +47,7 @@ fn bench_coord_to_spiral(c: &mut Criterion) {
 
     for coord in coords {
         let shell = coord.z.unsigned_abs()
-            .max(coord.hex_distance(&HexCoord::new(0, 0, coord.z)) as u64);
+            .max(coord.hex_distance(&HexCoord::new(0, 0, coord.z)));
         group.throughput(Throughput::Elements(1));
         group.bench_with_input(
             BenchmarkId::new("shell", shell),
@@ -90,7 +90,7 @@ fn bench_neighbors(c: &mut Criterion) {
 
     for coord in coords {
         let shell = coord.z.unsigned_abs()
-            .max(coord.hex_distance(&HexCoord::new(0, 0, coord.z)) as u64);
+            .max(coord.hex_distance(&HexCoord::new(0, 0, coord.z)));
         group.throughput(Throughput::Elements(20)); // 20 neighbors
         group.bench_with_input(
             BenchmarkId::new("shell", shell),
@@ -194,7 +194,7 @@ fn bench_routing_simulation(c: &mut Criterion) {
 fn hex_distance_3d(a: &HexCoord, b: &HexCoord) -> u64 {
     let planar_a = HexCoord::new(a.q, a.r, 0);
     let planar_b = HexCoord::new(b.q, b.r, 0);
-    let planar_dist = planar_a.hex_distance(&planar_b) as u64;
+    let planar_dist = planar_a.hex_distance(&planar_b);
     let z_dist = (a.z - b.z).unsigned_abs();
     planar_dist.max(z_dist)
 }
