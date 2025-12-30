@@ -136,11 +136,11 @@ pub fn check_exclusivity_invariant(
     }
 
     // Checks exclusivity without allocation
-    let thresh_filter = |(_, b)| *b >= FULL_THRESHOLD
+    let thresh_filter = |(_, b): &&(_, usize)| *b >= FULL_THRESHOLD;
     let second_thresh = bindings_by_node
         .iter()
         .filter(thresh_filter)
-        .nth(1)
+        .nth(1);
 
     if second_thresh.is_some() {
         return Err(ExclusivityViolation::MultipleOccupants {
