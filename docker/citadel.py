@@ -253,11 +253,13 @@ defaults
 
 frontend http_front
     bind *:8085
+    option http-server-close
     default_backend citadel_nodes
 
 backend citadel_nodes
     balance roundrobin
     option httpchk GET /health
+    timeout tunnel 3600s
 {servers}
 
 frontend stats

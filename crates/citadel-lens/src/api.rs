@@ -7,6 +7,7 @@ use citadel_crdt::ContentId;
 use citadel_docs::Document;
 use crate::ws::ws_mesh_handler;
 use crate::ws_admin;
+use crate::admin_socket;
 use axum::{
     body::Bytes,
     extract::{Path, Query, State},
@@ -204,6 +205,19 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/import", post(import_releases))
         .route("/api/v1/export", get(export_releases))
         .route("/api/v1/admin/releases", delete(delete_all_releases))
+        // Admin API (for lens-admin CLI with --url)
+        .route("/api/admin/ping", post(admin_ping))
+        .route("/api/admin/add-admin", post(admin_add_admin))
+        .route("/api/admin/remove-admin", post(admin_remove_admin))
+        .route("/api/admin/grant-upload", post(admin_grant_upload))
+        .route("/api/admin/revoke-upload", post(admin_revoke_upload))
+        .route("/api/admin/list-admins", post(admin_list_admins))
+        .route("/api/admin/is-admin", post(admin_is_admin))
+        .route("/api/admin/start-profiling", post(admin_start_profiling))
+        .route("/api/admin/stop-profiling", post(admin_stop_profiling))
+        .route("/api/admin/cpu-profile", post(admin_cpu_profile))
+        .route("/api/admin/mem-profile", post(admin_mem_profile))
+        .route("/api/admin/mesh-stats", post(admin_mesh_stats))
         .layer(cors)
         .with_state(state)
 }
@@ -1834,10 +1848,7 @@ async fn get_network_map(
         label: short_self_id.clone(),  // Use peer ID as label, not IP
         slot: slot.clone(),
         peer_type: "server".to_string(),
-        last_heartbeat: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs(),
+        last_heartbeat: 0,  // We ARE ourselves - always fresh
         capabilities: vec!["storage".to_string(), "relay".to_string(), "api".to_string()],
         online: true,
     };
@@ -2411,6 +2422,305 @@ async fn delete_all_releases(
             tracing::error!("Failed to delete releases: {}", e);
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
+    }
+}
+
+// ============================================================================
+// ADMIN HTTP API (for lens-admin CLI with --url)
+// ============================================================================
+
+/// Admin API response format (matches socket responses)
+#[derive(Debug, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum AdminApiResponse {
+    Ok { message: String },
+    Error { error: String },
+    List { items: Vec<String> },
+    Bool { value: bool },
+    Pong,
+    Profile { data: serde_json::Value },
+}
+
+/// Request body for add/remove admin
+#[derive(Debug, Deserialize)]
+struct AdminKeyRequest {
+    public_key: String,
+}
+
+/// Helper to verify admin auth from headers
+fn verify_admin_auth(
+    headers: &HeaderMap,
+    storage: &crate::storage::Storage,
+) -> Result<String, AdminApiResponse> {
+    let pubkey = headers
+        .get("X-Pubkey")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| AdminApiResponse::Error {
+            error: "Missing X-Pubkey header".to_string(),
+        })?;
+
+    let timestamp = headers
+        .get("X-Timestamp")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| AdminApiResponse::Error {
+            error: "Missing X-Timestamp header".to_string(),
+        })?;
+
+    let signature = headers
+        .get("X-Signature")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| AdminApiResponse::Error {
+            error: "Missing X-Signature header".to_string(),
+        })?;
+
+    // Verify signature (CLI signs "{timestamp}:UPLOAD" for admin commands)
+    let message = format!("{}:UPLOAD", timestamp);
+    verify_signature(pubkey, message.as_bytes(), signature).map_err(|e| AdminApiResponse::Error {
+        error: e,
+    })?;
+
+    // Check admin status
+    if !storage.is_admin(pubkey).unwrap_or(false) {
+        return Err(AdminApiResponse::Error {
+            error: format!("Public key {} is not an admin", pubkey),
+        });
+    }
+
+    Ok(pubkey.to_string())
+}
+
+/// POST /api/admin/ping
+async fn admin_ping(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<AdminApiResponse>, (StatusCode, Json<AdminApiResponse>)> {
+    let state = state.read().await;
+    verify_admin_auth(&headers, &state.storage).map_err(|e| (StatusCode::UNAUTHORIZED, Json(e)))?;
+    Ok(Json(AdminApiResponse::Pong))
+}
+
+/// POST /api/admin/add-admin
+async fn admin_add_admin(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<AdminKeyRequest>,
+) -> Result<Json<AdminApiResponse>, (StatusCode, Json<AdminApiResponse>)> {
+    let state = state.read().await;
+    verify_admin_auth(&headers, &state.storage).map_err(|e| (StatusCode::UNAUTHORIZED, Json(e)))?;
+
+    match state.storage.set_admin(&req.public_key, true) {
+        Ok(()) => {
+            tracing::info!("Added admin: {}", req.public_key);
+            Ok(Json(AdminApiResponse::Ok {
+                message: format!("Added admin: {}", req.public_key),
+            }))
+        }
+        Err(e) => Ok(Json(AdminApiResponse::Error {
+            error: e.to_string(),
+        })),
+    }
+}
+
+/// POST /api/admin/remove-admin
+async fn admin_remove_admin(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<AdminKeyRequest>,
+) -> Result<Json<AdminApiResponse>, (StatusCode, Json<AdminApiResponse>)> {
+    let state = state.read().await;
+    verify_admin_auth(&headers, &state.storage).map_err(|e| (StatusCode::UNAUTHORIZED, Json(e)))?;
+
+    match state.storage.set_admin(&req.public_key, false) {
+        Ok(()) => {
+            tracing::info!("Removed admin: {}", req.public_key);
+            Ok(Json(AdminApiResponse::Ok {
+                message: format!("Removed admin: {}", req.public_key),
+            }))
+        }
+        Err(e) => Ok(Json(AdminApiResponse::Error {
+            error: e.to_string(),
+        })),
+    }
+}
+
+/// POST /api/admin/grant-upload
+async fn admin_grant_upload(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<AdminKeyRequest>,
+) -> Result<Json<AdminApiResponse>, (StatusCode, Json<AdminApiResponse>)> {
+    let state = state.read().await;
+    verify_admin_auth(&headers, &state.storage).map_err(|e| (StatusCode::UNAUTHORIZED, Json(e)))?;
+
+    match state.storage.grant_permission(&req.public_key, "upload") {
+        Ok(()) => {
+            tracing::info!("Granted upload to: {}", req.public_key);
+            Ok(Json(AdminApiResponse::Ok {
+                message: format!("Granted upload permission to: {}", req.public_key),
+            }))
+        }
+        Err(e) => Ok(Json(AdminApiResponse::Error {
+            error: e.to_string(),
+        })),
+    }
+}
+
+/// POST /api/admin/revoke-upload
+async fn admin_revoke_upload(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<AdminKeyRequest>,
+) -> Result<Json<AdminApiResponse>, (StatusCode, Json<AdminApiResponse>)> {
+    let state = state.read().await;
+    verify_admin_auth(&headers, &state.storage).map_err(|e| (StatusCode::UNAUTHORIZED, Json(e)))?;
+
+    match state.storage.revoke_permission(&req.public_key, "upload") {
+        Ok(()) => {
+            tracing::info!("Revoked upload from: {}", req.public_key);
+            Ok(Json(AdminApiResponse::Ok {
+                message: format!("Revoked upload permission from: {}", req.public_key),
+            }))
+        }
+        Err(e) => Ok(Json(AdminApiResponse::Error {
+            error: e.to_string(),
+        })),
+    }
+}
+
+/// POST /api/admin/list-admins
+async fn admin_list_admins(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<AdminApiResponse>, (StatusCode, Json<AdminApiResponse>)> {
+    let state = state.read().await;
+    verify_admin_auth(&headers, &state.storage).map_err(|e| (StatusCode::UNAUTHORIZED, Json(e)))?;
+
+    match state.storage.list_admins() {
+        Ok(admins) => Ok(Json(AdminApiResponse::List { items: admins })),
+        Err(e) => Ok(Json(AdminApiResponse::Error {
+            error: e.to_string(),
+        })),
+    }
+}
+
+/// POST /api/admin/is-admin
+async fn admin_is_admin(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<AdminKeyRequest>,
+) -> Result<Json<AdminApiResponse>, (StatusCode, Json<AdminApiResponse>)> {
+    let state = state.read().await;
+    verify_admin_auth(&headers, &state.storage).map_err(|e| (StatusCode::UNAUTHORIZED, Json(e)))?;
+
+    match state.storage.is_admin(&req.public_key) {
+        Ok(is_admin) => Ok(Json(AdminApiResponse::Bool { value: is_admin })),
+        Err(e) => Ok(Json(AdminApiResponse::Error {
+            error: e.to_string(),
+        })),
+    }
+}
+
+/// POST /api/admin/start-profiling
+async fn admin_start_profiling(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<AdminApiResponse>, (StatusCode, Json<AdminApiResponse>)> {
+    let state = state.read().await;
+    verify_admin_auth(&headers, &state.storage).map_err(|e| (StatusCode::UNAUTHORIZED, Json(e)))?;
+
+    tracing::info!("Profiling mode enabled via HTTP");
+    Ok(Json(AdminApiResponse::Ok {
+        message: "Profiling enabled. cpu-profile will auto-collect when called.".to_string(),
+    }))
+}
+
+/// POST /api/admin/stop-profiling
+async fn admin_stop_profiling(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<AdminApiResponse>, (StatusCode, Json<AdminApiResponse>)> {
+    let state = state.read().await;
+    verify_admin_auth(&headers, &state.storage).map_err(|e| (StatusCode::UNAUTHORIZED, Json(e)))?;
+
+    tracing::info!("Profiling stopped via HTTP");
+    Ok(Json(AdminApiResponse::Ok {
+        message: "Profiling stopped.".to_string(),
+    }))
+}
+
+/// POST /api/admin/cpu-profile
+async fn admin_cpu_profile(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<AdminApiResponse>, (StatusCode, Json<AdminApiResponse>)> {
+    let state = state.read().await;
+    verify_admin_auth(&headers, &state.storage).map_err(|e| (StatusCode::UNAUTHORIZED, Json(e)))?;
+
+    tracing::info!("CPU profiling: collecting for 5 seconds via HTTP...");
+
+    // Run profiling in a blocking task since it uses std::thread::sleep
+    let profile_result = tokio::task::spawn_blocking(|| {
+        admin_socket::collect_cpu_profile(5)
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(AdminApiResponse::Error {
+                error: format!("Task join error: {}", e),
+            }),
+        )
+    })?;
+
+    match profile_result {
+        Ok(data) => Ok(Json(AdminApiResponse::Profile { data })),
+        Err(e) => Ok(Json(AdminApiResponse::Error {
+            error: e.to_string(),
+        })),
+    }
+}
+
+/// POST /api/admin/mem-profile
+async fn admin_mem_profile(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<AdminApiResponse>, (StatusCode, Json<AdminApiResponse>)> {
+    let state = state.read().await;
+    verify_admin_auth(&headers, &state.storage).map_err(|e| (StatusCode::UNAUTHORIZED, Json(e)))?;
+
+    let mem_data = admin_socket::get_memory_stats();
+    Ok(Json(AdminApiResponse::Profile { data: mem_data }))
+}
+
+/// POST /api/admin/mesh-stats
+async fn admin_mesh_stats(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<AdminApiResponse>, (StatusCode, Json<AdminApiResponse>)> {
+    let state = state.read().await;
+    verify_admin_auth(&headers, &state.storage).map_err(|e| (StatusCode::UNAUTHORIZED, Json(e)))?;
+
+    // Get mesh state if available
+    if let Some(ref mesh_state) = state.mesh_state {
+        let mesh = mesh_state.read().await;
+        let (synced, total) = mesh.sync_status();
+        let ready = mesh.is_content_ready();
+
+        let stats = serde_json::json!({
+            "synced_peers": synced,
+            "total_peers": total,
+            "content_ready": ready,
+            "timestamp": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+        });
+
+        Ok(Json(AdminApiResponse::Profile { data: stats }))
+    } else {
+        Ok(Json(AdminApiResponse::Error {
+            error: "Mesh state not available (standalone mode)".to_string(),
+        }))
     }
 }
 

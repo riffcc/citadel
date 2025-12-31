@@ -103,6 +103,21 @@ enum Commands {
         /// Path to file or folder to upload
         path: PathBuf,
     },
+
+    /// Start CPU/memory profiling (recording begins)
+    StartProfiling,
+
+    /// Stop profiling and return to normal operation
+    StopProfiling,
+
+    /// Get CPU profile data (requires profiling to be active)
+    CpuProfile,
+
+    /// Get memory profile data (requires profiling to be active)
+    MemProfile,
+
+    /// Get mesh connection statistics (always available, no profiling needed)
+    MeshStats,
 }
 
 /// Admin command sent over the socket (legacy local mode)
@@ -116,6 +131,11 @@ enum AdminCommand {
     ListAdmins,
     IsAdmin { public_key: String },
     Ping,
+    StartProfiling,
+    StopProfiling,
+    CpuProfile,
+    MemProfile,
+    MeshStats,
 }
 
 /// Response from admin command
@@ -127,6 +147,7 @@ enum AdminResponse {
     List { items: Vec<String> },
     Bool { value: bool },
     Pong,
+    Profile { data: serde_json::Value },
 }
 
 /// Get the config directory path
@@ -323,6 +344,11 @@ async fn send_http_command(
         AdminCommand::RevokeUpload { .. } => "/api/admin/revoke-upload",
         AdminCommand::ListAdmins => "/api/admin/list-admins",
         AdminCommand::IsAdmin { .. } => "/api/admin/is-admin",
+        AdminCommand::StartProfiling => "/api/admin/start-profiling",
+        AdminCommand::StopProfiling => "/api/admin/stop-profiling",
+        AdminCommand::CpuProfile => "/api/admin/cpu-profile",
+        AdminCommand::MemProfile => "/api/admin/mem-profile",
+        AdminCommand::MeshStats => "/api/admin/mesh-stats",
     };
 
     let url = format!("{}{}", base_url.trim_end_matches('/'), endpoint);
@@ -553,6 +579,10 @@ fn handle_response(response: AdminResponse) -> Result<(), String> {
             println!("pong - lens-node is running");
             Ok(())
         }
+        AdminResponse::Profile { data } => {
+            println!("{}", serde_json::to_string_pretty(&data).unwrap_or_else(|_| data.to_string()));
+            Ok(())
+        }
     }
 }
 
@@ -619,6 +649,26 @@ async fn run() -> Result<(), String> {
                         let resp = send_http_command(&client, url, &signing_key, AdminCommand::IsAdmin { public_key }).await?;
                         handle_response(resp)
                     }
+                    Commands::StartProfiling => {
+                        let resp = send_http_command(&client, url, &signing_key, AdminCommand::StartProfiling).await?;
+                        handle_response(resp)
+                    }
+                    Commands::StopProfiling => {
+                        let resp = send_http_command(&client, url, &signing_key, AdminCommand::StopProfiling).await?;
+                        handle_response(resp)
+                    }
+                    Commands::CpuProfile => {
+                        let resp = send_http_command(&client, url, &signing_key, AdminCommand::CpuProfile).await?;
+                        handle_response(resp)
+                    }
+                    Commands::MemProfile => {
+                        let resp = send_http_command(&client, url, &signing_key, AdminCommand::MemProfile).await?;
+                        handle_response(resp)
+                    }
+                    Commands::MeshStats => {
+                        let resp = send_http_command(&client, url, &signing_key, AdminCommand::MeshStats).await?;
+                        handle_response(resp)
+                    }
                     Commands::Init | Commands::Show | Commands::Upload { .. } => unreachable!(),
                 }
             } else {
@@ -631,6 +681,11 @@ async fn run() -> Result<(), String> {
                     Commands::RevokeUpload { public_key } => AdminCommand::RevokeUpload { public_key },
                     Commands::ListAdmins => AdminCommand::ListAdmins,
                     Commands::IsAdmin { public_key } => AdminCommand::IsAdmin { public_key },
+                    Commands::StartProfiling => AdminCommand::StartProfiling,
+                    Commands::StopProfiling => AdminCommand::StopProfiling,
+                    Commands::CpuProfile => AdminCommand::CpuProfile,
+                    Commands::MemProfile => AdminCommand::MemProfile,
+                    Commands::MeshStats => AdminCommand::MeshStats,
                     Commands::Init | Commands::Show | Commands::Upload { .. } => unreachable!(),
                 };
 

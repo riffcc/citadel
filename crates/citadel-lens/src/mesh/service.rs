@@ -66,6 +66,8 @@ pub struct MeshService {
     pending_connect_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<(String, SocketAddr)>>>,
     /// Atomic flag to prevent concurrent slot claiming attempts
     claiming_in_progress: std::sync::atomic::AtomicBool,
+    /// Traffic statistics for aggregate logging
+    traffic_stats: Arc<super::state::TrafficStats>,
 }
 
 impl MeshService {
@@ -155,6 +157,8 @@ impl MeshService {
             pending_connect_rx: Arc::new(tokio::sync::Mutex::new(pending_connect_rx)),
             // Atomic flag for slot claiming (prevents concurrent claims)
             claiming_in_progress: std::sync::atomic::AtomicBool::new(false),
+            // Traffic statistics for aggregate logging (instead of per-packet spam)
+            traffic_stats: Arc::new(super::state::TrafficStats::new()),
         }
     }
 
@@ -770,6 +774,21 @@ impl MeshService {
                 // Staple SPORE proof to heartbeat - empty at convergence (zero overhead)
                 let spore_proof = citadel_spore::Spore::empty();
                 self.flood(FloodMessage::CvdfNewRound { round, spore_proof });
+
+                // EVENT-DRIVEN SLOT EVICTION: On round production, evict stale slots.
+                // Slots that haven't attested in SLOT_LIVENESS_THRESHOLD rounds are dead.
+                // This keeps claimed_slots bounded and accurate.
+                let stale = self.prune_stale_slots().await;
+                if !stale.is_empty() {
+                    let mut state = self.state.write().await;
+                    for slot_idx in &stale {
+                        if let Some(claim) = state.claimed_slots.remove(slot_idx) {
+                            state.slot_coords.remove(&claim.coord);
+                            info!("Evicted stale slot {} (peer {} - no attestation for {} rounds)",
+                                slot_idx, claim.peer_id, crate::cvdf::SLOT_LIVENESS_THRESHOLD);
+                        }
+                    }
+                }
             }
 
             // Periodically broadcast chain state for sync
@@ -1395,6 +1414,20 @@ impl MeshService {
             }
         }
 
+        // BUG FIX: Check if this peer already has a DIFFERENT slot claimed.
+        // Each peer can only have ONE slot - remove any old claim before accepting new one.
+        // This prevents nodes from appearing to claim multiple slots (e.g., slots 3, 25, 48).
+        let old_slot_to_remove: Option<(u64, HexCoord)> = state.claimed_slots.iter()
+            .find(|(slot_idx, claim)| claim.peer_id == peer_id && **slot_idx != index)
+            .map(|(slot_idx, claim)| (*slot_idx, claim.coord));
+
+        if let Some((old_index, old_coord)) = old_slot_to_remove {
+            info!("Peer {} moving from slot {} to slot {} - removing old claim",
+                  peer_id, old_index, index);
+            state.claimed_slots.remove(&old_index);
+            state.slot_coords.remove(&old_coord);
+        }
+
         // Accept the claim (with public key for TGP)
         let claim = SlotClaim::with_public_key(index, peer_id.clone(), public_key.clone());
         state.claimed_slots.insert(index, claim);
@@ -1467,15 +1500,16 @@ impl MeshService {
         loop {
             match socket.recv_from(&mut buf).await {
                 Ok((len, src_addr)) => {
-                    info!("UDP recv {} bytes from {}", len, src_addr);
+                    self.traffic_stats.record_recv(len as u64);
                     // Deserialize TGP message
                     match serde_json::from_slice::<TgpMessage>(&buf[..len]) {
                         Ok(tgp_msg) => {
+                            self.traffic_stats.record_tgp_message();
                             // Handle message and immediately send response (event-driven)
                             if let Some(peer_id) = self.handle_tgp_message(src_addr, tgp_msg).await {
                                 self.send_tgp_messages(&socket, &peer_id).await;
                             } else {
-                                info!("UDP from {} - no peer found for TGP message", src_addr);
+                                debug!("UDP from {} - no peer found for TGP message", src_addr);
                             }
                         }
                         Err(e) => {
@@ -1561,7 +1595,7 @@ impl MeshService {
                         warn!("Invalid public key from unknown peer at {}", src_addr);
                         return None;
                     };
-                    info!("TGP-PURE: Accepting coordination from {} at {} (no TCP required)",
+                    debug!("TGP: Accepting coordination from {} at {}",
                           &peer_id[..12], src_addr);
                     (peer_id, keypair, counterparty)
                 }
@@ -1637,14 +1671,14 @@ impl MeshService {
                     MessagePayload::TripleProof(t) => format!("Triple({})", t.party),
                     MessagePayload::QuadProof(q) => format!("Quad({})", q.party),
                 };
-                info!("TGP recv: {} msg={} (state: {:?})", peer_id, msg_party, old_state);
+                debug!("TGP recv: {} msg={} (state: {:?})", peer_id, msg_party, old_state);
                 match session.coordinator.receive(&msg) {
                     Ok(advanced) => {
                         let new_state = session.coordinator.tgp_state();
                         if advanced {
-                            info!("TGP with {} advanced: {:?} -> {:?}", peer_id, old_state, new_state);
+                            debug!("TGP with {} advanced: {:?} -> {:?}", peer_id, old_state, new_state);
                         } else {
-                            info!("TGP with {} receive ok but state unchanged: {:?}", peer_id, old_state);
+                            debug!("TGP with {} receive ok but state unchanged: {:?}", peer_id, old_state);
                         }
                         if session.coordinator.is_coordinated() {
                             info!("TGP with {} complete - QuadProof achieved!", peer_id);
@@ -1665,19 +1699,20 @@ impl MeshService {
                         }
                     }
                     Err(e) => {
-                        info!("TGP message from {} rejected (state: {:?}): {:?}", peer_id, old_state, e);
+                        debug!("TGP message from {} rejected (state: {:?}): {:?}", peer_id, old_state, e);
                         None
                     }
                 }
             } else {
-                info!("TGP recv: no session for {} (sessions: {:?})", peer_id, sessions.keys().collect::<Vec<_>>());
+                debug!("TGP recv: no session for {} (sessions: {:?})", peer_id, sessions.keys().collect::<Vec<_>>());
                 None
             }
         };
 
         // If coordination completed, store in authorized_peers AND claim our slot
         if let Some((our_quad, their_quad, pubkey, addr)) = completed_auth {
-            info!("TGP-NATIVE: Adding {} to authorized_peers (QuadProof stored)", peer_id);
+            self.traffic_stats.record_tgp_completion();
+            debug!("TGP: Adding {} to authorized_peers", peer_id);
             let authorized = AuthorizedPeer::new(
                 peer_id.clone(),
                 pubkey,
@@ -1688,7 +1723,7 @@ impl MeshService {
 
             let mut state = self.state.write().await;
             state.authorized_peers.insert(peer_id.clone(), authorized);
-            info!("TGP-NATIVE: {} authorized peers total", state.authorized_peers.len());
+            debug!("TGP: {} authorized peers total", state.authorized_peers.len());
 
             // EVENT-DRIVEN SLOT CLAIM: One QuadProof = claim the slot
             if let Some(target_slot) = state.pending_slot_claim.take() {
@@ -1766,7 +1801,7 @@ impl MeshService {
                     match session.coordinator.poll() {
                         Ok(Some(messages)) => {
                             let tgp_addr = session.peer_tgp_addr;
-                            info!("TGP poll: {} messages for {} (state: {:?}, addr: {})",
+                            debug!("TGP poll: {} messages for {} (state: {:?}, addr: {})",
                                    messages.len(), peer_id, state, tgp_addr);
                             for msg in messages {
                                 if let Ok(data) = serde_json::to_vec(&msg) {
@@ -1779,7 +1814,7 @@ impl MeshService {
                             debug!("TGP poll: rate limited for {} (state: {:?})", peer_id, state);
                         }
                         Err(e) => {
-                            info!("TGP poll error for {} (state: {:?}): {:?}", peer_id, state, e);
+                            debug!("TGP poll error for {} (state: {:?}): {:?}", peer_id, state, e);
                             if let Some(tx) = session.result_tx.take() {
                                 let _ = tx.send(false);
                             }
@@ -1793,10 +1828,11 @@ impl MeshService {
 
         // Send messages (outside of lock)
         for (addr, data) in messages_to_send {
+            let len = data.len();
             if let Err(e) = socket.send_to(&data, addr).await {
                 warn!("Failed to send TGP to {}: {}", addr, e);
             } else {
-                info!("UDP send {} bytes to {}", data.len(), addr);
+                self.traffic_stats.record_send(len as u64);
             }
         }
     }
@@ -1864,6 +1900,25 @@ impl MeshService {
         let self_clone = Arc::clone(&self);
         tokio::spawn(async move {
             self_clone.run_cvdf_loop().await;
+        });
+
+        // Spawn traffic stats logging loop (every 10s)
+        let traffic_stats = Arc::clone(&self.traffic_stats);
+        tokio::spawn(async move {
+            use tokio::time::{interval, Duration};
+            let mut tick = interval(Duration::from_secs(10));
+            loop {
+                tick.tick().await;
+                let (sent, recv, pkt_sent, pkt_recv, tgp_msgs, tgp_done) = traffic_stats.take_snapshot();
+                // Only log if there was any traffic
+                if sent > 0 || recv > 0 {
+                    info!("Traffic: {} tx, {} rx | {}/s tx, {}/s rx | {} TGP msgs, {} completions",
+                        pkt_sent, pkt_recv,
+                        super::state::TrafficStats::format_rate(sent, 10),
+                        super::state::TrafficStats::format_rate(recv, 10),
+                        tgp_msgs, tgp_done);
+                }
+            }
         });
 
         // Spawn entry peer retry loop - keeps trying to connect when isolated
@@ -2850,17 +2905,44 @@ impl MeshService {
                 }
                 // Re-flood newly discovered peers to propagate through mesh
                 if !new_peers.is_empty() {
-                    // Collect addresses to connect (we'll connect after releasing locks)
+                    // Get our slot's neighbor coordinates (if we have a slot)
+                    // TOPOLOGY FIX: Only connect to spiral neighbors, not full mesh!
+                    let our_neighbor_coords: Option<Vec<HexCoord>> = {
+                        let state = self.state.read().await;
+                        state.self_slot.as_ref().map(|slot| {
+                            Neighbors::of(slot.coord).to_vec()
+                        })
+                    };
+
+                    // Collect addresses to connect - ONLY spiral neighbors (or all if no slot yet)
                     let peers_to_connect: Vec<(String, SocketAddr)> = new_peers.iter()
-                        .filter_map(|(peer_id, addr_str, _, _)| {
-                            addr_str.parse::<SocketAddr>().ok().map(|addr| (peer_id.clone(), addr))
+                        .filter_map(|(peer_id, addr_str, slot_opt, _)| {
+                            let addr: SocketAddr = addr_str.parse().ok()?;
+
+                            // If we don't have a slot yet, accept any connection for bootstrapping
+                            let Some(ref neighbor_coords) = our_neighbor_coords else {
+                                return Some((peer_id.clone(), addr));
+                            };
+
+                            // Only connect if this peer's slot is one of our spiral neighbors
+                            if let Some(their_slot_idx) = slot_opt {
+                                let their_coord = spiral3d_to_coord(Spiral3DIndex::new(*their_slot_idx));
+                                if neighbor_coords.contains(&their_coord) {
+                                    return Some((peer_id.clone(), addr));
+                                }
+                            }
+
+                            // Not a neighbor - don't connect
+                            None
                         })
                         .collect();
 
                     self.flood(FloodMessage::Peers(new_peers));
 
                     // Return peers to connect - caller will spawn connections
-                    return Ok((None, peers_to_connect));
+                    if !peers_to_connect.is_empty() {
+                        return Ok((None, peers_to_connect));
+                    }
                 }
                 // Note: No bootstrap sync signal needed - CVDF swarm merge handles everything.
                 // When we receive heavier chains, we adopt them automatically.

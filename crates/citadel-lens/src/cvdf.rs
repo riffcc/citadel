@@ -726,25 +726,109 @@ impl CvdfChain {
         true
     }
 
+    /// Verify only NEW rounds incrementally (cooperative model)
+    ///
+    /// This is the key optimization for CVDF: we don't re-verify history.
+    /// Only verify rounds from `from_height` onwards, assuming prior rounds
+    /// are already validated (they're in our chain).
+    ///
+    /// Used for normal sync where we share common ancestry.
+    pub fn verify_incremental(&self, new_rounds: &[CvdfRound], from_height: u64) -> bool {
+        if new_rounds.is_empty() {
+            return true;
+        }
+
+        // Get our tip output at the fork point
+        let fork_output = if from_height == 0 {
+            // Genesis case - check genesis seed
+            [0u8; 32]
+        } else {
+            // Find our round at from_height - 1
+            let fork_idx = (from_height - 1) as usize;
+            if fork_idx >= self.rounds.len() {
+                return false; // Can't verify - we don't have the fork point
+            }
+            self.rounds[fork_idx].output
+        };
+
+        // Verify chain of new rounds
+        let mut prev_output = fork_output;
+        for round in new_rounds {
+            // Each round must chain correctly
+            if round.round > 0 && round.prev_output != prev_output {
+                return false;
+            }
+            // Verify the round itself (attestations, VDF output)
+            if !round.verify(&prev_output) {
+                return false;
+            }
+            prev_output = round.output;
+        }
+
+        true
+    }
+
     /// Compare with another chain - returns true if we should adopt theirs
+    ///
+    /// COOPERATIVE MODEL: Use incremental verification when possible.
+    /// Only falls back to full verification for bootstrap/fork scenarios.
     pub fn should_adopt(&self, other_rounds: &[CvdfRound]) -> bool {
         if other_rounds.is_empty() {
             return false;
         }
 
-        // Verify other chain
-        let other = match CvdfChain::from_rounds(
-            self.genesis_seed,
-            other_rounds.to_vec(),
-            self.signing_key.clone(),
-        ) {
-            Some(c) => c,
-            None => return false,
-        };
+        // Calculate their weight without full verification first
+        let their_weight: u64 = other_rounds.iter().map(|r| r.weight()).sum();
+        let our_weight = self.total_weight();
 
-        // Compare total weight (not just height!)
-        // This is the key insight: chains with more attesters are heavier
-        other.total_weight() > self.total_weight()
+        // Quick rejection: if not heavier, don't bother verifying
+        if their_weight <= our_weight {
+            return false;
+        }
+
+        // Find common ancestry for incremental verification
+        // Look for where our chains diverge
+
+        // Find fork point: highest round where outputs match
+        let mut fork_height: u64 = 0;
+        for our_round in &self.rounds {
+            // Find corresponding round in their chain
+            let their_idx = our_round.round as usize;
+            if their_idx < other_rounds.len() {
+                let their_round = &other_rounds[their_idx];
+                if their_round.output == our_round.output {
+                    fork_height = our_round.round + 1;
+                } else {
+                    break; // Divergence found
+                }
+            }
+        }
+
+        if fork_height > 0 {
+            // INCREMENTAL: We share ancestry, only verify new rounds
+            let new_rounds = &other_rounds[fork_height as usize..];
+            if !self.verify_incremental(new_rounds, fork_height) {
+                return false;
+            }
+        } else {
+            // FULL: No common ancestry (bootstrap/partition recovery)
+            // This is the expensive path - only for joining or major forks
+            let other = match CvdfChain::from_rounds(
+                self.genesis_seed,
+                other_rounds.to_vec(),
+                self.signing_key.clone(),
+            ) {
+                Some(c) => c,
+                None => return false,
+            };
+            // Sanity check weight matches
+            if other.total_weight() != their_weight {
+                return false;
+            }
+        }
+
+        // Heavier chain wins (per CVDF.lean theorem: collaboration_wins)
+        true
     }
 
     /// Adopt a heavier chain

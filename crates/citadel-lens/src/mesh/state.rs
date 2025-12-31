@@ -19,10 +19,76 @@ use ed25519_dalek::SigningKey;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::net::UdpSocket;
 
 use super::peer::{AuthorizedPeer, MeshPeer};
 use super::slot::{LatencyHistory, SlotClaim};
+
+/// Traffic statistics for aggregate logging (instead of per-packet spam)
+#[derive(Debug, Default)]
+pub struct TrafficStats {
+    /// UDP bytes sent
+    pub bytes_sent: AtomicU64,
+    /// UDP bytes received
+    pub bytes_recv: AtomicU64,
+    /// UDP packets sent
+    pub packets_sent: AtomicU64,
+    /// UDP packets received
+    pub packets_recv: AtomicU64,
+    /// TGP messages processed
+    pub tgp_messages: AtomicU64,
+    /// TGP completions (QuadProof achieved)
+    pub tgp_completions: AtomicU64,
+}
+
+impl TrafficStats {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn record_send(&self, bytes: u64) {
+        self.bytes_sent.fetch_add(bytes, Ordering::Relaxed);
+        self.packets_sent.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_recv(&self, bytes: u64) {
+        self.bytes_recv.fetch_add(bytes, Ordering::Relaxed);
+        self.packets_recv.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_tgp_message(&self) {
+        self.tgp_messages.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_tgp_completion(&self) {
+        self.tgp_completions.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Reset and return previous values for interval logging
+    pub fn take_snapshot(&self) -> (u64, u64, u64, u64, u64, u64) {
+        (
+            self.bytes_sent.swap(0, Ordering::Relaxed),
+            self.bytes_recv.swap(0, Ordering::Relaxed),
+            self.packets_sent.swap(0, Ordering::Relaxed),
+            self.packets_recv.swap(0, Ordering::Relaxed),
+            self.tgp_messages.swap(0, Ordering::Relaxed),
+            self.tgp_completions.swap(0, Ordering::Relaxed),
+        )
+    }
+
+    /// Format bytes as human-readable (B/s, KiB/s, MiB/s)
+    pub fn format_rate(bytes: u64, interval_secs: u64) -> String {
+        let rate = bytes as f64 / interval_secs as f64;
+        if rate >= 1024.0 * 1024.0 {
+            format!("{:.1} MiB/s", rate / (1024.0 * 1024.0))
+        } else if rate >= 1024.0 {
+            format!("{:.1} KiB/s", rate / 1024.0)
+        } else {
+            format!("{:.0} B/s", rate)
+        }
+    }
+}
 
 /// Mesh service state
 pub struct MeshState {
