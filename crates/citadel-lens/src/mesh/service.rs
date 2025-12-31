@@ -192,63 +192,10 @@ impl MeshService {
     ///
     /// # TODO
     ///
-    /// Replace this with `attempt_slot_via_tgp()` that:
-    /// - Uses [`PeerCoordinator`] for each neighbor connection
-    /// - Commitment message includes: (my_id, target_slot, direction_from_neighbor)
-    /// - Returns true only if TGP agreements >= threshold
-    /// - On failure, caller tries next slot
+    /// Claim a slot (delegates to VDF-anchored claiming)
+    /// All slot claims MUST be VDF-signed to prevent forgery and oscillation.
     pub async fn claim_slot(&self, index: u64) -> bool {
-        // TODO: Replace with TGP-based slot acquisition
-        // This function currently floods a claim without TGP validation
-        // See docs/MESH_PROTOCOL.md for the correct protocol
-
-        let mut state = self.state.write().await;
-
-        // Check if slot is already claimed
-        if state.claimed_slots.contains_key(&index) {
-            warn!("Slot {} already claimed", index);
-            return false;
-        }
-
-        let peer_id = state.self_id.clone();
-        let public_key = state.signing_key.verifying_key();
-        let public_key_bytes = public_key.as_bytes().to_vec();
-        let claim = SlotClaim::with_public_key(index, peer_id.clone(), Some(public_key_bytes.clone()));
-        let coord = claim.coord;
-
-        // Record our claim (with our own public key)
-        state.self_slot = Some(claim.clone());
-        state.claimed_slots.insert(index, claim.clone());
-        state.slot_coords.insert(coord);
-
-        // Calculate required confirmations based on mesh size
-        let mesh_size = state.claimed_slots.len();
-        let threshold = consensus_threshold(mesh_size);
-
-        info!(
-            "Claimed slot {} at ({}, {}, {}) - mesh size {}, threshold {}",
-            index, coord.q, coord.r, coord.z, mesh_size, threshold
-        );
-
-        drop(state);
-
-        // Set our slot in CVDF for duty rotation
-        self.cvdf_set_slot(index).await;
-
-        // Also register ourselves in CVDF
-        let mut pubkey_arr = [0u8; 32];
-        pubkey_arr.copy_from_slice(&public_key_bytes);
-        self.cvdf_register_slot(index, pubkey_arr).await;
-
-        // Flood our claim to the network (with public key for TGP)
-        self.flood(FloodMessage::SlotClaim {
-            index,
-            peer_id,
-            coord: (coord.q, coord.r, coord.z),
-            public_key: Some(public_key_bytes),
-        });
-
-        true
+        self.claim_slot_with_vdf(index).await.is_some()
     }
 
     /// EVENT-DRIVEN slot claiming trigger.
@@ -446,16 +393,8 @@ impl MeshService {
         pubkey_arr.copy_from_slice(&public_key_bytes);
         self.cvdf_register_slot(index, pubkey_arr).await;
 
-        // Flood the VDF claim
+        // Flood the VDF claim (signed, with VDF height for ordering)
         self.flood(FloodMessage::VdfSlotClaim { claim: claim.clone() });
-
-        // Also flood regular slot claim for compatibility with non-VDF nodes
-        self.flood(FloodMessage::SlotClaim {
-            index,
-            peer_id,
-            coord: (coord.q, coord.r, coord.z),
-            public_key: Some(public_key_bytes),
-        });
 
         Some(claim)
     }
@@ -1729,36 +1668,15 @@ impl MeshService {
             if let Some(target_slot) = state.pending_slot_claim.take() {
                 // Double-check slot is still available
                 if !state.claimed_slots.contains_key(&target_slot) {
-                    let my_id = state.self_id.clone();
-                    let my_pubkey = state.signing_key.verifying_key().as_bytes().to_vec();
-                    let claim = SlotClaim::with_public_key(target_slot, my_id.clone(), Some(my_pubkey.clone()));
-                    let coord = claim.coord;
-
-                    state.self_slot = Some(claim.clone());
-                    state.claimed_slots.insert(target_slot, claim);
-                    state.slot_coords.insert(coord);
-
-                    info!("SLOT CLAIMED: {} at ({}, {}, {}) via QuadProof with {}",
-                          target_slot, coord.q, coord.r, coord.z, peer_id);
-
                     drop(state);
-
-                    // Set our slot in CVDF for duty rotation
-                    self.cvdf_set_slot(target_slot).await;
-
-                    // Also register ourselves in CVDF
-                    let mut pubkey_arr = [0u8; 32];
-                    pubkey_arr.copy_from_slice(&my_pubkey);
-                    self.cvdf_register_slot(target_slot, pubkey_arr).await;
-
-                    // Flood our claim
-                    debug!("Flooding slot_claim for slot {} from {}", target_slot, my_id);
-                    self.flood(FloodMessage::SlotClaim {
-                        index: target_slot,
-                        peer_id: my_id,
-                        coord: (coord.q, coord.r, coord.z),
-                        public_key: Some(my_pubkey),
-                    });
+                    // Use VDF-anchored claim (signed, with VDF height for ordering)
+                    if let Some(claim) = self.claim_slot_with_vdf(target_slot).await {
+                        info!("SLOT CLAIMED: {} via QuadProof with {} (VDF height {})",
+                              target_slot, peer_id, claim.vdf_height);
+                    } else {
+                        warn!("Failed to create VDF-anchored claim for slot {}", target_slot);
+                        self.start_slot_claim_tgp().await;
+                    }
                 } else {
                     info!("Slot {} was claimed by someone else during TGP, will retry", target_slot);
                     drop(state);
@@ -2404,28 +2322,7 @@ impl MeshService {
                             let _ = writer.write_all(flood_msg.to_string().as_bytes()).await;
                             let _ = writer.write_all(b"\n").await;
                         }
-                        Ok(FloodMessage::SlotClaim { index, peer_id, coord, public_key }) => {
-                            let flood_msg = serde_json::json!({
-                                "type": "slot_claim",
-                                "index": index,
-                                "peer_id": peer_id,
-                                "coord": [coord.0, coord.1, coord.2],
-                                "public_key": public_key.map(hex::encode),
-                            });
-                            let _ = writer.write_all(flood_msg.to_string().as_bytes()).await;
-                            let _ = writer.write_all(b"\n").await;
-                        }
-                        Ok(FloodMessage::SlotValidation { index, peer_id, validator_id, accepted }) => {
-                            let flood_msg = serde_json::json!({
-                                "type": "slot_validation",
-                                "index": index,
-                                "peer_id": peer_id,
-                                "validator_id": validator_id,
-                                "accepted": accepted,
-                            });
-                            let _ = writer.write_all(flood_msg.to_string().as_bytes()).await;
-                            let _ = writer.write_all(b"\n").await;
-                        }
+                        // NOTE: Unsigned SlotClaim removed - use VdfSlotClaim only
                         Ok(FloodMessage::SporeHaveList { peer_id, slots }) => {
                             let flood_msg = serde_json::json!({
                                 "type": "spore_have_list",
@@ -2947,102 +2844,9 @@ impl MeshService {
                 // Note: No bootstrap sync signal needed - CVDF swarm merge handles everything.
                 // When we receive heavier chains, we adopt them automatically.
             }
-            "slot_claim" => {
-                // Process a slot claim from another node
-                // SPORE: re-flood new claims to propagate through mesh
-                if let (Some(index), Some(claimer_id)) = (
-                    msg.get("index").and_then(|i| i.as_u64()),
-                    msg.get("peer_id").and_then(|p| p.as_str()),
-                ) {
-                    debug!("Received slot_claim flood: slot {} from {}", index, claimer_id);
-                    let coord = msg.get("coord")
-                        .and_then(|c| c.as_array())
-                        .map(|arr| {
-                            let q = arr.first().and_then(|v| v.as_i64()).unwrap_or(0);
-                            let r = arr.get(1).and_then(|v| v.as_i64()).unwrap_or(0);
-                            let z = arr.get(2).and_then(|v| v.as_i64()).unwrap_or(0);
-                            (q, r, z)
-                        })
-                        .unwrap_or((0, 0, 0));
-
-                    // Extract public key if present (hex-encoded)
-                    let public_key = msg.get("public_key")
-                        .and_then(|p| p.as_str())
-                        .and_then(|hex_str| hex::decode(hex_str).ok());
-
-                    // Check if this is a new claim before processing
-                    let is_new = !self.state.read().await.claimed_slots.contains_key(&index);
-
-                    // Check if someone else claimed the slot we're trying to claim via TGP
-                    let self_id = self.state.read().await.self_id.clone();
-                    let pending_sniped = {
-                        let state = self.state.read().await;
-                        state.pending_slot_claim == Some(index) && claimer_id != self_id
-                    };
-
-                    if pending_sniped {
-                        // Someone else got our pending slot - cancel our TGP and retry for next slot
-                        info!("Pending slot {} was claimed by {} - canceling TGP and retrying", index, claimer_id);
-                        let mut state = self.state.write().await;
-                        state.pending_slot_claim = None;
-                        drop(state);
-                    }
-
-                    // Process the slot claim (stores public key in claim and peer)
-                    let (we_lost, race_won) = self.process_slot_claim(index, claimer_id.to_string(), coord, public_key.clone()).await;
-
-                    // Register slot in CVDF for attestation tracking and duty rotation
-                    if let Some(ref pk) = public_key {
-                        if pk.len() == 32 {
-                            let mut pubkey_arr = [0u8; 32];
-                            pubkey_arr.copy_from_slice(pk);
-                            self.cvdf_register_slot(index, pubkey_arr).await;
-                        }
-                    }
-
-                    // Re-flood claims to propagate through mesh:
-                    // - New claims (is_new): first time we've seen this slot claimed
-                    // - Race winners (race_won): a new claimer beat the previous one
-                    if is_new || race_won {
-                        self.flood(FloodMessage::SlotClaim {
-                            index,
-                            peer_id: claimer_id.to_string(),
-                            coord,
-                            public_key,
-                        });
-                    }
-
-                    // EVENT: Mesh state changed - trigger claim attempt
-                    // Per FailureDetectorElimination.lean: state changes are valid trigger events
-                    if we_lost || pending_sniped {
-                        debug!("Lost slot {} - triggering reclaim", index);
-                        self.trigger_slot_claim_if_ready();
-                    } else if is_new || race_won {
-                        // Slot state changed - maybe we can claim now
-                        self.trigger_slot_claim_if_ready();
-                    }
-                }
-            }
-            "slot_validation" => {
-                // Process a slot validation response
-                if let (Some(index), Some(claimer_id), Some(_validator_id), Some(accepted)) = (
-                    msg.get("index").and_then(|i| i.as_u64()),
-                    msg.get("peer_id").and_then(|p| p.as_str()),
-                    msg.get("validator_id").and_then(|v| v.as_str()),
-                    msg.get("accepted").and_then(|a| a.as_bool()),
-                ) {
-                    if accepted {
-                        let mut state = self.state.write().await;
-                        if let Some(claim) = state.claimed_slots.get_mut(&index) {
-                            if claim.peer_id == claimer_id {
-                                claim.confirmations += 1;
-                                debug!("Slot {} now has {} confirmations",
-                                       index, claim.confirmations);
-                            }
-                        }
-                    }
-                }
-            }
+            // NOTE: Unsigned "slot_claim" and "slot_validation" handlers REMOVED.
+            // They had no signature, so anyone could forge claims for any peer.
+            // Use "vdf_slot_claim" instead - it has VDF height for ordering and signature for auth.
             "spore_have_list" => {
                 // SPORE: Compare their HaveList with ours and send missing slots
                 if let Some(their_slots) = msg.get("slots").and_then(|s| s.as_array()) {
@@ -3062,17 +2866,13 @@ impl MeshService {
                     }
                     drop(state);
 
-                    // Send missing slots to this peer
+                    // Send missing slots to this peer via VDF claims
                     if !missing_slots.is_empty() {
-                        info!("SPORE: Sending {} missing slots to {}", missing_slots.len(), peer_id);
-                        for claim in missing_slots {
-                            self.flood(FloodMessage::SlotClaim {
-                                index: claim.index,
-                                peer_id: claim.peer_id,
-                                coord: (claim.coord.q, claim.coord.r, claim.coord.z),
-                                public_key: claim.public_key,
-                            });
-                        }
+                        info!("SPORE: Peer missing {} slots - they'll sync via VdfSlotClaim", missing_slots.len());
+                        // NOTE: We don't re-flood unsigned claims. Peers sync slots via:
+                        // 1. VdfSlotClaim floods (signed, with VDF height)
+                        // 2. CvdfSyncResponse (contains all slots with pubkeys)
+                        // This prevents the oscillation bug from unsigned claim re-flooding.
                     }
                 }
             }

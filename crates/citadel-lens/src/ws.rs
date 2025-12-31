@@ -59,19 +59,7 @@ pub enum MeshEvent {
     },
     /// Peer left the mesh
     PeerLeft { id: String },
-    /// Slot claimed by a peer
-    SlotClaimed {
-        index: u64,
-        peer_id: String,
-        coord: [i64; 3],
-    },
-    /// Slot validation received
-    SlotValidated {
-        index: u64,
-        peer_id: String,
-        validator_id: String,
-        accepted: bool,
-    },
+    // NOTE: Unsigned SlotClaimed and SlotValidated REMOVED - use VdfSlotClaimed only
     /// SPORE sync update
     SporeSync {
         peer_id: String,
@@ -443,27 +431,7 @@ pub fn flood_to_event(msg: FloodMessage) -> Option<MeshEvent> {
             None
         }
         FloodMessage::Admins(admins) => Some(MeshEvent::AdminsChanged { admins }),
-        FloodMessage::SlotClaim {
-            index,
-            peer_id,
-            coord,
-            ..  // public_key not needed for WS event
-        } => Some(MeshEvent::SlotClaimed {
-            index,
-            peer_id,
-            coord: [coord.0, coord.1, coord.2],
-        }),
-        FloodMessage::SlotValidation {
-            index,
-            peer_id,
-            validator_id,
-            accepted,
-        } => Some(MeshEvent::SlotValidated {
-            index,
-            peer_id,
-            validator_id,
-            accepted,
-        }),
+        // NOTE: Unsigned SlotClaim and SlotValidation REMOVED - use VdfSlotClaim only
         FloodMessage::SporeHaveList { peer_id, slots } => Some(MeshEvent::SporeSync {
             peer_id,
             have_count: slots.len(),

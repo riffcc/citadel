@@ -18,20 +18,8 @@ pub enum FloodMessage {
     Peers(Vec<(String, String, Option<u64>, Option<Vec<u8>>)>),
     /// Admin list sync
     Admins(Vec<String>),
-    /// Slot claim announcement (index, peer_id, coord as (q, r, z), public_key)
-    SlotClaim {
-        index: u64,
-        peer_id: String,
-        coord: (i64, i64, i64),
-        public_key: Option<Vec<u8>>,
-    },
-    /// Slot claim validation response
-    SlotValidation {
-        index: u64,
-        peer_id: String,
-        validator_id: String,
-        accepted: bool,
-    },
+    // NOTE: Unsigned SlotClaim was REMOVED - it had no signature so anyone could
+    // forge claims for any peer, causing oscillation bugs. Use VdfSlotClaim only.
     /// SPORE HaveList - advertise what slots we know about (for targeted sync)
     SporeHaveList { peer_id: String, slots: Vec<u64> },
     /// VDF chain sync - broadcast chain links for collaborative VDF
