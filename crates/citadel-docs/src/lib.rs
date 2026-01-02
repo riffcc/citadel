@@ -13,8 +13,9 @@
 //!
 //! ### Storage Model
 //!
-//! Documents are stored in RocksDB with:
-//! - Key: `{type_prefix}:{content_id}`
+//! Documents are stored in ReDB with:
+//! - Table: One table per document type (named by TYPE_PREFIX)
+//! - Key: `[u8; 32]` ContentId bytes (CID-native)
 //! - Value: JSON-serialized document
 //!
 //! ### SPORE Integration
@@ -65,13 +66,17 @@
 
 use citadel_crdt::{ContentId, TotalMerge};
 use citadel_spore::{Range256, Spore, U256};
-use rocksdb::{DB, Options, WriteBatch};
+use redb::{Database, ReadableTable, ReadableDatabase, TableDefinition};
 use serde::{de::DeserializeOwned, Serialize};
 use std::marker::PhantomData;
 use std::path::Path;
 use std::sync::Arc;
 use thiserror::Error;
 use tracing::{debug, trace};
+
+/// Index table for SPORE tracking - stores all ContentIds
+/// Key: ContentId bytes, Value: empty (just presence marker)
+const CONTENT_INDEX: TableDefinition<&[u8; 32], ()> = TableDefinition::new("_content_index");
 
 /// Convert a ContentId to a U256 for SPORE tracking
 fn content_id_to_u256(id: &ContentId) -> U256 {
@@ -102,10 +107,40 @@ pub enum DocError {
     Serialization(#[from] serde_json::Error),
 
     #[error("Storage error: {0}")]
-    Storage(#[from] rocksdb::Error),
+    Storage(String),
 
     #[error("Invalid document format")]
     InvalidFormat,
+}
+
+impl From<redb::DatabaseError> for DocError {
+    fn from(e: redb::DatabaseError) -> Self {
+        DocError::Storage(e.to_string())
+    }
+}
+
+impl From<redb::TransactionError> for DocError {
+    fn from(e: redb::TransactionError) -> Self {
+        DocError::Storage(e.to_string())
+    }
+}
+
+impl From<redb::TableError> for DocError {
+    fn from(e: redb::TableError) -> Self {
+        DocError::Storage(e.to_string())
+    }
+}
+
+impl From<redb::StorageError> for DocError {
+    fn from(e: redb::StorageError) -> Self {
+        DocError::Storage(e.to_string())
+    }
+}
+
+impl From<redb::CommitError> for DocError {
+    fn from(e: redb::CommitError) -> Self {
+        DocError::Storage(e.to_string())
+    }
 }
 
 pub type Result<T> = std::result::Result<T, DocError>;
@@ -130,11 +165,12 @@ pub trait Document: Serialize + DeserializeOwned + TotalMerge + Clone {
     }
 }
 
-/// Persistent document store backed by RocksDB.
+/// Persistent document store backed by ReDB.
 ///
 /// Stores documents with automatic SPORE tracking for sync.
+/// Uses CID-native keys: `[u8; 32]` ContentId bytes.
 pub struct DocumentStore {
-    db: Arc<DB>,
+    db: Arc<Database>,
     /// SPORE HaveList tracking all stored document IDs
     have_list: Spore,
 }
@@ -142,11 +178,7 @@ pub struct DocumentStore {
 impl DocumentStore {
     /// Open or create a document store at the given path.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let mut opts = Options::default();
-        opts.create_if_missing(true);
-        opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
-
-        let db = DB::open(&opts, path)?;
+        let db = Database::create(path)?;
 
         // Rebuild HaveList from existing documents
         let have_list = Self::rebuild_havelist(&db)?;
@@ -162,22 +194,24 @@ impl DocumentStore {
         })
     }
 
-    /// Rebuild SPORE HaveList by scanning all keys
-    fn rebuild_havelist(db: &DB) -> Result<Spore> {
+    /// Rebuild SPORE HaveList by scanning the content index table
+    fn rebuild_havelist(db: &Database) -> Result<Spore> {
         let mut ranges = Vec::new();
 
-        let iter = db.iterator(rocksdb::IteratorMode::Start);
-        for item in iter {
-            let (key, _) = item?;
-            // Extract content ID from key (after the type prefix)
-            if let Some(id_hex) = std::str::from_utf8(&key)
-                .ok()
-                .and_then(|s| s.split(':').nth(1))
-            {
-                if let Ok(content_id) = ContentId::from_hex(id_hex) {
-                    ranges.push(point_range(&content_id));
-                }
-            }
+        let read_txn = db.begin_read()?;
+
+        // Scan the content index table (stores all ContentIds)
+        let table = match read_txn.open_table(CONTENT_INDEX) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Spore::from_ranges(vec![])),
+            Err(e) => return Err(DocError::from(e)),
+        };
+
+        for item in table.iter()? {
+            let (key, _): (redb::AccessGuard<&[u8; 32]>, redb::AccessGuard<()>) = item?;
+            let key_bytes: [u8; 32] = *key.value();
+            let content_id = ContentId::from_bytes(key_bytes);
+            ranges.push(point_range(&content_id));
         }
 
         Ok(Spore::from_ranges(ranges))
@@ -200,25 +234,40 @@ impl DocumentStore {
     /// document differs from what was previously stored (or is new).
     pub fn put<D: Document>(&mut self, doc: &D) -> Result<(ContentId, bool)> {
         let content_id = doc.content_id();
-        let key = self.make_key::<D>(&content_id);
+        let key_bytes: [u8; 32] = *content_id.as_bytes();
 
-        // Check for existing document
-        let (merged, changed) = if let Some(existing_bytes) = self.db.get(&key)? {
-            let existing: D = serde_json::from_slice(&existing_bytes)?;
-            // TotalMerge - this CANNOT fail (proven in Lean)
-            let merged = existing.merge(doc);
-            let merged_bytes = serde_json::to_vec(&merged)?;
-            // Changed if merged differs from existing
-            let changed = merged_bytes.as_slice() != &existing_bytes[..];
-            (merged, changed)
-        } else {
-            // New document = always changed
-            (doc.clone(), true)
+        let write_txn = self.db.begin_write()?;
+        let changed = {
+            // Open table by TYPE_PREFIX (one table per document type)
+            let table_def: TableDefinition<&[u8; 32], &[u8]> =
+                TableDefinition::new(D::TYPE_PREFIX);
+            let mut table = write_txn.open_table(table_def)?;
+
+            // Check for existing document
+            let (merged, changed) = if let Some(existing_guard) = table.get(&key_bytes)? {
+                let existing: D = serde_json::from_slice(existing_guard.value())?;
+                // TotalMerge - this CANNOT fail (proven in Lean)
+                let merged = existing.merge(doc);
+                let merged_bytes = serde_json::to_vec(&merged)?;
+                // Changed if merged differs from existing
+                let changed = merged_bytes.as_slice() != existing_guard.value();
+                (merged, changed)
+            } else {
+                // New document = always changed
+                (doc.clone(), true)
+            };
+
+            // Serialize and store
+            let bytes = serde_json::to_vec(&merged)?;
+            table.insert(&key_bytes, bytes.as_slice())?;
+
+            // Update content index for SPORE tracking
+            let mut index_table = write_txn.open_table(CONTENT_INDEX)?;
+            index_table.insert(&key_bytes, ())?;
+
+            changed
         };
-
-        // Serialize and store
-        let bytes = serde_json::to_vec(&merged)?;
-        self.db.put(&key, &bytes)?;
+        write_txn.commit()?;
 
         // Update SPORE HaveList
         let range = point_range(&content_id);
@@ -236,11 +285,21 @@ impl DocumentStore {
 
     /// Get a document by content ID.
     pub fn get<D: Document>(&self, content_id: &ContentId) -> Result<Option<D>> {
-        let key = self.make_key::<D>(content_id);
+        let key_bytes: [u8; 32] = *content_id.as_bytes();
+        let table_def: TableDefinition<&[u8; 32], &[u8]> =
+            TableDefinition::new(D::TYPE_PREFIX);
 
-        match self.db.get(&key)? {
-            Some(bytes) => {
-                let doc: D = serde_json::from_slice(&bytes)?;
+        let read_txn = self.db.begin_read()?;
+        let table = match read_txn.open_table(table_def) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(DocError::from(e)),
+        };
+
+        match table.get(&key_bytes)? {
+            Some(guard) => {
+                let bytes: &[u8] = guard.value();
+                let doc: D = serde_json::from_slice(bytes)?;
                 Ok(Some(doc))
             }
             None => Ok(None),
@@ -249,19 +308,38 @@ impl DocumentStore {
 
     /// Check if a document exists.
     pub fn contains<D: Document>(&self, content_id: &ContentId) -> Result<bool> {
-        let key = self.make_key::<D>(content_id);
-        Ok(self.db.get(&key)?.is_some())
+        let key_bytes: [u8; 32] = *content_id.as_bytes();
+        let table_def: TableDefinition<&[u8; 32], &[u8]> =
+            TableDefinition::new(D::TYPE_PREFIX);
+
+        let read_txn = self.db.begin_read()?;
+        let table = match read_txn.open_table(table_def) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
+            Err(e) => return Err(DocError::from(e)),
+        };
+
+        let result: Option<redb::AccessGuard<&[u8]>> = table.get(&key_bytes)?;
+        Ok(result.is_some())
     }
 
     /// List all documents of a given type.
     pub fn list<D: Document>(&self) -> Result<Vec<D>> {
-        let prefix = format!("{}:", D::TYPE_PREFIX);
-        let mut docs = Vec::new();
+        let table_def: TableDefinition<&[u8; 32], &[u8]> =
+            TableDefinition::new(D::TYPE_PREFIX);
 
-        let iter = db_prefix_iterator(&self.db, &prefix);
-        for item in iter {
-            let (_, value) = item?;
-            let doc: D = serde_json::from_slice(&value)?;
+        let read_txn = self.db.begin_read()?;
+        let table = match read_txn.open_table(table_def) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(DocError::from(e)),
+        };
+
+        let mut docs = Vec::new();
+        for item in table.iter()? {
+            let (_, value): (redb::AccessGuard<&[u8; 32]>, redb::AccessGuard<&[u8]>) = item?;
+            let bytes: &[u8] = value.value();
+            let doc: D = serde_json::from_slice(bytes)?;
             docs.push(doc);
         }
 
@@ -273,8 +351,20 @@ impl DocumentStore {
     /// Note: In a CRDT context, deletion is usually modeled as a tombstone,
     /// not physical deletion. Use with caution.
     pub fn delete<D: Document>(&mut self, content_id: &ContentId) -> Result<()> {
-        let key = self.make_key::<D>(content_id);
-        self.db.delete(&key)?;
+        let key_bytes: [u8; 32] = *content_id.as_bytes();
+        let table_def: TableDefinition<&[u8; 32], &[u8]> =
+            TableDefinition::new(D::TYPE_PREFIX);
+
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(table_def)?;
+            table.remove(&key_bytes)?;
+
+            // Remove from content index
+            let mut index_table = write_txn.open_table(CONTENT_INDEX)?;
+            index_table.remove(&key_bytes)?;
+        }
+        write_txn.commit()?;
 
         // Update SPORE HaveList
         let range = point_range(content_id);
@@ -291,30 +381,39 @@ impl DocumentStore {
 
     /// Apply a batch of document operations atomically.
     pub fn batch<D: Document>(&mut self, ops: Vec<BatchOp<D>>) -> Result<()> {
-        let mut batch = WriteBatch::default();
+        let table_def: TableDefinition<&[u8; 32], &[u8]> =
+            TableDefinition::new(D::TYPE_PREFIX);
 
-        for op in ops {
-            match op {
-                BatchOp::Put(doc) => {
-                    let content_id = doc.content_id();
-                    let key = self.make_key::<D>(&content_id);
-                    let bytes = serde_json::to_vec(&doc)?;
-                    batch.put(&key, &bytes);
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(table_def)?;
+            let mut index_table = write_txn.open_table(CONTENT_INDEX)?;
 
-                    let range = point_range(&content_id);
-                    self.have_list = self.have_list.union(&Spore::from_range(range));
-                }
-                BatchOp::Delete(content_id) => {
-                    let key = self.make_key::<D>(&content_id);
-                    batch.delete(&key);
+            for op in ops {
+                match op {
+                    BatchOp::Put(doc) => {
+                        let content_id = doc.content_id();
+                        let key_bytes: [u8; 32] = *content_id.as_bytes();
+                        let bytes = serde_json::to_vec(&doc)?;
+                        table.insert(&key_bytes, bytes.as_slice())?;
+                        index_table.insert(&key_bytes, ())?;
 
-                    let range = point_range(&content_id);
-                    self.have_list = self.have_list.subtract(&Spore::from_range(range));
+                        let range = point_range(&content_id);
+                        self.have_list = self.have_list.union(&Spore::from_range(range));
+                    }
+                    BatchOp::Delete(content_id) => {
+                        let key_bytes: [u8; 32] = *content_id.as_bytes();
+                        table.remove(&key_bytes)?;
+                        index_table.remove(&key_bytes)?;
+
+                        let range = point_range(&content_id);
+                        self.have_list = self.have_list.subtract(&Spore::from_range(range));
+                    }
                 }
             }
         }
 
-        self.db.write(batch)?;
+        write_txn.commit()?;
         Ok(())
     }
 
@@ -338,33 +437,12 @@ impl DocumentStore {
 
         Ok(docs)
     }
-
-    fn make_key<D: Document>(&self, content_id: &ContentId) -> String {
-        format!("{}:{}", D::TYPE_PREFIX, content_id.to_hex())
-    }
 }
 
 /// Batch operation for atomic updates.
 pub enum BatchOp<D: Document> {
     Put(D),
     Delete(ContentId),
-}
-
-/// Helper to iterate over keys with a prefix
-fn db_prefix_iterator<'a>(
-    db: &'a DB,
-    prefix: &str,
-) -> impl Iterator<Item = std::result::Result<(Box<[u8]>, Box<[u8]>), rocksdb::Error>> + 'a {
-    let prefix_bytes = prefix.as_bytes().to_vec();
-    db.iterator(rocksdb::IteratorMode::From(
-        &prefix_bytes,
-        rocksdb::Direction::Forward,
-    ))
-    .take_while(move |item| {
-        item.as_ref()
-            .map(|(k, _)| k.starts_with(&prefix_bytes))
-            .unwrap_or(false)
-    })
 }
 
 /// A typed collection handle for working with a specific document type.
@@ -403,7 +481,7 @@ impl<'a, D: Document> Collection<'a, D> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use citadel_crdt::{CommutativeMerge, AssociativeMerge, IdempotentMerge};
+    use citadel_crdt::{AssociativeMerge, CommutativeMerge, IdempotentMerge};
     use std::collections::BTreeSet;
     use tempfile::tempdir;
 
@@ -447,10 +525,10 @@ mod tests {
     #[test]
     fn test_put_and_get() {
         let dir = tempdir().unwrap();
-        let mut store = DocumentStore::open(dir.path()).unwrap();
+        let mut store = DocumentStore::open(dir.path().join("docs.redb")).unwrap();
 
         let doc = TagDoc::new(&["rust", "crdt"]);
-        let id = store.put(&doc).unwrap();
+        let (id, _) = store.put(&doc).unwrap();
 
         let retrieved: Option<TagDoc> = store.get(&id).unwrap();
         assert!(retrieved.is_some());
@@ -460,11 +538,11 @@ mod tests {
     #[test]
     fn test_merge_on_put() {
         let dir = tempdir().unwrap();
-        let mut store = DocumentStore::open(dir.path()).unwrap();
+        let mut store = DocumentStore::open(dir.path().join("docs.redb")).unwrap();
 
         // First put
         let doc1 = TagDoc::new(&["rust"]);
-        let id = store.put(&doc1).unwrap();
+        let (id, _) = store.put(&doc1).unwrap();
 
         // Second put with same ID but different tags - should merge
         let mut doc2 = doc1.clone();
@@ -480,7 +558,7 @@ mod tests {
     #[test]
     fn test_list() {
         let dir = tempdir().unwrap();
-        let mut store = DocumentStore::open(dir.path()).unwrap();
+        let mut store = DocumentStore::open(dir.path().join("docs.redb")).unwrap();
 
         let doc1 = TagDoc::new(&["a"]);
         let doc2 = TagDoc::new(&["b"]);
@@ -497,7 +575,7 @@ mod tests {
     #[test]
     fn test_spore_tracking() {
         let dir = tempdir().unwrap();
-        let mut store = DocumentStore::open(dir.path()).unwrap();
+        let mut store = DocumentStore::open(dir.path().join("docs.redb")).unwrap();
 
         assert_eq!(store.have_list().range_count(), 0);
 
@@ -517,8 +595,8 @@ mod tests {
         let dir1 = tempdir().unwrap();
         let dir2 = tempdir().unwrap();
 
-        let mut store1 = DocumentStore::open(dir1.path()).unwrap();
-        let mut store2 = DocumentStore::open(dir2.path()).unwrap();
+        let mut store1 = DocumentStore::open(dir1.path().join("docs.redb")).unwrap();
+        let mut store2 = DocumentStore::open(dir2.path().join("docs.redb")).unwrap();
 
         // Both have doc_a
         let doc_a = TagDoc::new(&["a"]);

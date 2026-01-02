@@ -256,8 +256,7 @@ impl LensNode {
 
         // Open document store for CRDT documents with SPORE sync
         // Uses rich semantic merges (NOT LWW) - proven convergent in Lean
-        let doc_store_path = self.config.data_dir.join("docs");
-        std::fs::create_dir_all(&doc_store_path)?;
+        let doc_store_path = self.config.data_dir.join("docs.redb");
         let doc_store = citadel_docs::DocumentStore::open(&doc_store_path)
             .map_err(|e| crate::error::Error::Storage(e.to_string()))?;
 

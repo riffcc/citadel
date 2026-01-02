@@ -406,9 +406,10 @@ impl MeshService {
         let mut state = self.state.write().await;
 
         let slot = claim.slot;
+        let claimer_pubkey = claim.claimer;
 
         // Check if we have an existing claim for this slot
-        if let Some(existing) = state.vdf_claims.get(&slot) {
+        let wins = if let Some(existing) = state.vdf_claims.get(&slot) {
             // Compare using proven priority ordering
             if claim_has_priority(&claim, existing) {
                 info!(
@@ -444,7 +445,32 @@ impl MeshService {
             );
             state.vdf_claims.insert(slot, claim);
             true
+        };
+
+        // If claim won, also update claimed_slots for REST API / WebSocket visibility
+        if wins {
+            // Convert claimer public key to peer_id format: "b3b3/<pubkey_hex>"
+            let peer_id = format!("b3b3/{}", hex::encode(claimer_pubkey));
+
+            // Remove old slot if this peer claimed a different one
+            let old_slot = state.claimed_slots.iter()
+                .find(|(_, c)| c.peer_id == peer_id)
+                .map(|(idx, c)| (*idx, c.coord));
+            if let Some((old_idx, old_coord)) = old_slot {
+                if old_idx != slot {
+                    debug!("Peer {} moving from slot {} to slot {}", peer_id, old_idx, slot);
+                    state.claimed_slots.remove(&old_idx);
+                    state.slot_coords.remove(&old_coord);
+                }
+            }
+
+            // Create SlotClaim from VDF claim
+            let slot_claim = SlotClaim::with_public_key(slot, peer_id, Some(claimer_pubkey.to_vec()));
+            state.slot_coords.insert(slot_claim.coord);
+            state.claimed_slots.insert(slot, slot_claim);
         }
+
+        wins
     }
 
     /// Try to adopt a longer VDF chain (for split-brain merge)

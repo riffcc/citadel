@@ -50,7 +50,7 @@ struct MeshNode {
 impl MeshNode {
     fn new(id: &str) -> Self {
         let dir = tempdir().expect("Failed to create temp dir");
-        let storage = Arc::new(Storage::open(dir.path()).expect("Failed to open storage"));
+        let storage = Arc::new(Storage::open(dir.path().join("storage.redb")).expect("Failed to open storage"));
 
         Self {
             id: id.to_string(),
@@ -737,10 +737,9 @@ async fn create_test_peer(
     entry_peers: Vec<String>,
 ) -> (Arc<MeshService>, TempDir, Arc<RwLock<citadel_lens::mesh::state::MeshState>>) {
     let dir = tempdir().expect("Failed to create temp dir");
-    let storage = Arc::new(Storage::open(dir.path()).expect("Failed to open storage"));
+    let storage = Arc::new(Storage::open(dir.path().join("storage.redb")).expect("Failed to open storage"));
 
-    let doc_store_path = dir.path().join("docs");
-    std::fs::create_dir_all(&doc_store_path).expect("Failed to create docs dir");
+    let doc_store_path = dir.path().join("docs.redb");
     let doc_store = DocumentStore::open(&doc_store_path).expect("Failed to open doc store");
 
     let listen_addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();

@@ -45,7 +45,7 @@ struct TestNode {
 impl TestNode {
     fn new() -> Self {
         let dir = tempdir().expect("Failed to create temp dir");
-        let store = DocumentStore::open(dir.path()).expect("Failed to open store");
+        let store = DocumentStore::open(dir.path().join("docs.redb")).expect("Failed to open store");
         Self { store, _dir: dir }
     }
 }

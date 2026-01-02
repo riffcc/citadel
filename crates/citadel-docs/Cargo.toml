@@ -11,7 +11,7 @@ citadel-crdt = { path = "../citadel-crdt" }
 citadel-spore = { path = "../citadel-spore" }
 
 # Storage
-rocksdb = "0.22"
+redb = "3"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

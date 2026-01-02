@@ -47,7 +47,7 @@ rand = "0.8"
 getrandom = "0.2"
 
 # Storage
-rocksdb = "0.22"
+redb = "3"
 
 # HTTP server + WebSocket
 axum = { version = "0.7", features = ["ws"] }

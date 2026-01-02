@@ -37,8 +37,32 @@ pub enum Error {
     Io(#[from] std::io::Error),
 }
 
-impl From<rocksdb::Error> for Error {
-    fn from(e: rocksdb::Error) -> Self {
+impl From<redb::DatabaseError> for Error {
+    fn from(e: redb::DatabaseError) -> Self {
+        Error::Storage(e.to_string())
+    }
+}
+
+impl From<redb::TransactionError> for Error {
+    fn from(e: redb::TransactionError) -> Self {
+        Error::Storage(e.to_string())
+    }
+}
+
+impl From<redb::TableError> for Error {
+    fn from(e: redb::TableError) -> Self {
+        Error::Storage(e.to_string())
+    }
+}
+
+impl From<redb::StorageError> for Error {
+    fn from(e: redb::StorageError) -> Self {
+        Error::Storage(e.to_string())
+    }
+}
+
+impl From<redb::CommitError> for Error {
+    fn from(e: redb::CommitError) -> Self {
         Error::Storage(e.to_string())
     }
 }
