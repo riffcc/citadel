@@ -27,7 +27,7 @@
             udev
             libclang.lib
             sccache
-
+            cargo-nextest
           ];
           LIBCLANG_PATH = "${pkgs.libclang.lib}/lib";
           RUSTC_WRAPPER="${pkgs.sccache}/bin/sccache";
