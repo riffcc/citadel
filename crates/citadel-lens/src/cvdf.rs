@@ -1431,14 +1431,31 @@ mod tests {
         println!("\n=== Weight Comparison PASSED ===\n");
     }
 
+    #[cfg(feature = "heavy_tests")]
     #[test]
-    fn test_cvdf_coordinator_collaboration() {
+    fn test_cvdf_coordinator_collaboration_heavy() {
+
+        println!("\n=== CVDF Coordinator Collaboration Heavy===\n");
+        run_test_cvdf_coordinator_collaboration(5, 20);
+
+        println!("\n=== Coordinator Collaboration Heavy PASSED ===\n");
+    }
+    #[cfg(not(feature = "heavy_tests"))]
+    #[test]
+    fn test_cvdf_coordinator_collaboration_light() {
+
+        println!("\n=== CVDF Coordinator Collaboration Light===\n");
+        run_test_cvdf_coordinator_collaboration(3, 5);
+
+        println!("\n=== Coordinator Collaboration Light PASSED ===\n");
+    }
+    fn run_test_cvdf_coordinator_collaboration(nodes: u64, rounds: u64) {
         let genesis_seed = [42u8; 32];
 
         println!("\n=== CVDF Coordinator Collaboration ===\n");
 
-        // Create 5 nodes
-        let keys: Vec<SigningKey> = (0..5)
+        // Create the nodes
+        let keys: Vec<SigningKey> = (0..nodes)
             .map(|_| SigningKey::generate(&mut OsRng))
             .collect();
 
@@ -1470,8 +1487,8 @@ mod tests {
 
         let start = std::time::Instant::now();
 
-        // Cooperatively produce 20 rounds
-        for _ in 0..20 {
+        // Cooperatively produce the rounds
+        for _ in 0..rounds {
             // All nodes create attestations
             let attestations: Vec<RoundAttestation> = coordinators.iter()
                 .map(|c| c.attest())
@@ -1507,20 +1524,20 @@ mod tests {
 
         // All coordinators should be at same height
         for (i, coord) in coordinators.iter().enumerate() {
-            assert_eq!(coord.height(), 20,
-                "Coordinator {} should be at height 20", i);
+            assert_eq!(coord.height(), rounds,
+                "Coordinator {} should be at height {}", i, rounds);
         }
 
         let total_weight = coordinators[0].weight();
         let avg_attesters = coordinators[0].chain().avg_attesters();
 
-        println!("5 nodes produced 20 rounds in {:?}", elapsed);
+        println!("{} nodes produced {} rounds in {:?}", nodes, rounds, elapsed);
         println!("Total chain weight: {}", total_weight);
         println!("Average attesters per round: {:.1}", avg_attesters);
-        println!("Expected weight: 1 + 20 * (1 + 5) = {}", 1 + 20 * 6);
+        println!("Expected weight: 1 + {} * (1 + {}) = {}", rounds, nodes, 1 + rounds * (1 + nodes));
 
         // Weight should be: genesis(1) + 20 rounds * (base 1 + 5 attesters)
-        assert_eq!(total_weight, 1 + 20 * 6);
+        assert_eq!(total_weight, 1 + rounds * (nodes + 1));
 
         println!("\n=== Coordinator Collaboration PASSED ===\n");
     }

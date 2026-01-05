@@ -672,14 +672,23 @@ mod tests {
         println!("A has priority: {}", claim_has_priority(&claim_a, &claim_b));
     }
 
+    #[cfg(feature = "heavy_tests")]
     #[test]
-    fn test_vdf_race_50_nodes() {
+    fn test_vdf_race_heavy() {
+        run_test_vdf_race_n_nodes(50);
+    }
+    #[cfg(not(feature = "heavy_tests"))]
+    #[test]
+    fn test_vdf_race_light() {
+        run_test_vdf_race_n_nodes(10);
+    }
+    fn run_test_vdf_race_n_nodes(nodes: usize) {
         let genesis_seed = [42u8; 32];
 
-        println!("\n=== VDF Race: 50 Node Bootstrap ===\n");
+        println!("\n=== VDF Race: {} Node Bootstrap ===\n", nodes);
 
         // Create 50 nodes with their signing keys
-        let keys: Vec<SigningKey> = (0..50)
+        let keys: Vec<SigningKey> = (0..nodes)
             .map(|_| SigningKey::generate(&mut OsRng))
             .collect();
 
@@ -752,34 +761,44 @@ mod tests {
         }
 
         println!("  Unique slots claimed: {}", claimed_slots.len());
-        assert_eq!(claimed_slots.len(), 50, "All 50 nodes should have unique slots");
+        assert_eq!(claimed_slots.len(), nodes, "All {} nodes should have unique slots", nodes);
 
         // Check slots are contiguous 0..50
-        for slot in 0..50 {
-            assert!(claimed_slots.contains(&slot), "Missing slot {}", slot);
+        for slot in 0..nodes {
+            assert!(claimed_slots.contains(&(slot as u64)), "Missing slot {}", slot);
         }
 
         println!("  ✓ All slots 0-49 claimed uniquely");
         println!("\n=== VDF Race Bootstrap PASSED ===\n");
     }
 
+    #[cfg(feature = "heavy_tests")]
     #[test]
-    fn test_split_brain_merge() {
+    fn test_split_brain_merge_heavy() {
+        run_test_split_brain_merge(30, 100, 20, 60);
+    } 
+    #[cfg(not(feature = "heavy_tests"))]
+    #[test]
+    fn test_split_brain_merge_light() {
+        run_test_split_brain_merge(30, 60, 10, 40);
+    } 
+    fn run_test_split_brain_merge(node_a_count: usize, a_ext_count: usize, node_b_count: usize, b_ext_count: usize) {
+        assert!(node_a_count > node_b_count, "test parameter error: {:?} should be larger than {:?}", node_a_count, node_b_count);
         let genesis_seed = [42u8; 32];
 
         println!("\n=== Split Brain Merge Test ===\n");
 
         // Partition A: 30 nodes, longer chain
-        let keys_a: Vec<SigningKey> = (0..30)
+        let keys_a: Vec<SigningKey> = (0..node_a_count)
             .map(|_| SigningKey::generate(&mut OsRng))
             .collect();
 
         let mut chain_a = VdfChain::new_genesis(genesis_seed, keys_a[0].verifying_key().to_bytes());
 
         // A extends chain 100 times (simulating 30 nodes taking turns)
-        for i in 0..100 {
+        for i in 0..a_ext_count {
             // Round-robin producers
-            let producer_idx = i % 30;
+            let producer_idx = i % node_a_count;
             chain_a = VdfChain {
                 genesis_seed,
                 links: chain_a.links.clone(),
@@ -788,16 +807,16 @@ mod tests {
             chain_a.extend();
         }
 
-        // Partition B: 20 nodes, shorter chain (started later or fewer nodes)
-        let keys_b: Vec<SigningKey> = (0..20)
+        // Partition B:  shorter chain (started later or fewer nodes)
+        let keys_b: Vec<SigningKey> = (0..node_b_count)
             .map(|_| SigningKey::generate(&mut OsRng))
             .collect();
 
         let mut chain_b = VdfChain::new_genesis(genesis_seed, keys_b[0].verifying_key().to_bytes());
 
-        // B extends chain 60 times
-        for i in 0..60 {
-            let producer_idx = i % 20;
+        // B extends its chain
+        for i in 0..b_ext_count {
+            let producer_idx = i % node_b_count;
             chain_b = VdfChain {
                 genesis_seed,
                 links: chain_b.links.clone(),

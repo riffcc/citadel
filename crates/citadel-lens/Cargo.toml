@@ -13,6 +13,8 @@ path = "src/main.rs"
 name = "lens-admin"
 path = "src/admin_cli.rs"
 
+[features]
+heavy_tests = []
 [dependencies]
 # Citadel crates
 citadel-topology = { path = "../citadel-topology" }
