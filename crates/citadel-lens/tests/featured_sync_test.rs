@@ -1,3 +1,4 @@
+#![cfg(feature = "server")]
 //! Convergence tests for Featured Releases with CRDT merging.
 //!
 //! These tests verify that FeaturedRelease documents converge correctly

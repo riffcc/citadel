@@ -701,7 +701,6 @@ dependencies = [
  "clap",
  "dirs",
  "ed25519-dalek",
- "futures",
  "getrandom 0.2.16",
  "hex",
  "pprof",

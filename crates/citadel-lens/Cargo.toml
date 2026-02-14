@@ -8,19 +8,40 @@ license.workspace = true
 [[bin]]
 name = "lens-node"
 path = "src/main.rs"
+required-features = ["server"]
 
 [[bin]]
 name = "lens-admin"
 path = "src/admin_cli.rs"
+required-features = ["server"]
+
+[features]
+default = ["server"]
+server = [
+    "dep:redb",
+    "dep:axum",
+    "dep:tower-http",
+    "dep:clap",
+    "dep:dirs",
+    "dep:chrono",
+    "dep:reqwest",
+    "dep:pprof",
+    "dep:citadel-dht",
+    "dep:citadel-protocols",
+    "dep:citadel-crdt",
+    "dep:citadel-docs",
+]
 
 [dependencies]
-# Citadel crates
+# Citadel crates (always available)
 citadel-topology = { path = "../citadel-topology" }
-citadel-dht = { path = "../citadel-dht" }
-citadel-protocols = { path = "../citadel-protocols" }
 citadel-spore = { path = "../citadel-spore" }
-citadel-crdt = { path = "../citadel-crdt" }
-citadel-docs = { path = "../citadel-docs" }
+
+# Citadel crates (server only)
+citadel-dht = { path = "../citadel-dht", optional = true }
+citadel-protocols = { path = "../citadel-protocols", optional = true }
+citadel-crdt = { path = "../citadel-crdt", optional = true }
+citadel-docs = { path = "../citadel-docs", optional = true }
 
 # Async runtime
 tokio = { workspace = true }
@@ -31,9 +52,6 @@ serde_json = { workspace = true }
 
 # Error handling
 thiserror = { workspace = true }
-
-# CLI parsing
-clap = { version = "4", features = ["derive", "env"] }
 
 # Logging
 tracing = { workspace = true }
@@ -46,25 +64,15 @@ hex = { workspace = true }
 rand = "0.8"
 getrandom = "0.2"
 
-# Storage
-redb = "3"
-
-# HTTP server + WebSocket
-axum = { version = "0.7", features = ["ws"] }
-tower-http = { version = "0.6", features = ["cors", "trace"] }
-futures = "0.3"
-
-# Date/time
-chrono = { version = "0.4", features = ["serde"] }
-
-# HTTP client for remote API (rustls for cross-compilation)
-reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
-
-# Home directory detection
-dirs = "5"
-
-# CPU profiling (flamegraphs, stack traces)
-pprof = { version = "0.15", features = ["flamegraph"] }
+# Server-only dependencies
+clap = { version = "4", features = ["derive", "env"], optional = true }
+redb = { version = "3", optional = true }
+axum = { version = "0.7", features = ["ws"], optional = true }
+tower-http = { version = "0.6", features = ["cors", "trace"], optional = true }
+chrono = { version = "0.4", features = ["serde"], optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"], optional = true }
+dirs = { version = "5", optional = true }
+pprof = { version = "0.15", features = ["flamegraph"], optional = true }
 
 [dev-dependencies]
 tempfile = "3"

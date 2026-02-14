@@ -1,3 +1,4 @@
+#![cfg(feature = "server")]
 //! Mesh Propagation Integration Tests
 //!
 //! These tests verify that content propagates correctly through the mesh:
