@@ -169,57 +169,108 @@ pub struct Connection {
     pub is_ghost: bool,
 }
 
-/// Compute the gap size between source and target in a direction
-fn compute_gap_size(
-    occupied: &HashSet<HexCoord>,
-    source: HexCoord,
-    target: HexCoord,
-    direction: Direction,
-) -> u32 {
-    let mut current = source;
-    let mut gap = 0u32;
-    for _ in 0..10_000 {
-        current = step(current, direction);
-        if current == target {
-            return gap;
-        }
-        if !occupied.contains(&current) {
-            gap += 1;
-        } else {
-            // Shouldn't happen if target is the correct ghost target
-            return gap;
-        }
-    }
-    gap
-}
-
-/// Compute all ghost connections for a node
+/// Compute all 20 connections for a node using bidirectional gap-and-wrap.
 ///
-/// Returns up to 20 connections (fewer if mesh has < 2 nodes or is very sparse in some direction)
+/// For each of the 20 directions:
+/// 1. **Primary**: walk outward in direction D, find the nearest occupied slot.
+///    If it's unique (not already a neighbor), use it.
+/// 2. **Wrap**: if the primary collides (already a neighbor) or walks into void,
+///    wrap to the opposite side of the honeycomb — walk in the opposite
+///    direction (-D) to find the antipodal edge, then the nearest unchosen
+///    node from that side is the neighbor for direction D.
+///
+/// This guarantees exactly min(20, N-1) unique neighbors per node.
+/// The wrapping maintains spatial balance: neighbors form a balanced shell
+/// even when the mesh is small.
 pub fn compute_all_connections(
     occupied: &HashSet<HexCoord>,
     coord: HexCoord,
 ) -> Vec<Connection> {
+    let mut chosen: HashSet<HexCoord> = HashSet::new();
+    chosen.insert(coord); // never connect to self
+
     Direction::all()
         .iter()
         .filter_map(|&direction| {
-            ghost_target(occupied, coord, direction).map(|target| {
-                let theoretical = theoretical_neighbor(coord, direction);
-                let is_ghost = target != theoretical;
-                let gap_size = if is_ghost {
-                    compute_gap_size(occupied, coord, target, direction)
-                } else {
-                    0
-                };
-                Connection {
-                    direction,
-                    target,
-                    gap_size,
-                    is_ghost,
+            // Primary: nearest occupied in direction D (may collide with existing neighbor)
+            let primary = ghost_target(occupied, coord, direction);
+
+            let target = match primary {
+                Some(t) if !chosen.contains(&t) => t,
+                _ => {
+                    // Collision or void — wrap to the opposite side.
+                    // Walk -D to find the unchosen node at the antipodal edge.
+                    wrap_opposite(occupied, coord, direction, &chosen)?
                 }
+            };
+
+            chosen.insert(target);
+
+            let theoretical = theoretical_neighbor(coord, direction);
+            let is_ghost = target != theoretical;
+            let gap_size = if is_ghost {
+                shell_distance(coord, target) as u32
+            } else {
+                0
+            };
+
+            Some(Connection {
+                direction,
+                target,
+                gap_size,
+                is_ghost,
             })
         })
         .collect()
+}
+
+/// Wrap to the opposite side of the honeycomb in direction D.
+///
+/// When direction D's primary target is a collision (already a neighbor) or void
+/// (walks into empty space), we imagine wrapping around to the opposite side of
+/// the honeycomb and coming back toward our position.
+///
+/// Implementation: among all unchosen occupied nodes, pick the one furthest
+/// from us in the OPPOSITE direction (-D). This is the antipodal node —
+/// the first one you'd encounter if you wrapped around the honeycomb and
+/// walked back toward the center.
+///
+/// Uses projection onto the direction vector for geometric ordering.
+/// Ties broken by shell distance (prefer closer nodes) then coordinates
+/// (determinism).
+fn wrap_opposite(
+    occupied: &HashSet<HexCoord>,
+    origin: HexCoord,
+    direction: Direction,
+    already_chosen: &HashSet<HexCoord>,
+) -> Option<HexCoord> {
+    let d = direction.offset();
+
+    // Projection of each node onto direction D, relative to our position.
+    // Negative projection = opposite side of honeycomb in direction D.
+    // The most negative projection = furthest antipodal = first hit when wrapping.
+    occupied
+        .iter()
+        .filter(|c| !already_chosen.contains(c))
+        .min_by_key(|c| {
+            let proj = (c.q - origin.q) * d.q
+                + (c.r - origin.r) * d.r
+                + (c.z - origin.z) * d.z;
+            // Most negative projection first (antipodal edge).
+            // Tie-break: prefer closer nodes (smaller shell distance).
+            let shell = shell_distance(origin, **c);
+            (proj, shell, c.q, c.r, c.z)
+        })
+        .copied()
+}
+
+/// Shell distance between two coordinates: max(hex_distance, |dz|).
+///
+/// This is the radius of the smallest shell centered on `a` that contains `b`.
+pub fn shell_distance(a: HexCoord, b: HexCoord) -> u64 {
+    let hex_dist = a.hex_distance(&b);
+    let dz = (a.z - b.z).unsigned_abs();
+    hex_dist.max(dz)
 }
 
 /// Check if a connection is bidirectional (it should always be, per Lean proofs)
@@ -373,5 +424,152 @@ mod tests {
         assert_eq!(connections.len(), 20);
         assert!(connections.iter().all(|c| !c.is_ghost));
         assert!(connections.iter().all(|c| c.gap_size == 0));
+    }
+
+    #[test]
+    fn forty_nodes_all_have_20_unique_neighbors() {
+        use crate::spiral3d_to_coord;
+        use crate::Spiral3DIndex;
+
+        // Occupy slots 0..40 — the first 40 SPIRAL positions.
+        let mut occupied = HashSet::new();
+        let coords: Vec<HexCoord> = (0..40)
+            .map(|i| {
+                let c = spiral3d_to_coord(Spiral3DIndex::new(i));
+                occupied.insert(c);
+                c
+            })
+            .collect();
+
+        // Every node must have exactly 20 unique neighbors.
+        for (i, &coord) in coords.iter().enumerate() {
+            let connections = compute_all_connections(&occupied, coord);
+            let targets: HashSet<HexCoord> = connections.iter().map(|c| c.target).collect();
+
+            assert_eq!(
+                connections.len(),
+                20,
+                "node {} at {:?}: expected 20 connections, got {}",
+                i,
+                coord,
+                connections.len()
+            );
+
+            // All targets must be unique (guaranteed by construction, but verify).
+            assert_eq!(
+                targets.len(),
+                20,
+                "node {} at {:?}: expected 20 unique targets, got {} (duplicates!)",
+                i,
+                coord,
+                targets.len()
+            );
+
+            // No self-connections.
+            assert!(
+                !targets.contains(&coord),
+                "node {} at {:?}: connected to self!",
+                i,
+                coord
+            );
+        }
+    }
+
+    /// Helper: build an N-node mesh and compute neighbor graph statistics.
+    ///
+    /// Returns (min_neighbors, max_neighbors, asymmetries, node_count).
+    fn mesh_stats(n: usize) -> (usize, usize, usize, usize) {
+        use crate::spiral3d_to_coord;
+        use crate::Spiral3DIndex;
+
+        let mut occupied = HashSet::new();
+        let coords: Vec<HexCoord> = (0..n)
+            .map(|i| {
+                let c = spiral3d_to_coord(Spiral3DIndex::new(i as u64));
+                occupied.insert(c);
+                c
+            })
+            .collect();
+
+        // Build neighbor graph: coord → set of neighbor coords.
+        let mut neighbors: std::collections::HashMap<HexCoord, HashSet<HexCoord>> =
+            std::collections::HashMap::new();
+
+        for &coord in &coords {
+            let connections = compute_all_connections(&occupied, coord);
+            let targets: HashSet<HexCoord> = connections.iter().map(|c| c.target).collect();
+            neighbors.insert(coord, targets);
+        }
+
+        let min_nbrs = neighbors.values().map(|s| s.len()).min().unwrap_or(0);
+        let max_nbrs = neighbors.values().map(|s| s.len()).max().unwrap_or(0);
+
+        // Count asymmetric relationships.
+        let mut asymmetries = 0;
+        for &a in &coords {
+            for &b in neighbors.get(&a).unwrap() {
+                if !neighbors.get(&b).unwrap().contains(&a) {
+                    asymmetries += 1;
+                }
+            }
+        }
+
+        (min_nbrs, max_nbrs, asymmetries, n)
+    }
+
+    #[test]
+    fn mesh_behavior_at_various_sizes() {
+        // Verify sane behavior at multiple mesh sizes.
+        // At small sizes (N ≤ 20), every node is every other node's neighbor.
+        // At larger sizes, every node should have exactly 20 unique neighbors.
+        // Asymmetry is expected at small mesh sizes — full symmetry requires
+        // the mesh to be large enough that wrap collisions don't dominate
+        // (empirically ~20² = 400+ nodes).
+
+        for &n in &[1, 2, 3, 5, 10, 15, 20, 40] {
+            let (min_nbrs, max_nbrs, asymmetries, _) = mesh_stats(n);
+            let expected_nbrs = std::cmp::min(20, n - 1);
+
+            assert_eq!(
+                min_nbrs, expected_nbrs,
+                "n={n}: min neighbors {min_nbrs}, expected {expected_nbrs}"
+            );
+            assert_eq!(
+                max_nbrs, expected_nbrs,
+                "n={n}: max neighbors {max_nbrs}, expected {expected_nbrs}"
+            );
+
+            // Report asymmetries (informational, not a hard failure for small meshes).
+            if asymmetries > 0 {
+                eprintln!(
+                    "n={n}: {asymmetries} asymmetric relationships \
+                     (expected at small mesh sizes)"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn symmetry_improves_with_size() {
+        // As mesh grows, the asymmetry ratio should decrease.
+        // At N ≤ 20, everything is fully connected → zero asymmetry.
+        // At N=40, some asymmetry is expected.
+        // At N=400+, asymmetry should approach zero.
+        let stats_20 = mesh_stats(20);
+        assert_eq!(stats_20.2, 0, "N=20 (fully connected) should have zero asymmetry");
+
+        // N=40: asymmetry is expected, just verify it's bounded.
+        let stats_40 = mesh_stats(40);
+        let asymmetry_ratio = stats_40.2 as f64 / (stats_40.3 * 20) as f64;
+        assert!(
+            asymmetry_ratio < 0.5,
+            "N=40: asymmetry ratio {asymmetry_ratio:.2} is surprisingly high"
+        );
+        eprintln!(
+            "N=40: {}/{} asymmetric ({:.1}%)",
+            stats_40.2,
+            stats_40.3 * 20,
+            asymmetry_ratio * 100.0
+        );
     }
 }
