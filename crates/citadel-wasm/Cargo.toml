@@ -7,13 +7,6 @@ description = "WASM bindings for Citadel P2P in browsers"
 [lib]
 crate-type = ["cdylib", "rlib"]
 
-[profile.release]
-opt-level = 3    # Maximum optimization for speed
-lto = "fat"      # Aggressive Link Time Optimization
-codegen-units = 1  # Single codegen unit for maximum optimization
-strip = true     # Strip symbols for smaller binary
-panic = "abort"  # Abort on panic (smaller + faster)
-
 [dependencies]
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
