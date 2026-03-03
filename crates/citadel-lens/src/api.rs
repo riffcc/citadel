@@ -1434,6 +1434,20 @@ async fn create_featured_release(
         .put_featured_release(&featured)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
+    // SPORE: Flood featured releases so they propagate across the mesh
+    if let Some(ref flood_tx) = state.flood_tx {
+        if let Ok(all_featured) = state.storage.list_featured_releases() {
+            let featured_json: Vec<String> = all_featured.iter()
+                .filter_map(|f| serde_json::to_string(f).ok())
+                .collect();
+            let _ = flood_tx.send(FloodMessage::FeaturedSync {
+                peer_id: "api".to_string(),
+                featured: featured_json,
+            });
+            tracing::debug!("SPORE: Broadcast FeaturedSync after creating featured release");
+        }
+    }
+
     Ok((StatusCode::CREATED, Json(featured)))
 }
 
@@ -1555,6 +1569,20 @@ async fn update_featured_release(
         .put_featured_release(&featured)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
+    // SPORE: Flood featured releases so they propagate across the mesh
+    if let Some(ref flood_tx) = state.flood_tx {
+        if let Ok(all_featured) = state.storage.list_featured_releases() {
+            let featured_json: Vec<String> = all_featured.iter()
+                .filter_map(|f| serde_json::to_string(f).ok())
+                .collect();
+            let _ = flood_tx.send(FloodMessage::FeaturedSync {
+                peer_id: "api".to_string(),
+                featured: featured_json,
+            });
+            tracing::debug!("SPORE: Broadcast FeaturedSync after updating featured release");
+        }
+    }
+
     Ok(Json(featured))
 }
 
@@ -1592,6 +1620,19 @@ async fn delete_featured_release(
     match state.storage.get_featured_release(&id) {
         Ok(Some(_)) => {
             if state.storage.delete_featured_release(&id).is_ok() {
+                // SPORE: Flood updated featured releases so deletion propagates
+                if let Some(ref flood_tx) = state.flood_tx {
+                    if let Ok(all_featured) = state.storage.list_featured_releases() {
+                        let featured_json: Vec<String> = all_featured.iter()
+                            .filter_map(|f| serde_json::to_string(f).ok())
+                            .collect();
+                        let _ = flood_tx.send(FloodMessage::FeaturedSync {
+                            peer_id: "api".to_string(),
+                            featured: featured_json,
+                        });
+                        tracing::debug!("SPORE: Broadcast FeaturedSync after deleting featured release");
+                    }
+                }
                 StatusCode::NO_CONTENT
             } else {
                 StatusCode::INTERNAL_SERVER_ERROR
@@ -2723,4 +2764,3 @@ async fn admin_mesh_stats(
         }))
     }
 }
-
