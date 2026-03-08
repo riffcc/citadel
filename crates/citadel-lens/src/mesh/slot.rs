@@ -6,8 +6,8 @@
 //! - Latency tracking for optimization
 
 use citadel_topology::{
-    compute_all_connections, ghost_target, Connection, Direction, HexCoord, Neighbors,
-    Spiral3DIndex, spiral3d_to_coord,
+    compute_all_connections, ghost_target, spiral3d_to_coord, Connection, Direction, HexCoord,
+    Neighbors, Spiral3DIndex,
 };
 use std::collections::HashSet;
 
@@ -123,20 +123,20 @@ impl SlotClaim {
 /// - 20 nodes: 11/20 must agree (9 Byzantine tolerated!)
 pub fn consensus_threshold(mesh_size: usize) -> usize {
     match mesh_size {
-        0 | 1 => 1,      // Genesis: auto-occupy slot 0
-        2 => 2,          // Pure TGP: 2/2 bilateral (both agree or neither)
-        3 => 2,          // Triad: 2/3 (one Byzantine tolerated)
-        4 => 3,          // BFT emerges: 3/4 (f=1, 2f+1=3)
-        5 => 4,          // f=1, 2f+1=3, but need >50% so 4/5
-        6 => 4,          // f=1, 2f+1=3, but need >50% so 4/6
-        7 => 5,          // f=2, 2f+1=5 (two Byzantine tolerated)
-        8 => 6,          // f=2, need >50%
-        9 => 6,          // f=2, need >50%
-        10 => 7,         // f=3, 2f+1=7
-        11..=13 => 8,    // f=3-4, scaling
-        14..=16 => 9,    // f=4-5, approaching full mesh
-        17..=19 => 10,   // f=5-6, almost there
-        _ => 11,         // Full mesh: 11/20 (9 Byzantine tolerated)
+        0 | 1 => 1,    // Genesis: auto-occupy slot 0
+        2 => 2,        // Pure TGP: 2/2 bilateral (both agree or neither)
+        3 => 2,        // Triad: 2/3 (one Byzantine tolerated)
+        4 => 3,        // BFT emerges: 3/4 (f=1, 2f+1=3)
+        5 => 4,        // f=1, 2f+1=3, but need >50% so 4/5
+        6 => 4,        // f=1, 2f+1=3, but need >50% so 4/6
+        7 => 5,        // f=2, 2f+1=5 (two Byzantine tolerated)
+        8 => 6,        // f=2, need >50%
+        9 => 6,        // f=2, need >50%
+        10 => 7,       // f=3, 2f+1=7
+        11..=13 => 8,  // f=3-4, scaling
+        14..=16 => 9,  // f=4-5, approaching full mesh
+        17..=19 => 10, // f=5-6, almost there
+        _ => 11,       // Full mesh: 11/20 (9 Byzantine tolerated)
     }
 }
 

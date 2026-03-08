@@ -209,30 +209,27 @@ fn execute_command(
             }
         }
 
-        AdminCommand::ListAdmins => {
-            match storage.list_admins() {
-                Ok(admins) => AdminResponse::List { items: admins },
-                Err(e) => AdminResponse::Error {
-                    error: e.to_string(),
-                },
-            }
-        }
+        AdminCommand::ListAdmins => match storage.list_admins() {
+            Ok(admins) => AdminResponse::List { items: admins },
+            Err(e) => AdminResponse::Error {
+                error: e.to_string(),
+            },
+        },
 
-        AdminCommand::IsAdmin { public_key } => {
-            match storage.is_admin(&public_key) {
-                Ok(is_admin) => AdminResponse::Bool { value: is_admin },
-                Err(e) => AdminResponse::Error {
-                    error: e.to_string(),
-                },
-            }
-        }
+        AdminCommand::IsAdmin { public_key } => match storage.is_admin(&public_key) {
+            Ok(is_admin) => AdminResponse::Bool { value: is_admin },
+            Err(e) => AdminResponse::Error {
+                error: e.to_string(),
+            },
+        },
 
         AdminCommand::Ping => AdminResponse::Pong,
 
         AdminCommand::StartProfiling => {
             tracing::info!("Profiling mode enabled");
             AdminResponse::Ok {
-                message: "Profiling enabled. cpu-profile will auto-collect when called.".to_string(),
+                message: "Profiling enabled. cpu-profile will auto-collect when called."
+                    .to_string(),
             }
         }
 
@@ -248,7 +245,9 @@ fn execute_command(
             tracing::info!("CPU profiling: collecting for 5 seconds...");
             match collect_cpu_profile(5) {
                 Ok(profile_data) => AdminResponse::Profile { data: profile_data },
-                Err(e) => AdminResponse::Error { error: e.to_string() },
+                Err(e) => AdminResponse::Error {
+                    error: e.to_string(),
+                },
             }
         }
 
@@ -262,7 +261,8 @@ fn execute_command(
             // Note: This handler doesn't have access to mesh state
             // Return error suggesting to use the HTTP API instead
             AdminResponse::Error {
-                error: "Mesh stats not available via socket. Use HTTP API with --url flag.".to_string(),
+                error: "Mesh stats not available via socket. Use HTTP API with --url flag."
+                    .to_string(),
             }
         }
     }
@@ -270,7 +270,9 @@ fn execute_command(
 
 /// Collect CPU profile using pprof for N seconds
 /// Returns flamegraph data and top functions
-pub fn collect_cpu_profile(duration_secs: u64) -> std::result::Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+pub fn collect_cpu_profile(
+    duration_secs: u64,
+) -> std::result::Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
     use pprof::ProfilerGuard;
 
     // Start the profiler (100 Hz sampling)
@@ -283,26 +285,30 @@ pub fn collect_cpu_profile(duration_secs: u64) -> std::result::Result<serde_json
     let report = guard.report().build()?;
 
     let mut result = serde_json::Map::new();
-    result.insert("duration_secs".to_string(), serde_json::json!(duration_secs));
+    result.insert(
+        "duration_secs".to_string(),
+        serde_json::json!(duration_secs),
+    );
     result.insert("sample_rate_hz".to_string(), serde_json::json!(100));
 
     // Get flamegraph as SVG
     let mut flamegraph_svg = Vec::new();
     if report.flamegraph(&mut flamegraph_svg).is_ok() {
         // Base64 encode the SVG for JSON transport
-        result.insert("flamegraph_svg_base64".to_string(),
-            serde_json::json!(base64_encode(&flamegraph_svg)));
-        result.insert("flamegraph_size_bytes".to_string(),
-            serde_json::json!(flamegraph_svg.len()));
+        result.insert(
+            "flamegraph_svg_base64".to_string(),
+            serde_json::json!(base64_encode(&flamegraph_svg)),
+        );
+        result.insert(
+            "flamegraph_size_bytes".to_string(),
+            serde_json::json!(flamegraph_svg.len()),
+        );
     }
 
     // Get top frames for quick view
     let mut top_frames = Vec::new();
     for (frames, count) in report.data.iter().take(20) {
-        let frame_names: Vec<String> = frames.frames.iter()
-            .flatten()
-            .map(|f| f.name())
-            .collect();
+        let frame_names: Vec<String> = frames.frames.iter().flatten().map(|f| f.name()).collect();
         if !frame_names.is_empty() {
             top_frames.push(serde_json::json!({
                 "count": count,
@@ -313,11 +319,13 @@ pub fn collect_cpu_profile(duration_secs: u64) -> std::result::Result<serde_json
     result.insert("top_stacks".to_string(), serde_json::json!(top_frames));
 
     // Add timestamp
-    result.insert("timestamp".to_string(),
+    result.insert(
+        "timestamp".to_string(),
         serde_json::json!(std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_secs()));
+            .as_secs()),
+    );
 
     Ok(serde_json::Value::Object(result))
 }
@@ -411,8 +419,14 @@ pub fn get_memory_stats() -> serde_json::Value {
         if parts.len() > 22 {
             if let (Ok(utime), Ok(stime)) = (parts[13].parse::<u64>(), parts[14].parse::<u64>()) {
                 let ticks_per_sec = 100u64;
-                result.insert("cpu_user_secs".to_string(), serde_json::json!(utime / ticks_per_sec));
-                result.insert("cpu_system_secs".to_string(), serde_json::json!(stime / ticks_per_sec));
+                result.insert(
+                    "cpu_user_secs".to_string(),
+                    serde_json::json!(utime / ticks_per_sec),
+                );
+                result.insert(
+                    "cpu_system_secs".to_string(),
+                    serde_json::json!(stime / ticks_per_sec),
+                );
             }
         }
     }

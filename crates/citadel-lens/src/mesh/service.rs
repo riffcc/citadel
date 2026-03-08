@@ -7,13 +7,13 @@
 //! - VDF/CVDF consensus
 //! - SPORE sync
 
+use crate::accountability::{AccountabilityTracker, FailureType};
+use crate::cvdf::{CvdfCoordinator, CvdfRound, RoundAttestation};
 use crate::error::Result;
+use crate::liveness::{LivenessManager, MeshVouch, PropagationDecision};
 use crate::models::FeaturedRelease;
 use crate::storage::Storage;
 use crate::vdf_race::{claim_has_priority, AnchoredSlotClaim, VdfLink, VdfRace};
-use crate::cvdf::{CvdfCoordinator, CvdfRound, RoundAttestation};
-use crate::accountability::{AccountabilityTracker, FailureType};
-use crate::liveness::{LivenessManager, MeshVouch, PropagationDecision};
 use citadel_docs::DocumentStore;
 use citadel_protocols::{
     CoordinatorConfig, FloodRateConfig, KeyPair, Message as TgpMessage, MessagePayload,
@@ -32,7 +32,9 @@ use tracing::{debug, error, info, warn};
 
 // Import types from sibling modules
 use super::flood::FloodMessage;
-use super::peer::{compute_peer_id, compute_peer_id_from_bytes, double_hash_id, AuthorizedPeer, MeshPeer};
+use super::peer::{
+    compute_peer_id, compute_peer_id_from_bytes, double_hash_id, AuthorizedPeer, MeshPeer,
+};
 use super::slot::{consensus_threshold, SlotClaim};
 use super::spore::{build_spore_havelist, release_id_to_u256};
 use super::state::MeshState;
@@ -80,12 +82,11 @@ impl MeshService {
         doc_store: DocumentStore,
     ) -> Self {
         // Generate or load node keypair for peer identity
-        let signing_key = storage.get_or_create_node_key()
-            .unwrap_or_else(|_| {
-                // Fallback: generate ephemeral key
-                let mut rng = rand::thread_rng();
-                SigningKey::generate(&mut rng)
-            });
+        let signing_key = storage.get_or_create_node_key().unwrap_or_else(|_| {
+            // Fallback: generate ephemeral key
+            let mut rng = rand::thread_rng();
+            SigningKey::generate(&mut rng)
+        });
 
         // PeerID is double-BLAKE3 hash of ed25519 public key (Archivist/IPFS style)
         let verifying_key = signing_key.verifying_key();
@@ -107,7 +108,7 @@ impl MeshService {
         // This is derived from signing_key and shared via Arc across all sessions
         let tgp_keypair = Arc::new(
             KeyPair::from_seed(&signing_key.to_bytes())
-                .expect("Failed to create TGP keypair from signing key")
+                .expect("Failed to create TGP keypair from signing key"),
         );
 
         // Channel for pending connections to spawn from listener
@@ -123,29 +124,29 @@ impl MeshService {
                 self_id,
                 signing_key: signing_key.clone(),
                 tgp_keypair,
-                udp_socket: None,  // Set when run() is called
-                authorized_peers: HashMap::new(),  // TGP-native: QuadProof-authorized peers
+                udp_socket: None,                 // Set when run() is called
+                authorized_peers: HashMap::new(), // TGP-native: QuadProof-authorized peers
                 self_slot: None,
                 pending_slot_claim: None,
                 peers: HashMap::new(),
                 claimed_slots: HashMap::new(),
                 slot_coords: HashSet::new(),
                 spore_sync: Some(spore_sync),
-                vdf_race: None,    // Initialized when joining mesh or as genesis
+                vdf_race: None, // Initialized when joining mesh or as genesis
                 vdf_claims: HashMap::new(),
-                pol_manager: None,  // Initialized after claiming a slot
+                pol_manager: None, // Initialized after claiming a slot
                 pol_pending_pings: HashMap::new(),
-                cvdf: None,        // Initialized as genesis or when joining mesh
+                cvdf: None, // Initialized as genesis or when joining mesh
                 latency_history: HashMap::new(),
-                observed_public_addr: None,  // Learned from peers via hello
+                observed_public_addr: None, // Learned from peers via hello
                 // SPORE⁻¹: Deletion sync (inverse of SPORE) - GDPR Art. 17 compliant
-                do_not_want: Spore::empty(),      // Deletions as ranges in 256-bit space
+                do_not_want: Spore::empty(), // Deletions as ranges in 256-bit space
                 erasure_confirmed: Spore::empty(), // Ranges peers confirmed they deleted
-                erasure_synced: HashMap::new(),   // Peer sync status for GC/audit
+                erasure_synced: HashMap::new(), // Peer sync status for GC/audit
                 // BadBits: Permanent blocklist (NOT for normal deletes)
-                bad_bits: HashSet::new(),         // DMCA, abuse - never GC, blocks re-upload
-                accountability: Some(AccountabilityTracker::new(signing_key.clone())),  // Misbehaviour tracking
-                liveness: Some(LivenessManager::new(signing_key)),  // Structure-aware liveness (2-hop vouches)
+                bad_bits: HashSet::new(), // DMCA, abuse - never GC, blocks re-upload
+                accountability: Some(AccountabilityTracker::new(signing_key.clone())), // Misbehaviour tracking
+                liveness: Some(LivenessManager::new(signing_key)), // Structure-aware liveness (2-hop vouches)
             })),
             // Separate lock for TGP sessions - contention-free TGP operations
             tgp_sessions: Arc::new(RwLock::new(HashMap::new())),
@@ -237,12 +238,17 @@ impl MeshService {
 
         // Check if slot is already claimed (race condition check)
         if state.claimed_slots.contains_key(&target_slot) {
-            info!("Slot {} already claimed, will retry on next peer event", target_slot);
+            info!(
+                "Slot {} already claimed, will retry on next peer event",
+                target_slot
+            );
             return;
         }
 
         // Gather peers to start TGP with (only those with public keys)
-        let peers_to_tgp: Vec<(String, SocketAddr, [u8; 32])> = state.peers.values()
+        let peers_to_tgp: Vec<(String, SocketAddr, [u8; 32])> = state
+            .peers
+            .values()
             .filter_map(|p| {
                 p.public_key.as_ref().and_then(|pk| {
                     if pk.len() == 32 {
@@ -265,12 +271,19 @@ impl MeshService {
         // Set pending claim ONLY if we have peers to TGP with
         state.pending_slot_claim = Some(target_slot);
         let target_coord = spiral3d_to_coord(Spiral3DIndex::new(target_slot));
-        let commitment_msg = format!("mesh_slot:{}:{}:{}", target_slot, target_coord.q, target_coord.r);
+        let commitment_msg = format!(
+            "mesh_slot:{}:{}:{}",
+            target_slot, target_coord.q, target_coord.r
+        );
 
         let my_keypair = (*state.tgp_keypair).clone();
         drop(state);
 
-        info!("Starting TGP for slot {} with {} peers", target_slot, peers_to_tgp.len());
+        info!(
+            "Starting TGP for slot {} with {} peers",
+            target_slot,
+            peers_to_tgp.len()
+        );
 
         // Create TGP sessions and send first messages
         for (peer_id, peer_addr, pubkey_bytes) in peers_to_tgp {
@@ -313,10 +326,10 @@ impl MeshService {
     /// Genesis seed for VDF chain (shared across all nodes in the mesh)
     /// In production, this would be derived from network genesis block or similar
     const VDF_GENESIS_SEED: [u8; 32] = [
-        0x43, 0x49, 0x54, 0x41, 0x44, 0x45, 0x4c, 0x2d,  // "CITADEL-"
-        0x56, 0x44, 0x46, 0x2d, 0x47, 0x45, 0x4e, 0x45,  // "VDF-GENE"
-        0x53, 0x49, 0x53, 0x2d, 0x53, 0x45, 0x45, 0x44,  // "SIS-SEED"
-        0x2d, 0x56, 0x31, 0x2e, 0x30, 0x2e, 0x30, 0x00,  // "-V1.0.0\0"
+        0x43, 0x49, 0x54, 0x41, 0x44, 0x45, 0x4c, 0x2d, // "CITADEL-"
+        0x56, 0x44, 0x46, 0x2d, 0x47, 0x45, 0x4e, 0x45, // "VDF-GENE"
+        0x53, 0x49, 0x53, 0x2d, 0x53, 0x45, 0x45, 0x44, // "SIS-SEED"
+        0x2d, 0x56, 0x31, 0x2e, 0x30, 0x2e, 0x30, 0x00, // "-V1.0.0\0"
     ];
 
     /// Initialize VDF race as genesis node (first node in mesh)
@@ -371,7 +384,8 @@ impl MeshService {
         // Also create regular slot claim for compatibility
         let peer_id = state.self_id.clone();
         let public_key_bytes = state.signing_key.verifying_key().as_bytes().to_vec();
-        let slot_claim = SlotClaim::with_public_key(index, peer_id.clone(), Some(public_key_bytes.clone()));
+        let slot_claim =
+            SlotClaim::with_public_key(index, peer_id.clone(), Some(public_key_bytes.clone()));
         let coord = slot_claim.coord;
 
         state.self_slot = Some(slot_claim.clone());
@@ -394,7 +408,9 @@ impl MeshService {
         self.cvdf_register_slot(index, pubkey_arr).await;
 
         // Flood the VDF claim (signed, with VDF height for ordering)
-        self.flood(FloodMessage::VdfSlotClaim { claim: claim.clone() });
+        self.flood(FloodMessage::VdfSlotClaim {
+            claim: claim.clone(),
+        });
 
         Some(claim)
     }
@@ -453,19 +469,25 @@ impl MeshService {
             let peer_id = format!("b3b3/{}", hex::encode(claimer_pubkey));
 
             // Remove old slot if this peer claimed a different one
-            let old_slot = state.claimed_slots.iter()
+            let old_slot = state
+                .claimed_slots
+                .iter()
                 .find(|(_, c)| c.peer_id == peer_id)
                 .map(|(idx, c)| (*idx, c.coord));
             if let Some((old_idx, old_coord)) = old_slot {
                 if old_idx != slot {
-                    debug!("Peer {} moving from slot {} to slot {}", peer_id, old_idx, slot);
+                    debug!(
+                        "Peer {} moving from slot {} to slot {}",
+                        peer_id, old_idx, slot
+                    );
                     state.claimed_slots.remove(&old_idx);
                     state.slot_coords.remove(&old_coord);
                 }
             }
 
             // Create SlotClaim from VDF claim
-            let slot_claim = SlotClaim::with_public_key(slot, peer_id, Some(claimer_pubkey.to_vec()));
+            let slot_claim =
+                SlotClaim::with_public_key(slot, peer_id, Some(claimer_pubkey.to_vec()));
             state.slot_coords.insert(slot_claim.coord);
             state.claimed_slots.insert(slot, slot_claim);
         }
@@ -493,7 +515,8 @@ impl MeshService {
         if vdf_race.try_adopt_chain(other_links) {
             info!(
                 "Adopted longer VDF chain: {} -> {} (split-brain merge)",
-                our_height, vdf_race.height()
+                our_height,
+                vdf_race.height()
             );
             true
         } else {
@@ -508,7 +531,9 @@ impl MeshService {
     /// Get VDF chain links for syncing to peers
     pub async fn get_vdf_chain_links(&self) -> Vec<VdfLink> {
         let state = self.state.read().await;
-        state.vdf_race.as_ref()
+        state
+            .vdf_race
+            .as_ref()
             .map(|v| v.chain_links().to_vec())
             .unwrap_or_default()
     }
@@ -565,7 +590,11 @@ impl MeshService {
 
     /// Initialize CVDF by joining existing swarm
     /// Takes rounds from bootstrap peer and slot registrations
-    pub async fn init_cvdf_join(&self, rounds: Vec<CvdfRound>, slots: Vec<(u64, [u8; 32])>) -> bool {
+    pub async fn init_cvdf_join(
+        &self,
+        rounds: Vec<CvdfRound>,
+        slots: Vec<(u64, [u8; 32])>,
+    ) -> bool {
         let mut state = self.state.write().await;
         let signing_key = state.signing_key.clone();
 
@@ -593,7 +622,11 @@ impl MeshService {
         let mut state = self.state.write().await;
         if let Some(ref mut cvdf) = state.cvdf {
             cvdf.register_slot(slot, pubkey);
-            debug!("CVDF registered slot {} with pubkey {:?}", slot, &pubkey[..8]);
+            debug!(
+                "CVDF registered slot {} with pubkey {:?}",
+                slot,
+                &pubkey[..8]
+            );
         }
     }
 
@@ -686,7 +719,9 @@ impl MeshService {
     /// Get CVDF tip hash
     pub async fn cvdf_tip(&self) -> [u8; 32] {
         let state = self.state.read().await;
-        state.cvdf.as_ref()
+        state
+            .cvdf
+            .as_ref()
             .map(|c| c.chain().tip_output())
             .unwrap_or([0u8; 32])
     }
@@ -734,8 +769,11 @@ impl MeshService {
 
             // Try to produce a round
             if let Some(round) = self.cvdf_try_produce().await {
-                info!("CVDF produced round {} (weight {})",
-                    round.round, round.weight());
+                info!(
+                    "CVDF produced round {} (weight {})",
+                    round.round,
+                    round.weight()
+                );
                 // Staple SPORE proof to heartbeat - empty at convergence (zero overhead)
                 let spore_proof = citadel_spore::Spore::empty();
                 self.flood(FloodMessage::CvdfNewRound { round, spore_proof });
@@ -749,8 +787,12 @@ impl MeshService {
                     for slot_idx in &stale {
                         if let Some(claim) = state.claimed_slots.remove(slot_idx) {
                             state.slot_coords.remove(&claim.coord);
-                            info!("Evicted stale slot {} (peer {} - no attestation for {} rounds)",
-                                slot_idx, claim.peer_id, crate::cvdf::SLOT_LIVENESS_THRESHOLD);
+                            info!(
+                                "Evicted stale slot {} (peer {} - no attestation for {} rounds)",
+                                slot_idx,
+                                claim.peer_id,
+                                crate::cvdf::SLOT_LIVENESS_THRESHOLD
+                            );
                         }
                     }
                 }
@@ -772,7 +814,9 @@ impl MeshService {
     /// Check if a slot is live (has attested recently in CVDF)
     pub async fn is_slot_live(&self, slot: u64) -> bool {
         let state = self.state.read().await;
-        state.cvdf.as_ref()
+        state
+            .cvdf
+            .as_ref()
             .map(|c| c.is_slot_live(slot))
             .unwrap_or(false)
     }
@@ -780,7 +824,9 @@ impl MeshService {
     /// Get all stale slots (haven't attested in SLOT_LIVENESS_THRESHOLD rounds)
     pub async fn get_stale_slots(&self) -> Vec<u64> {
         let state = self.state.read().await;
-        state.cvdf.as_ref()
+        state
+            .cvdf
+            .as_ref()
             .map(|c| c.stale_slots())
             .unwrap_or_default()
     }
@@ -789,7 +835,9 @@ impl MeshService {
     /// Returns Vec<(slot, is_live, last_attestation_round)>
     pub async fn get_slot_liveness_status(&self) -> Vec<(u64, bool, Option<u64>)> {
         let state = self.state.read().await;
-        state.cvdf.as_ref()
+        state
+            .cvdf
+            .as_ref()
             .map(|c| c.slot_liveness_status())
             .unwrap_or_default()
     }
@@ -806,22 +854,28 @@ impl MeshService {
         let connections = self_slot.ghost_connections(&state.slot_coords);
         let cvdf = state.cvdf.as_ref();
 
-        connections.iter().filter_map(|conn| {
-            // Find slot index at target coord
-            let slot_idx = state.claimed_slots.values()
-                .find(|s| s.coord == conn.target)
-                .map(|s| s.index)?;
+        connections
+            .iter()
+            .filter_map(|conn| {
+                // Find slot index at target coord
+                let slot_idx = state
+                    .claimed_slots
+                    .values()
+                    .find(|s| s.coord == conn.target)
+                    .map(|s| s.index)?;
 
-            // Check liveness
-            let is_live = cvdf.map(|c| c.is_slot_live(slot_idx)).unwrap_or(false);
+                // Check liveness
+                let is_live = cvdf.map(|c| c.is_slot_live(slot_idx)).unwrap_or(false);
 
-            Some((conn.direction, slot_idx, is_live))
-        }).collect()
+                Some((conn.direction, slot_idx, is_live))
+            })
+            .collect()
     }
 
     /// Count live ghost neighbors
     pub async fn live_ghost_neighbor_count(&self) -> usize {
-        self.ghost_neighbor_liveness().await
+        self.ghost_neighbor_liveness()
+            .await
             .iter()
             .filter(|(_, _, live)| *live)
             .count()
@@ -831,7 +885,9 @@ impl MeshService {
     /// Returns list of pruned slot indices
     pub async fn prune_stale_slots(&self) -> Vec<u64> {
         let mut state = self.state.write().await;
-        state.cvdf.as_mut()
+        state
+            .cvdf
+            .as_mut()
             .map(|c| c.prune_stale_slots())
             .unwrap_or_default()
     }
@@ -871,7 +927,8 @@ impl MeshService {
                     let mut pubkey = [0u8; 32];
                     pubkey.copy_from_slice(pubkey_bytes);
                     drop(state);
-                    self.start_failure_tracking(pubkey, Some(slot), FailureType::Unresponsive).await;
+                    self.start_failure_tracking(pubkey, Some(slot), FailureType::Unresponsive)
+                        .await;
                 }
             }
         }
@@ -880,7 +937,9 @@ impl MeshService {
     /// Check if a node is under failure tracking
     pub async fn is_tracking_failure(&self, pubkey: &[u8; 32]) -> bool {
         let state = self.state.read().await;
-        state.accountability.as_ref()
+        state
+            .accountability
+            .as_ref()
             .map(|a| a.get_failure_proof(pubkey, 20).is_some())
             .unwrap_or(false)
     }
@@ -891,19 +950,24 @@ impl MeshService {
         let stale_slots = self.get_stale_slots().await;
         let state = self.state.read().await;
 
-        stale_slots.iter().filter_map(|&slot| {
-            state.claimed_slots.get(&slot)
-                .and_then(|claim| claim.public_key.as_ref())
-                .and_then(|pk| {
-                    if pk.len() == 32 {
-                        let mut arr = [0u8; 32];
-                        arr.copy_from_slice(pk);
-                        Some(arr)
-                    } else {
-                        None
-                    }
-                })
-        }).collect()
+        stale_slots
+            .iter()
+            .filter_map(|&slot| {
+                state
+                    .claimed_slots
+                    .get(&slot)
+                    .and_then(|claim| claim.public_key.as_ref())
+                    .and_then(|pk| {
+                        if pk.len() == 32 {
+                            let mut arr = [0u8; 32];
+                            arr.copy_from_slice(pk);
+                            Some(arr)
+                        } else {
+                            None
+                        }
+                    })
+            })
+            .collect()
     }
 
     /// Trigger misbehaviour check for all stale ghost neighbors
@@ -912,7 +976,10 @@ impl MeshService {
 
         for (direction, slot, is_live) in liveness {
             if !is_live {
-                debug!("Ghost neighbor at slot {} (direction {:?}) is stale - reporting unresponsive", slot, direction);
+                debug!(
+                    "Ghost neighbor at slot {} (direction {:?}) is stale - reporting unresponsive",
+                    slot, direction
+                );
                 self.report_unresponsive(slot).await;
             }
         }
@@ -944,15 +1011,14 @@ impl MeshService {
         let mut state = self.state.write().await;
 
         // Get current VDF height
-        let vdf_height = state.cvdf.as_ref()
-            .map(|c| c.current_round())
-            .unwrap_or(0);
+        let vdf_height = state.cvdf.as_ref().map(|c| c.current_round()).unwrap_or(0);
 
         // Get our slot
         let our_slot = state.self_slot.as_ref().map(|s| s.index);
 
         // Get neighbor public keys
-        let neighbors: Vec<[u8; 32]> = state.present_neighbors()
+        let neighbors: Vec<[u8; 32]> = state
+            .present_neighbors()
             .iter()
             .filter_map(|claim| {
                 claim.public_key.as_ref().and_then(|pk| {
@@ -1003,7 +1069,9 @@ impl MeshService {
     /// Check if we should create a new mesh vouch (event-driven)
     pub async fn should_create_mesh_vouch(&self) -> bool {
         let state = self.state.read().await;
-        state.liveness.as_ref()
+        state
+            .liveness
+            .as_ref()
             .map(|l| l.should_create_vouch())
             .unwrap_or(false)
     }
@@ -1020,7 +1088,9 @@ impl MeshService {
     /// Check if a node is valid (has sufficient vouches)
     pub async fn is_node_valid(&self, pubkey: &[u8; 32]) -> bool {
         let state = self.state.read().await;
-        state.liveness.as_ref()
+        state
+            .liveness
+            .as_ref()
             .map(|l| l.is_node_valid(pubkey))
             .unwrap_or(false)
     }
@@ -1031,7 +1101,9 @@ impl MeshService {
     /// Their slots can now be claimed by new nodes.
     pub async fn get_invalid_nodes(&self) -> Vec<[u8; 32]> {
         let state = self.state.read().await;
-        state.liveness.as_ref()
+        state
+            .liveness
+            .as_ref()
             .map(|l| l.invalid_nodes())
             .unwrap_or_default()
     }
@@ -1039,7 +1111,9 @@ impl MeshService {
     /// Get vouch count for a node
     pub async fn get_vouch_count(&self, pubkey: &[u8; 32]) -> usize {
         let state = self.state.read().await;
-        state.liveness.as_ref()
+        state
+            .liveness
+            .as_ref()
             .map(|l| l.vouch_count(pubkey))
             .unwrap_or(0)
     }
@@ -1060,15 +1134,22 @@ impl MeshService {
         let invalid_nodes = self.get_invalid_nodes().await;
         let state = self.state.read().await;
 
-        invalid_nodes.iter().filter_map(|pubkey| {
-            state.claimed_slots.values()
-                .find(|claim| {
-                    claim.public_key.as_ref()
-                        .map(|pk| pk.as_slice() == pubkey.as_slice())
-                        .unwrap_or(false)
-                })
-                .map(|claim| claim.index)
-        }).collect()
+        invalid_nodes
+            .iter()
+            .filter_map(|pubkey| {
+                state
+                    .claimed_slots
+                    .values()
+                    .find(|claim| {
+                        claim
+                            .public_key
+                            .as_ref()
+                            .map(|pk| pk.as_slice() == pubkey.as_slice())
+                            .unwrap_or(false)
+                    })
+                    .map(|claim| claim.index)
+            })
+            .collect()
     }
 
     // ==================== END STRUCTURE-AWARE LIVENESS ====================
@@ -1149,7 +1230,10 @@ impl MeshService {
         // You cannot claim a slot without at least one peer to validate with.
         // If you have no connections, you can't prove to anyone that you claimed it.
         if validator_count == 0 {
-            info!("Cannot claim slot {} - no peers to validate with", target_slot);
+            info!(
+                "Cannot claim slot {} - no peers to validate with",
+                target_slot
+            );
             return false;
         }
 
@@ -1172,9 +1256,7 @@ impl MeshService {
         let mut session_peer_ids = Vec::new();
         let commitment_msg = format!(
             "mesh_slot:{}:{}:{}",
-            target_slot,
-            target_coord.q,
-            target_coord.r
+            target_slot, target_coord.q, target_coord.r
         );
 
         for (peer_id, peer_addr, maybe_pubkey) in potential_validators {
@@ -1230,10 +1312,17 @@ impl MeshService {
 
             session_peer_ids.push(peer_id.clone());
             result_receivers.push((peer_id.clone(), result_rx));
-            debug!("Created TGP session with {} for slot {} (TGP addr: {})", peer_id, target_slot, peer_tgp_addr);
+            debug!(
+                "Created TGP session with {} for slot {} (TGP addr: {})",
+                peer_id, target_slot, peer_tgp_addr
+            );
         }
 
-        debug!("Created {} TGP sessions for slot {}", session_peer_ids.len(), target_slot);
+        debug!(
+            "Created {} TGP sessions for slot {}",
+            session_peer_ids.len(),
+            target_slot
+        );
         // Event-driven: immediately send TGP messages for all created sessions
         if let Some(udp_socket) = self.state.read().await.udp_socket.clone() {
             for peer_id in &session_peer_ids {
@@ -1251,7 +1340,10 @@ impl MeshService {
             match tokio::time::timeout(timeout, result_rx).await {
                 Ok(Ok(true)) => {
                     successful_coordinations += 1;
-                    info!("TGP coordination with {} succeeded (QuadProof achieved)", peer_id);
+                    info!(
+                        "TGP coordination with {} succeeded (QuadProof achieved)",
+                        peer_id
+                    );
                 }
                 Ok(Ok(false)) => {
                     debug!("TGP coordination with {} failed", peer_id);
@@ -1274,7 +1366,10 @@ impl MeshService {
 
         // Check if we reached threshold
         if successful_coordinations >= scaled_threshold {
-            info!("Slot {} acquired via TGP ({} >= {} threshold)", target_slot, successful_coordinations, scaled_threshold);
+            info!(
+                "Slot {} acquired via TGP ({} >= {} threshold)",
+                target_slot, successful_coordinations, scaled_threshold
+            );
             self.claim_slot(target_slot).await
         } else {
             warn!(
@@ -1309,21 +1404,29 @@ impl MeshService {
     fn peer_wins_slot(peer_a: &str, peer_b: &str, slot_index: u64) -> bool {
         let priority_a = Self::slot_claim_priority(peer_a, slot_index);
         let priority_b = Self::slot_claim_priority(peer_b, slot_index);
-        priority_a < priority_b  // Lower hash wins
+        priority_a < priority_b // Lower hash wins
     }
 
     /// Process a slot claim. Returns (we_lost, race_won) where:
     /// - we_lost: true if we lost our own slot to this claimer
     /// - race_won: true if this claimer beat a previous claimer (needs re-flooding)
-    pub async fn process_slot_claim(&self, index: u64, peer_id: String, coord: (i64, i64, i64), public_key: Option<Vec<u8>>) -> (bool, bool) {
+    pub async fn process_slot_claim(
+        &self,
+        index: u64,
+        peer_id: String,
+        coord: (i64, i64, i64),
+        public_key: Option<Vec<u8>>,
+    ) -> (bool, bool) {
         let mut state = self.state.write().await;
         let hex_coord = HexCoord::new(coord.0, coord.1, coord.2);
 
         // Verify the coord matches the index
         let expected_coord = spiral3d_to_coord(Spiral3DIndex::new(index));
         if hex_coord != expected_coord {
-            warn!("Invalid slot claim: index {} should be at {:?}, not {:?}",
-                  index, expected_coord, hex_coord);
+            warn!(
+                "Invalid slot claim: index {} should be at {:?}, not {:?}",
+                index, expected_coord, hex_coord
+            );
             return (false, false);
         }
 
@@ -1335,7 +1438,10 @@ impl MeshService {
             if our_index == index && peer_id != self_id {
                 // Ungameable tiebreaker: hash(blake3(peer_id) XOR blake3(tx))
                 if Self::peer_wins_slot(&peer_id, &self_id, index) {
-                    warn!("Lost slot {} race to {} (their priority wins), will reclaim", index, peer_id);
+                    warn!(
+                        "Lost slot {} race to {} (their priority wins), will reclaim",
+                        index, peer_id
+                    );
                     // Remove our claim from the global map
                     state.claimed_slots.remove(&index);
                     state.slot_coords.remove(&our_coord);
@@ -1343,7 +1449,10 @@ impl MeshService {
                     true
                 } else {
                     // We win, keep our slot
-                    debug!("Won slot {} race against {} (our priority wins)", index, peer_id);
+                    debug!(
+                        "Won slot {} race against {} (our priority wins)",
+                        index, peer_id
+                    );
                     false
                 }
             } else {
@@ -1363,8 +1472,10 @@ impl MeshService {
             // Different claimer - use ungameable tiebreaker
             if Self::peer_wins_slot(&peer_id, &existing.peer_id, index) {
                 let loser_id = existing.peer_id.clone();
-                info!("Slot {} taken by {} (beats previous claimer {} by priority)",
-                      index, peer_id, loser_id);
+                info!(
+                    "Slot {} taken by {} (beats previous claimer {} by priority)",
+                    index, peer_id, loser_id
+                );
                 // Clear the loser's slot in our peer records
                 if let Some(loser_peer) = state.peers.get_mut(&loser_id) {
                     loser_peer.slot = None;
@@ -1373,8 +1484,10 @@ impl MeshService {
                 race_won = true;
                 // Fall through to accept the new claim
             } else {
-                debug!("Slot {} stays with {} (beats new claimer {} by priority)",
-                       index, existing.peer_id, peer_id);
+                debug!(
+                    "Slot {} stays with {} (beats new claimer {} by priority)",
+                    index, existing.peer_id, peer_id
+                );
                 return (we_lost, false);
             }
         }
@@ -1382,13 +1495,17 @@ impl MeshService {
         // BUG FIX: Check if this peer already has a DIFFERENT slot claimed.
         // Each peer can only have ONE slot - remove any old claim before accepting new one.
         // This prevents nodes from appearing to claim multiple slots (e.g., slots 3, 25, 48).
-        let old_slot_to_remove: Option<(u64, HexCoord)> = state.claimed_slots.iter()
+        let old_slot_to_remove: Option<(u64, HexCoord)> = state
+            .claimed_slots
+            .iter()
             .find(|(slot_idx, claim)| claim.peer_id == peer_id && **slot_idx != index)
             .map(|(slot_idx, claim)| (*slot_idx, claim.coord));
 
         if let Some((old_index, old_coord)) = old_slot_to_remove {
-            info!("Peer {} moving from slot {} to slot {} - removing old claim",
-                  peer_id, old_index, index);
+            info!(
+                "Peer {} moving from slot {} to slot {} - removing old claim",
+                peer_id, old_index, index
+            );
             state.claimed_slots.remove(&old_index);
             state.slot_coords.remove(&old_coord);
         }
@@ -1398,12 +1515,18 @@ impl MeshService {
         state.claimed_slots.insert(index, claim);
         state.slot_coords.insert(hex_coord);
 
-        info!("Accepted slot claim {} from {} at ({}, {}, {})",
-              index, peer_id, coord.0, coord.1, coord.2);
+        info!(
+            "Accepted slot claim {} from {} at ({}, {}, {})",
+            index, peer_id, coord.0, coord.1, coord.2
+        );
 
         // If this peer is connected to us, update their slot info and public key
         if let Some(peer) = state.peers.get_mut(&peer_id) {
-            peer.slot = Some(SlotClaim::with_public_key(index, peer_id, public_key.clone()));
+            peer.slot = Some(SlotClaim::with_public_key(
+                index,
+                peer_id,
+                public_key.clone(),
+            ));
             // Also store public key in peer if we didn't have it
             if peer.public_key.is_none() {
                 peer.public_key = public_key;
@@ -1471,14 +1594,18 @@ impl MeshService {
                         Ok(tgp_msg) => {
                             self.traffic_stats.record_tgp_message();
                             // Handle message and immediately send response (event-driven)
-                            if let Some(peer_id) = self.handle_tgp_message(src_addr, tgp_msg).await {
+                            if let Some(peer_id) = self.handle_tgp_message(src_addr, tgp_msg).await
+                            {
                                 self.send_tgp_messages(&socket, &peer_id).await;
                             } else {
                                 debug!("UDP from {} - no peer found for TGP message", src_addr);
                             }
                         }
                         Err(e) => {
-                            warn!("Failed to deserialize TGP from {} ({} bytes): {}", src_addr, len, e);
+                            warn!(
+                                "Failed to deserialize TGP from {} ({} bytes): {}",
+                                src_addr, len, e
+                            );
                         }
                     }
                 }
@@ -1495,14 +1622,22 @@ impl MeshService {
         match &msg.payload {
             MessagePayload::Commitment(c) => Some(*c.public_key.as_bytes()),
             MessagePayload::DoubleProof(d) => Some(*d.own_commitment.public_key.as_bytes()),
-            MessagePayload::TripleProof(t) => Some(*t.own_double.own_commitment.public_key.as_bytes()),
-            MessagePayload::QuadProof(q) => Some(*q.own_triple.own_double.own_commitment.public_key.as_bytes()),
+            MessagePayload::TripleProof(t) => {
+                Some(*t.own_double.own_commitment.public_key.as_bytes())
+            }
+            MessagePayload::QuadProof(q) => {
+                Some(*q.own_triple.own_double.own_commitment.public_key.as_bytes())
+            }
+            MessagePayload::QuadConfirmation(q) => Some(*q.public_key().as_bytes()),
+            MessagePayload::QuadConfirmationFinal(q) => Some(*q.public_key().as_bytes()),
         }
     }
 
     /// Extract slot claim info from a Commitment message.
     /// Returns Some(slot_index) if this is a slot claim commitment.
-    fn extract_slot_claim_from_commitment(commitment: &citadel_protocols::Commitment) -> Option<u64> {
+    fn extract_slot_claim_from_commitment(
+        commitment: &citadel_protocols::Commitment,
+    ) -> Option<u64> {
         // The commitment message is "mesh_slot:X:q:r" where X is the slot index
         let msg_bytes = commitment.message.as_slice();
         let msg_str = std::str::from_utf8(msg_bytes).ok()?;
@@ -1530,12 +1665,12 @@ impl MeshService {
             let state = self.state.read().await;
 
             // Match by public key extracted from the TGP message (primary method)
-            let peer = state.peers.iter()
-                .find(|(_, p)| {
-                    p.public_key.as_ref()
-                        .map(|pk| pk.as_slice() == sender_pubkey.as_slice())
-                        .unwrap_or(false)
-                });
+            let peer = state.peers.iter().find(|(_, p)| {
+                p.public_key
+                    .as_ref()
+                    .map(|pk| pk.as_slice() == sender_pubkey.as_slice())
+                    .unwrap_or(false)
+            });
 
             // TGP is TCP-free: we can establish coordination with ANY node that sends us
             // a valid TGP message, using just the public key from the message itself.
@@ -1560,8 +1695,11 @@ impl MeshService {
                         warn!("Invalid public key from unknown peer at {}", src_addr);
                         return None;
                     };
-                    debug!("TGP: Accepting coordination from {} at {}",
-                          &peer_id[..12], src_addr);
+                    debug!(
+                        "TGP: Accepting coordination from {} at {}",
+                        &peer_id[..12],
+                        src_addr
+                    );
                     (peer_id, keypair, counterparty)
                 }
             }
@@ -1579,7 +1717,10 @@ impl MeshService {
                           claimed_slot, peer_id, existing_claim.peer_id);
                     return None;
                 }
-                debug!("SLOT VALIDATION: Slot {} is available for {}", claimed_slot, peer_id);
+                debug!(
+                    "SLOT VALIDATION: Slot {} is available for {}",
+                    claimed_slot, peer_id
+                );
             }
         }
 
@@ -1599,9 +1740,15 @@ impl MeshService {
 
             if need_new_session {
                 if sessions.contains_key(&peer_id) {
-                    info!("Resetting TGP session for {} (new Commitment received after Complete)", peer_id);
+                    info!(
+                        "Resetting TGP session for {} (new Commitment received after Complete)",
+                        peer_id
+                    );
                 } else {
-                    debug!("Creating SYMMETRIC TGP session for {} (incoming message)", peer_id);
+                    debug!(
+                        "Creating SYMMETRIC TGP session for {} (incoming message)",
+                        peer_id
+                    );
                 }
                 let mut coordinator = PeerCoordinator::symmetric(
                     my_keypair.clone(),
@@ -1635,15 +1782,26 @@ impl MeshService {
                     MessagePayload::DoubleProof(d) => format!("Double({})", d.party),
                     MessagePayload::TripleProof(t) => format!("Triple({})", t.party),
                     MessagePayload::QuadProof(q) => format!("Quad({})", q.party),
+                    MessagePayload::QuadConfirmation(q) => format!("QuadConf({})", q.party),
+                    MessagePayload::QuadConfirmationFinal(q) => format!("QuadConfFinal({})", q.party),
                 };
-                debug!("TGP recv: {} msg={} (state: {:?})", peer_id, msg_party, old_state);
+                debug!(
+                    "TGP recv: {} msg={} (state: {:?})",
+                    peer_id, msg_party, old_state
+                );
                 match session.coordinator.receive(&msg) {
                     Ok(advanced) => {
                         let new_state = session.coordinator.tgp_state();
                         if advanced {
-                            debug!("TGP with {} advanced: {:?} -> {:?}", peer_id, old_state, new_state);
+                            debug!(
+                                "TGP with {} advanced: {:?} -> {:?}",
+                                peer_id, old_state, new_state
+                            );
                         } else {
-                            debug!("TGP with {} receive ok but state unchanged: {:?}", peer_id, old_state);
+                            debug!(
+                                "TGP with {} receive ok but state unchanged: {:?}",
+                                peer_id, old_state
+                            );
                         }
                         if session.coordinator.is_coordinated() {
                             info!("TGP with {} complete - QuadProof achieved!", peer_id);
@@ -1651,10 +1809,17 @@ impl MeshService {
                                 let _ = tx.send(true);
                             }
                             // Extract bilateral receipt for AuthorizedPeer storage
-                            if let Some((our_quad, their_quad)) = session.coordinator.get_bilateral_receipt() {
+                            if let Some((our_quad, their_quad)) =
+                                session.coordinator.get_bilateral_receipt()
+                            {
                                 // Get peer's public key from message
                                 let pubkey = Self::extract_sender_pubkey(&msg).unwrap_or([0u8; 32]);
-                                Some((our_quad.clone(), their_quad.clone(), pubkey, session.peer_tgp_addr))
+                                Some((
+                                    our_quad.clone(),
+                                    their_quad.clone(),
+                                    pubkey,
+                                    session.peer_tgp_addr,
+                                ))
                             } else {
                                 warn!("TGP coordinated but no bilateral receipt - should never happen");
                                 None
@@ -1664,12 +1829,19 @@ impl MeshService {
                         }
                     }
                     Err(e) => {
-                        debug!("TGP message from {} rejected (state: {:?}): {:?}", peer_id, old_state, e);
+                        debug!(
+                            "TGP message from {} rejected (state: {:?}): {:?}",
+                            peer_id, old_state, e
+                        );
                         None
                     }
                 }
             } else {
-                debug!("TGP recv: no session for {} (sessions: {:?})", peer_id, sessions.keys().collect::<Vec<_>>());
+                debug!(
+                    "TGP recv: no session for {} (sessions: {:?})",
+                    peer_id,
+                    sessions.keys().collect::<Vec<_>>()
+                );
                 None
             }
         };
@@ -1678,17 +1850,15 @@ impl MeshService {
         if let Some((our_quad, their_quad, pubkey, addr)) = completed_auth {
             self.traffic_stats.record_tgp_completion();
             debug!("TGP: Adding {} to authorized_peers", peer_id);
-            let authorized = AuthorizedPeer::new(
-                peer_id.clone(),
-                pubkey,
-                our_quad,
-                their_quad,
-                addr,
-            );
+            let authorized =
+                AuthorizedPeer::new(peer_id.clone(), pubkey, our_quad, their_quad, addr);
 
             let mut state = self.state.write().await;
             state.authorized_peers.insert(peer_id.clone(), authorized);
-            debug!("TGP: {} authorized peers total", state.authorized_peers.len());
+            debug!(
+                "TGP: {} authorized peers total",
+                state.authorized_peers.len()
+            );
 
             // EVENT-DRIVEN SLOT CLAIM: One QuadProof = claim the slot
             if let Some(target_slot) = state.pending_slot_claim.take() {
@@ -1697,14 +1867,22 @@ impl MeshService {
                     drop(state);
                     // Use VDF-anchored claim (signed, with VDF height for ordering)
                     if let Some(claim) = self.claim_slot_with_vdf(target_slot).await {
-                        info!("SLOT CLAIMED: {} via QuadProof with {} (VDF height {})",
-                              target_slot, peer_id, claim.vdf_height);
+                        info!(
+                            "SLOT CLAIMED: {} via QuadProof with {} (VDF height {})",
+                            target_slot, peer_id, claim.vdf_height
+                        );
                     } else {
-                        warn!("Failed to create VDF-anchored claim for slot {}", target_slot);
+                        warn!(
+                            "Failed to create VDF-anchored claim for slot {}",
+                            target_slot
+                        );
                         self.start_slot_claim_tgp().await;
                     }
                 } else {
-                    info!("Slot {} was claimed by someone else during TGP, will retry", target_slot);
+                    info!(
+                        "Slot {} was claimed by someone else during TGP, will retry",
+                        target_slot
+                    );
                     drop(state);
                     // Trigger retry for next available slot
                     self.start_slot_claim_tgp().await;
@@ -1745,8 +1923,13 @@ impl MeshService {
                     match session.coordinator.poll() {
                         Ok(Some(messages)) => {
                             let tgp_addr = session.peer_tgp_addr;
-                            debug!("TGP poll: {} messages for {} (state: {:?}, addr: {})",
-                                   messages.len(), peer_id, state, tgp_addr);
+                            debug!(
+                                "TGP poll: {} messages for {} (state: {:?}, addr: {})",
+                                messages.len(),
+                                peer_id,
+                                state,
+                                tgp_addr
+                            );
                             for msg in messages {
                                 if let Ok(data) = serde_json::to_vec(&msg) {
                                     to_send.push((tgp_addr, data));
@@ -1755,10 +1938,16 @@ impl MeshService {
                         }
                         Ok(None) => {
                             // Rate limited - but log for debugging
-                            debug!("TGP poll: rate limited for {} (state: {:?})", peer_id, state);
+                            debug!(
+                                "TGP poll: rate limited for {} (state: {:?})",
+                                peer_id, state
+                            );
                         }
                         Err(e) => {
-                            debug!("TGP poll error for {} (state: {:?}): {:?}", peer_id, state, e);
+                            debug!(
+                                "TGP poll error for {} (state: {:?}): {:?}",
+                                peer_id, state, e
+                            );
                             if let Some(tx) = session.result_tx.take() {
                                 let _ = tx.send(false);
                             }
@@ -1853,14 +2042,19 @@ impl MeshService {
             let mut tick = interval(Duration::from_secs(10));
             loop {
                 tick.tick().await;
-                let (sent, recv, pkt_sent, pkt_recv, tgp_msgs, tgp_done) = traffic_stats.take_snapshot();
+                let (sent, recv, pkt_sent, pkt_recv, tgp_msgs, tgp_done) =
+                    traffic_stats.take_snapshot();
                 // Only log if there was any traffic
                 if sent > 0 || recv > 0 {
-                    info!("Traffic: {} tx, {} rx | {}/s tx, {}/s rx | {} TGP msgs, {} completions",
-                        pkt_sent, pkt_recv,
+                    info!(
+                        "Traffic: {} tx, {} rx | {}/s tx, {}/s rx | {} TGP msgs, {} completions",
+                        pkt_sent,
+                        pkt_recv,
                         super::state::TrafficStats::format_rate(sent, 10),
                         super::state::TrafficStats::format_rate(recv, 10),
-                        tgp_msgs, tgp_done);
+                        tgp_msgs,
+                        tgp_done
+                    );
                 }
             }
         });
@@ -1880,7 +2074,10 @@ impl MeshService {
                 // Only retry if we have no peers and have entry peers configured
                 let peer_count = self_clone.state.read().await.peers.len();
                 if peer_count == 0 && !self_clone.entry_peers.is_empty() {
-                    info!("Isolated (0 peers) - retrying entry peers (backoff {}s)", retry_secs);
+                    info!(
+                        "Isolated (0 peers) - retrying entry peers (backoff {}s)",
+                        retry_secs
+                    );
                     let connected = self_clone.connect_to_entry_peers().await;
                     if connected > 0 {
                         info!("Reconnected to {} entry peer(s)", connected);
@@ -1970,7 +2167,8 @@ impl MeshService {
             for resolved_addr in resolved_addrs {
                 debug!("Trying {} -> {}", peer_addr, resolved_addr);
 
-                match tokio::time::timeout(connect_timeout, TcpStream::connect(resolved_addr)).await {
+                match tokio::time::timeout(connect_timeout, TcpStream::connect(resolved_addr)).await
+                {
                     Ok(Ok(stream)) => {
                         info!("Connected to entry peer {} at {}", peer_addr, resolved_addr);
                         connected += 1;
@@ -1988,7 +2186,10 @@ impl MeshService {
                         break; // Connected successfully, don't try other addresses
                     }
                     Ok(Err(e)) => {
-                        debug!("Failed to connect to {} ({}): {}", peer_addr, resolved_addr, e);
+                        debug!(
+                            "Failed to connect to {} ({}): {}",
+                            peer_addr, resolved_addr, e
+                        );
                     }
                     Err(_) => {
                         debug!("Timeout connecting to {} ({})", peer_addr, resolved_addr);
@@ -1997,7 +2198,10 @@ impl MeshService {
             }
 
             if !peer_connected {
-                warn!("Failed to connect to peer {} (tried {} addresses)", peer_addr, addr_count);
+                warn!(
+                    "Failed to connect to peer {} (tried {} addresses)",
+                    peer_addr, addr_count
+                );
             }
         }
 
@@ -2005,7 +2209,12 @@ impl MeshService {
     }
 
     /// Handle a peer connection
-    async fn handle_connection(self: &Arc<Self>, stream: TcpStream, addr: SocketAddr, is_entry_peer: bool) -> Result<()> {
+    async fn handle_connection(
+        self: &Arc<Self>,
+        stream: TcpStream,
+        addr: SocketAddr,
+        is_entry_peer: bool,
+    ) -> Result<()> {
         // Use full IP:port as initial peer_id to avoid collisions when connecting to
         // multiple peers that listen on the same port (e.g., all bootstrap nodes on :9000)
         let peer_id = format!("peer-{}", addr);
@@ -2021,10 +2230,10 @@ impl MeshService {
                     public_key: None,
                     last_seen: std::time::Instant::now(),
                     coordinated: false,
-                    slot: None,  // Will be learned via SPORE slot_claim flood
+                    slot: None, // Will be learned via SPORE slot_claim flood
                     is_entry_peer,
-                    content_synced: false,  // Will become true when HaveLists match
-                    their_have: None,  // SPORE: received via SporeSync
+                    content_synced: false, // Will become true when HaveLists match
+                    their_have: None,      // SPORE: received via SporeSync
                 },
             );
         }
@@ -2044,7 +2253,8 @@ impl MeshService {
         let self_pubkey = state.signing_key.verifying_key();
         let pubkey_hex = hex::encode(self_pubkey.as_bytes());
         // Priority: 1) explicit announce_addr, 2) learned from peers, 3) listen_addr
-        let our_addr = self.announce_addr
+        let our_addr = self
+            .announce_addr
             .or(state.observed_public_addr)
             .unwrap_or(self.listen_addr);
         drop(state);
@@ -2067,7 +2277,9 @@ impl MeshService {
                     "type": "flood_admins",
                     "admins": admins,
                 });
-                writer.write_all(flood_admins.to_string().as_bytes()).await?;
+                writer
+                    .write_all(flood_admins.to_string().as_bytes())
+                    .await?;
                 writer.write_all(b"\n").await?;
                 debug!("Flooded {} admins to peer {}", admins.len(), peer_id);
             }
@@ -2080,7 +2292,8 @@ impl MeshService {
             let self_slot = state.self_slot.as_ref().map(|s| s.index);
             let self_pubkey = hex::encode(state.signing_key.verifying_key().as_bytes());
             // Priority: 1) explicit announce_addr, 2) learned from peers, 3) listen_addr
-            let our_addr_for_flood = self.announce_addr
+            let our_addr_for_flood = self
+                .announce_addr
                 .or(state.observed_public_addr)
                 .unwrap_or(self.listen_addr);
             let mut all_peers = vec![serde_json::json!({
@@ -2138,7 +2351,9 @@ impl MeshService {
         // WantList = HaveList.complement() - receiver derives it
         {
             let doc_store = self.doc_store.read().await;
-            let releases = doc_store.list::<crate::models::Release>().unwrap_or_default();
+            let releases = doc_store
+                .list::<crate::models::Release>()
+                .unwrap_or_default();
             let release_ids: Vec<String> = releases.iter().map(|r| r.id.clone()).collect();
             let have_list = build_spore_havelist(&release_ids);
             let self_id = self.state.read().await.self_id.clone();
@@ -2150,7 +2365,11 @@ impl MeshService {
             });
             writer.write_all(spore_sync.to_string().as_bytes()).await?;
             writer.write_all(b"\n").await?;
-            debug!("SPORE: Sent HaveList with {} ranges to peer {}", have_list.range_count(), peer_id);
+            debug!(
+                "SPORE: Sent HaveList with {} ranges to peer {}",
+                have_list.range_count(),
+                peer_id
+            );
         }
 
         // SPORE: Send featured releases for homepage sync (from DocumentStore)
@@ -2161,7 +2380,8 @@ impl MeshService {
             let featured = doc_store.list::<FeaturedRelease>().unwrap_or_default();
             if !featured.is_empty() {
                 let self_id = self.state.read().await.self_id.clone();
-                let featured_json: Vec<String> = featured.iter()
+                let featured_json: Vec<String> = featured
+                    .iter()
                     .filter_map(|f| serde_json::to_string(f).ok())
                     .collect();
                 let featured_sync = serde_json::json!({
@@ -2169,9 +2389,15 @@ impl MeshService {
                     "peer_id": self_id,
                     "featured": featured_json,
                 });
-                writer.write_all(featured_sync.to_string().as_bytes()).await?;
+                writer
+                    .write_all(featured_sync.to_string().as_bytes())
+                    .await?;
                 writer.write_all(b"\n").await?;
-                debug!("SPORE: Sent {} featured releases to peer {}", featured.len(), peer_id);
+                debug!(
+                    "SPORE: Sent {} featured releases to peer {}",
+                    featured.len(),
+                    peer_id
+                );
             }
         }
 
@@ -2184,10 +2410,15 @@ impl MeshService {
                     "type": "do_not_want_list",
                     "ranges": state.do_not_want_spore(),
                 });
-                writer.write_all(do_not_want_list.to_string().as_bytes()).await?;
+                writer
+                    .write_all(do_not_want_list.to_string().as_bytes())
+                    .await?;
                 writer.write_all(b"\n").await?;
-                debug!("SPORE⁻¹: Sent DoNotWantList with {} ranges to peer {}",
-                    state.do_not_want.range_count(), peer_id);
+                debug!(
+                    "SPORE⁻¹: Sent DoNotWantList with {} ranges to peer {}",
+                    state.do_not_want.range_count(),
+                    peer_id
+                );
             }
         }
 
@@ -2202,8 +2433,11 @@ impl MeshService {
                 });
                 writer.write_all(erasure_msg.to_string().as_bytes()).await?;
                 writer.write_all(b"\n").await?;
-                debug!("SPORE⁻¹: Sent ErasureConfirmation with {} ranges to peer {}",
-                    state.erasure_confirmed.range_count(), peer_id);
+                debug!(
+                    "SPORE⁻¹: Sent ErasureConfirmation with {} ranges to peer {}",
+                    state.erasure_confirmed.range_count(),
+                    peer_id
+                );
             }
         }
 
@@ -2212,48 +2446,59 @@ impl MeshService {
         {
             let state = self.state.read().await;
             if !state.bad_bits.is_empty() {
-                let bad_bits_hex: Vec<String> = state.bad_bits.iter()
-                    .map(|h| hex::encode(h))
-                    .collect();
+                let bad_bits_hex: Vec<String> =
+                    state.bad_bits.iter().map(|h| hex::encode(h)).collect();
                 let bad_bits_msg = serde_json::json!({
                     "type": "bad_bits",
                     "double_hashes": bad_bits_hex,
                 });
-                writer.write_all(bad_bits_msg.to_string().as_bytes()).await?;
+                writer
+                    .write_all(bad_bits_msg.to_string().as_bytes())
+                    .await?;
                 writer.write_all(b"\n").await?;
-                debug!("Sent BadBits with {} entries to peer {}", bad_bits_hex.len(), peer_id);
+                debug!(
+                    "Sent BadBits with {} entries to peer {}",
+                    bad_bits_hex.len(),
+                    peer_id
+                );
             }
         }
 
         // CVDF chain sync: Send our chain state so peer can adopt heavier chain
         // CRITICAL: This enables swarm merge during initial connection
         if let Some((rounds, slots)) = self.cvdf_chain_state().await {
-            let rounds_json: Vec<serde_json::Value> = rounds.iter().map(|r| {
-                serde_json::json!({
-                    "round": r.round,
-                    "prev_output": hex::encode(r.prev_output),
-                    "washed_input": hex::encode(r.washed_input),
-                    "output": hex::encode(r.output),
-                    "producer": hex::encode(r.producer),
-                    "producer_signature": hex::encode(r.producer_signature),
-                    "timestamp_ms": r.timestamp_ms,
-                    "attestations": r.attestations.iter().map(|a| {
-                        serde_json::json!({
-                            "round": a.round,
-                            "prev_output": hex::encode(a.prev_output),
-                            "attester": hex::encode(a.attester),
-                            "slot": a.slot,
-                            "signature": hex::encode(a.signature),
-                        })
-                    }).collect::<Vec<_>>(),
+            let rounds_json: Vec<serde_json::Value> = rounds
+                .iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "round": r.round,
+                        "prev_output": hex::encode(r.prev_output),
+                        "washed_input": hex::encode(r.washed_input),
+                        "output": hex::encode(r.output),
+                        "producer": hex::encode(r.producer),
+                        "producer_signature": hex::encode(r.producer_signature),
+                        "timestamp_ms": r.timestamp_ms,
+                        "attestations": r.attestations.iter().map(|a| {
+                            serde_json::json!({
+                                "round": a.round,
+                                "prev_output": hex::encode(a.prev_output),
+                                "attester": hex::encode(a.attester),
+                                "slot": a.slot,
+                                "signature": hex::encode(a.signature),
+                            })
+                        }).collect::<Vec<_>>(),
+                    })
                 })
-            }).collect();
-            let slots_json: Vec<serde_json::Value> = slots.iter().map(|(idx, pk)| {
-                serde_json::json!({
-                    "index": idx,
-                    "pubkey": hex::encode(pk),
+                .collect();
+            let slots_json: Vec<serde_json::Value> = slots
+                .iter()
+                .map(|(idx, pk)| {
+                    serde_json::json!({
+                        "index": idx,
+                        "pubkey": hex::encode(pk),
+                    })
                 })
-            }).collect();
+                .collect();
             let cvdf_sync = serde_json::json!({
                 "type": "cvdf_sync_response",
                 "rounds": rounds_json,
@@ -2263,7 +2508,8 @@ impl MeshService {
             });
             writer.write_all(cvdf_sync.to_string().as_bytes()).await?;
             writer.write_all(b"\n").await?;
-            debug!("Sent CVDF chain state to peer {} (height {}, {} slots)",
+            debug!(
+                "Sent CVDF chain state to peer {} (height {}, {} slots)",
                 peer_id,
                 rounds.last().map(|r| r.round).unwrap_or(0),
                 slots.len()
@@ -2278,7 +2524,8 @@ impl MeshService {
 
         // Timer for checking if this entry peer should be disconnected
         // Only relevant if is_entry_peer=true
-        let mut entry_peer_check_interval = tokio::time::interval(std::time::Duration::from_secs(10));
+        let mut entry_peer_check_interval =
+            tokio::time::interval(std::time::Duration::from_secs(10));
 
         // Read peer messages and forward floods concurrently
         // NOTE: TGP is now over UDP (connectionless), not TCP
@@ -2651,7 +2898,10 @@ impl MeshService {
         {
             let mut state = self.state.write().await;
             if let Some(_peer) = state.peers.remove(&current_peer_key) {
-                debug!("Peer {} disconnected (slot claim preserved)", current_peer_key);
+                debug!(
+                    "Peer {} disconnected (slot claim preserved)",
+                    current_peer_key
+                );
             }
 
             // Clean up latency history for this peer to prevent memory leak
@@ -2684,20 +2934,23 @@ impl MeshService {
                 // Re-key peer entry with real PeerID and store public key for TGP
                 if let Some(node_id) = msg.get("node_id").and_then(|n| n.as_str()) {
                     // Extract public key from hello (hex-encoded ed25519 public key)
-                    let public_key = msg.get("public_key")
+                    let public_key = msg
+                        .get("public_key")
                         .and_then(|p| p.as_str())
                         .and_then(|hex_str| hex::decode(hex_str).ok());
 
                     // Extract listening port from hello (for TGP UDP)
                     // We keep the IP from the TCP connection (routable) but use their listening port
-                    let listen_port = msg.get("addr")
+                    let listen_port = msg
+                        .get("addr")
                         .and_then(|a| a.as_str())
                         .and_then(|addr_str| addr_str.parse::<SocketAddr>().ok())
                         .map(|addr| addr.port())
-                        .unwrap_or(9000);  // Default to 9000 if not provided
+                        .unwrap_or(9000); // Default to 9000 if not provided
 
                     // Learn our public IP from what the peer sees us as (STUN-like)
-                    let their_view_of_us = msg.get("your_addr")
+                    let their_view_of_us = msg
+                        .get("your_addr")
                         .and_then(|a| a.as_str())
                         .and_then(|addr_str| addr_str.parse::<SocketAddr>().ok());
 
@@ -2707,7 +2960,8 @@ impl MeshService {
                     if let Some(observed) = their_view_of_us {
                         if state.observed_public_addr.is_none() {
                             // Use our listen port, but the IP the peer sees
-                            let public_addr = SocketAddr::new(observed.ip(), self.listen_addr.port());
+                            let public_addr =
+                                SocketAddr::new(observed.ip(), self.listen_addr.port());
                             info!("Learned our public IP from {}: {}", peer_id, public_addr);
                             state.observed_public_addr = Some(public_addr);
                         }
@@ -2724,7 +2978,10 @@ impl MeshService {
                             peer.last_seen = std::time::Instant::now();
                             let peer_addr = peer.addr;
                             state.peers.insert(node_id.to_string(), peer);
-                            info!("Peer {} identified as {} at {}", peer_id, node_id, peer_addr);
+                            info!(
+                                "Peer {} identified as {} at {}",
+                                peer_id, node_id, peer_addr
+                            );
 
                             // Peer now has public key - try slot claiming if we don't have a slot
                             if state.self_slot.is_none() && state.pending_slot_claim.is_none() {
@@ -2769,23 +3026,34 @@ impl MeshService {
                 // Merge flooded peer list - this propagates mesh topology
                 // SPORE: only accept real peer IDs, skip those we already know
                 // Parse peer data OUTSIDE the lock to minimize lock hold time
-                let parsed_peers: Vec<_> = msg.get("peers")
+                let parsed_peers: Vec<_> = msg
+                    .get("peers")
                     .and_then(|p| p.as_array())
                     .map(|peers| {
-                        peers.iter().filter_map(|peer_info| {
-                            let id = peer_info.get("id").and_then(|i| i.as_str())?;
-                            let addr_str = peer_info.get("addr").and_then(|a| a.as_str())?;
-                            // SPORE: only accept real peer IDs (b3b3/...)
-                            if !id.starts_with("b3b3/") {
-                                return None;
-                            }
-                            let slot_index = peer_info.get("slot").and_then(|s| s.as_u64());
-                            let public_key = peer_info.get("public_key")
-                                .and_then(|p| p.as_str())
-                                .and_then(|hex_str| hex::decode(hex_str).ok());
-                            let addr: SocketAddr = addr_str.parse().ok()?;
-                            Some((id.to_string(), addr_str.to_string(), addr, slot_index, public_key))
-                        }).collect()
+                        peers
+                            .iter()
+                            .filter_map(|peer_info| {
+                                let id = peer_info.get("id").and_then(|i| i.as_str())?;
+                                let addr_str = peer_info.get("addr").and_then(|a| a.as_str())?;
+                                // SPORE: only accept real peer IDs (b3b3/...)
+                                if !id.starts_with("b3b3/") {
+                                    return None;
+                                }
+                                let slot_index = peer_info.get("slot").and_then(|s| s.as_u64());
+                                let public_key = peer_info
+                                    .get("public_key")
+                                    .and_then(|p| p.as_str())
+                                    .and_then(|hex_str| hex::decode(hex_str).ok());
+                                let addr: SocketAddr = addr_str.parse().ok()?;
+                                Some((
+                                    id.to_string(),
+                                    addr_str.to_string(),
+                                    addr,
+                                    slot_index,
+                                    public_key,
+                                ))
+                            })
+                            .collect()
                     })
                     .unwrap_or_default();
 
@@ -2796,12 +3064,18 @@ impl MeshService {
                     for (id, addr_str, addr, slot_index, public_key) in parsed_peers {
                         // Don't add ourselves or peers we already know
                         if id != state.self_id && !state.peers.contains_key(&id) {
-                            let slot = slot_index.map(|idx| SlotClaim::with_public_key(idx, id.clone(), public_key.clone()));
+                            let slot = slot_index.map(|idx| {
+                                SlotClaim::with_public_key(idx, id.clone(), public_key.clone())
+                            });
 
                             // Record slot claim if present (with public key for TGP)
                             if let Some(idx) = slot_index {
                                 if !state.claimed_slots.contains_key(&idx) {
-                                    let claim = SlotClaim::with_public_key(idx, id.clone(), public_key.clone());
+                                    let claim = SlotClaim::with_public_key(
+                                        idx,
+                                        id.clone(),
+                                        public_key.clone(),
+                                    );
                                     state.slot_coords.insert(claim.coord);
                                     state.claimed_slots.insert(idx, claim);
                                 }
@@ -2816,13 +3090,16 @@ impl MeshService {
                                     last_seen: std::time::Instant::now(),
                                     coordinated: false,
                                     slot,
-                                    is_entry_peer: false,  // Discovered via flooding, not an entry peer
-                                    content_synced: false,  // Will become true when HaveLists match
-                                    their_have: None,  // SPORE: received via SporeSync
+                                    is_entry_peer: false, // Discovered via flooding, not an entry peer
+                                    content_synced: false, // Will become true when HaveLists match
+                                    their_have: None,     // SPORE: received via SporeSync
                                 },
                             );
                             new_peers.push((id.clone(), addr_str, slot_index, public_key));
-                            debug!("Discovered peer {} (slot {:?}) via flood from {}", id, slot_index, peer_id);
+                            debug!(
+                                "Discovered peer {} (slot {:?}) via flood from {}",
+                                id, slot_index, peer_id
+                            );
                         }
                     }
                 }
@@ -2832,13 +3109,15 @@ impl MeshService {
                     // TOPOLOGY FIX: Only connect to spiral neighbors, not full mesh!
                     let our_neighbor_coords: Option<Vec<HexCoord>> = {
                         let state = self.state.read().await;
-                        state.self_slot.as_ref().map(|slot| {
-                            Neighbors::of(slot.coord).to_vec()
-                        })
+                        state
+                            .self_slot
+                            .as_ref()
+                            .map(|slot| Neighbors::of(slot.coord).to_vec())
                     };
 
                     // Collect addresses to connect - ONLY spiral neighbors (or all if no slot yet)
-                    let peers_to_connect: Vec<(String, SocketAddr)> = new_peers.iter()
+                    let peers_to_connect: Vec<(String, SocketAddr)> = new_peers
+                        .iter()
                         .filter_map(|(peer_id, addr_str, slot_opt, _)| {
                             let addr: SocketAddr = addr_str.parse().ok()?;
 
@@ -2849,7 +3128,8 @@ impl MeshService {
 
                             // Only connect if this peer's slot is one of our spiral neighbors
                             if let Some(their_slot_idx) = slot_opt {
-                                let their_coord = spiral3d_to_coord(Spiral3DIndex::new(*their_slot_idx));
+                                let their_coord =
+                                    spiral3d_to_coord(Spiral3DIndex::new(*their_slot_idx));
                                 if neighbor_coords.contains(&their_coord) {
                                     return Some((peer_id.clone(), addr));
                                 }
@@ -2876,10 +3156,8 @@ impl MeshService {
             "spore_have_list" => {
                 // SPORE: Compare their HaveList with ours and send missing slots
                 if let Some(their_slots) = msg.get("slots").and_then(|s| s.as_array()) {
-                    let their_slots: std::collections::HashSet<u64> = their_slots
-                        .iter()
-                        .filter_map(|v| v.as_u64())
-                        .collect();
+                    let their_slots: std::collections::HashSet<u64> =
+                        their_slots.iter().filter_map(|v| v.as_u64()).collect();
 
                     let state = self.state.read().await;
 
@@ -2894,7 +3172,10 @@ impl MeshService {
 
                     // Send missing slots to this peer via VDF claims
                     if !missing_slots.is_empty() {
-                        info!("SPORE: Peer missing {} slots - they'll sync via VdfSlotClaim", missing_slots.len());
+                        info!(
+                            "SPORE: Peer missing {} slots - they'll sync via VdfSlotClaim",
+                            missing_slots.len()
+                        );
                         // NOTE: We don't re-flood unsigned claims. Peers sync slots via:
                         // 1. VdfSlotClaim floods (signed, with VDF height)
                         // 2. CvdfSyncResponse (contains all slots with pubkeys)
@@ -2907,7 +3188,13 @@ impl MeshService {
                 if let Some(links_arr) = msg.get("links").and_then(|l| l.as_array()) {
                     let mut links = Vec::new();
                     for link_json in links_arr {
-                        if let (Some(height), Some(output_hex), Some(producer_hex), Some(previous_hex), Some(timestamp_ms)) = (
+                        if let (
+                            Some(height),
+                            Some(output_hex),
+                            Some(producer_hex),
+                            Some(previous_hex),
+                            Some(timestamp_ms),
+                        ) = (
                             link_json.get("height").and_then(|h| h.as_u64()),
                             link_json.get("output").and_then(|o| o.as_str()),
                             link_json.get("producer").and_then(|p| p.as_str()),
@@ -2919,7 +3206,10 @@ impl MeshService {
                                 hex::decode(producer_hex),
                                 hex::decode(previous_hex),
                             ) {
-                                if output.len() == 32 && producer.len() == 32 && previous.len() == 32 {
+                                if output.len() == 32
+                                    && producer.len() == 32
+                                    && previous.len() == 32
+                                {
                                     let mut output_arr = [0u8; 32];
                                     let mut producer_arr = [0u8; 32];
                                     let mut previous_arr = [0u8; 32];
@@ -2942,11 +3232,17 @@ impl MeshService {
                     if !links.is_empty() {
                         let their_height = links.last().map(|l| l.height).unwrap_or(0);
                         let our_height = self.vdf_height().await;
-                        debug!("Received VDF chain from {}: height {} (ours: {})", peer_id, their_height, our_height);
+                        debug!(
+                            "Received VDF chain from {}: height {} (ours: {})",
+                            peer_id, their_height, our_height
+                        );
 
                         // Try to adopt if longer
                         if self.try_adopt_vdf_chain(links.clone()).await {
-                            info!("Adopted VDF chain from {} (new height: {})", peer_id, their_height);
+                            info!(
+                                "Adopted VDF chain from {} (new height: {})",
+                                peer_id, their_height
+                            );
                             // Re-flood to propagate
                             self.flood(FloodMessage::VdfChain { links });
                         }
@@ -2955,7 +3251,13 @@ impl MeshService {
             }
             "vdf_slot_claim" => {
                 // VDF-anchored slot claim with priority ordering
-                if let (Some(slot), Some(claimer_hex), Some(vdf_height), Some(vdf_output_hex), Some(signature_hex)) = (
+                if let (
+                    Some(slot),
+                    Some(claimer_hex),
+                    Some(vdf_height),
+                    Some(vdf_output_hex),
+                    Some(signature_hex),
+                ) = (
                     msg.get("slot").and_then(|s| s.as_u64()),
                     msg.get("claimer").and_then(|c| c.as_str()),
                     msg.get("vdf_height").and_then(|h| h.as_u64()),
@@ -2983,7 +3285,10 @@ impl MeshService {
                                 signature: signature_arr,
                             };
 
-                            debug!("Received VDF slot claim from {}: slot {} at height {}", peer_id, slot, vdf_height);
+                            debug!(
+                                "Received VDF slot claim from {}: slot {} at height {}",
+                                peer_id, slot, vdf_height
+                            );
 
                             // Process with priority ordering
                             if self.process_vdf_claim(claim.clone()).await {
@@ -3039,21 +3344,32 @@ impl MeshService {
                                 if target == from_arr {
                                     // Complete the latency measurement in PoL manager
                                     // Get VDF output from chain tip
-                                    let vdf_output = state.vdf_race.as_ref()
+                                    let vdf_output = state
+                                        .vdf_race
+                                        .as_ref()
                                         .and_then(|v| v.chain_links().last())
                                         .map(|l| l.output)
                                         .unwrap_or([0u8; 32]);
 
                                     if let Some(ref mut pol) = state.pol_manager {
-                                        if let Some(proof) = pol.complete_ping(from_arr, vdf_height, vdf_output) {
+                                        if let Some(proof) =
+                                            pol.complete_ping(from_arr, vdf_height, vdf_output)
+                                        {
                                             let latency_ms = proof.latency_us / 1000;
-                                            debug!("PoL: measured latency to {} = {}ms", peer_id, latency_ms);
+                                            debug!(
+                                                "PoL: measured latency to {} = {}ms",
+                                                peer_id, latency_ms
+                                            );
 
                                             // Record latency in history for map visualization
                                             let self_id = state.self_id.clone();
                                             let short_self = crate::api::short_peer_id(&self_id);
                                             let short_peer = crate::api::short_peer_id(&peer_id);
-                                            state.record_latency(&short_self, &short_peer, latency_ms);
+                                            state.record_latency(
+                                                &short_self,
+                                                &short_peer,
+                                                latency_ms,
+                                            );
                                         }
                                     }
                                 }
@@ -3077,7 +3393,13 @@ impl MeshService {
             // ==================== CVDF MESSAGE HANDLERS ====================
             "cvdf_attestation" => {
                 // Parse attestation and process it
-                if let (Some(round), Some(slot), Some(prev_output_hex), Some(attester_hex), Some(sig_hex)) = (
+                if let (
+                    Some(round),
+                    Some(slot),
+                    Some(prev_output_hex),
+                    Some(attester_hex),
+                    Some(sig_hex),
+                ) = (
                     msg.get("round").and_then(|r| r.as_u64()),
                     msg.get("slot").and_then(|s| s.as_u64()),
                     msg.get("prev_output").and_then(|p| p.as_str()),
@@ -3089,7 +3411,8 @@ impl MeshService {
                         hex::decode(attester_hex),
                         hex::decode(sig_hex),
                     ) {
-                        if prev_output.len() == 32 && attester.len() == 32 && signature.len() == 64 {
+                        if prev_output.len() == 32 && attester.len() == 32 && signature.len() == 64
+                        {
                             let att = RoundAttestation {
                                 round,
                                 prev_output: prev_output.try_into().unwrap(),
@@ -3098,7 +3421,10 @@ impl MeshService {
                                 signature: signature.try_into().unwrap(),
                             };
                             if self.cvdf_process_attestation(att.clone()).await {
-                                debug!("Processed CVDF attestation for round {} from {}", round, peer_id);
+                                debug!(
+                                    "Processed CVDF attestation for round {} from {}",
+                                    round, peer_id
+                                );
                             }
 
                             // Handle piggybacked vouch (2-hop propagation)
@@ -3116,10 +3442,9 @@ impl MeshService {
                                     vouch_data.get("vdf_height").and_then(|v| v.as_u64()),
                                     vouch_data.get("signature").and_then(|v| v.as_str()),
                                 ) {
-                                    if let (Ok(voucher), Ok(vouch_sig)) = (
-                                        hex::decode(voucher_hex),
-                                        hex::decode(vouch_sig_hex),
-                                    ) {
+                                    if let (Ok(voucher), Ok(vouch_sig)) =
+                                        (hex::decode(voucher_hex), hex::decode(vouch_sig_hex))
+                                    {
                                         if voucher.len() == 32 && vouch_sig.len() == 64 {
                                             // Parse alive neighbors
                                             let mut alive: Vec<[u8; 32]> = Vec::new();
@@ -3134,18 +3459,28 @@ impl MeshService {
                                             }
 
                                             // Parse latencies (optional)
-                                            let latencies = vouch_data.get("latencies")
+                                            let latencies = vouch_data
+                                                .get("latencies")
                                                 .and_then(|l| l.as_array())
                                                 .map(|arr| {
-                                                    arr.iter().filter_map(|item| {
-                                                        let node = hex::decode(item.get("node")?.as_str()?).ok()?;
-                                                        let latency = item.get("latency_ms")?.as_u64()?;
-                                                        if node.len() == 32 {
-                                                            Some((node.try_into().unwrap(), latency))
-                                                        } else {
-                                                            None
-                                                        }
-                                                    }).collect::<Vec<_>>()
+                                                    arr.iter()
+                                                        .filter_map(|item| {
+                                                            let node = hex::decode(
+                                                                item.get("node")?.as_str()?,
+                                                            )
+                                                            .ok()?;
+                                                            let latency =
+                                                                item.get("latency_ms")?.as_u64()?;
+                                                            if node.len() == 32 {
+                                                                Some((
+                                                                    node.try_into().unwrap(),
+                                                                    latency,
+                                                                ))
+                                                            } else {
+                                                                None
+                                                            }
+                                                        })
+                                                        .collect::<Vec<_>>()
                                                 })
                                                 .unwrap_or_default();
 
@@ -3162,7 +3497,9 @@ impl MeshService {
                                             match self.handle_mesh_vouch(vouch.clone()).await {
                                                 PropagationDecision::ForwardToNeighbors => {
                                                     // I'm judged - re-flood to my neighbors (witnesses)
-                                                    debug!("Vouch judges me - forwarding to witnesses");
+                                                    debug!(
+                                                        "Vouch judges me - forwarding to witnesses"
+                                                    );
                                                     self.flood(FloodMessage::CvdfAttestation {
                                                         att,
                                                         vouch: Some(vouch),
@@ -3170,7 +3507,9 @@ impl MeshService {
                                                 }
                                                 PropagationDecision::Stop => {
                                                     // I'm a witness - recorded, stop propagation
-                                                    debug!("Vouch witnessed for neighbor - stopping");
+                                                    debug!(
+                                                        "Vouch witnessed for neighbor - stopping"
+                                                    );
                                                 }
                                                 PropagationDecision::Drop => {
                                                     // Not relevant to me
@@ -3187,14 +3526,20 @@ impl MeshService {
             "cvdf_new_round" => {
                 // Parse and process new round
                 // Note: This requires full round data including attestations
-                debug!("Received cvdf_new_round from {} (round {})", peer_id,
-                    msg.get("round").and_then(|r| r.as_u64()).unwrap_or(0));
+                debug!(
+                    "Received cvdf_new_round from {} (round {})",
+                    peer_id,
+                    msg.get("round").and_then(|r| r.as_u64()).unwrap_or(0)
+                );
                 // Full round processing requires attestations array - handled by flood
             }
             "cvdf_sync_request" => {
                 // Respond with our chain state
                 if let Some(from_height) = msg.get("from_height").and_then(|h| h.as_u64()) {
-                    debug!("Received CVDF sync request from {} (from_height {})", peer_id, from_height);
+                    debug!(
+                        "Received CVDF sync request from {} (from_height {})",
+                        peer_id, from_height
+                    );
                     // Send our chain state via flood
                     if let Some((rounds, slots)) = self.cvdf_chain_state().await {
                         self.flood(FloodMessage::CvdfSyncResponse { rounds, slots });
@@ -3210,16 +3555,23 @@ impl MeshService {
                 if let Some(rounds_arr) = msg.get("rounds").and_then(|r| r.as_array()) {
                     for round_json in rounds_arr {
                         if let (
-                            Some(round_num), Some(prev_output_hex), Some(washed_input_hex),
-                            Some(output_hex), Some(producer_hex), Some(producer_sig_hex),
-                            Some(timestamp_ms), Some(attestations_arr)
+                            Some(round_num),
+                            Some(prev_output_hex),
+                            Some(washed_input_hex),
+                            Some(output_hex),
+                            Some(producer_hex),
+                            Some(producer_sig_hex),
+                            Some(timestamp_ms),
+                            Some(attestations_arr),
                         ) = (
                             round_json.get("round").and_then(|r| r.as_u64()),
                             round_json.get("prev_output").and_then(|p| p.as_str()),
                             round_json.get("washed_input").and_then(|w| w.as_str()),
                             round_json.get("output").and_then(|o| o.as_str()),
                             round_json.get("producer").and_then(|p| p.as_str()),
-                            round_json.get("producer_signature").and_then(|s| s.as_str()),
+                            round_json
+                                .get("producer_signature")
+                                .and_then(|s| s.as_str()),
                             round_json.get("timestamp_ms").and_then(|t| t.as_u64()),
                             round_json.get("attestations").and_then(|a| a.as_array()),
                         ) {
@@ -3233,13 +3585,21 @@ impl MeshService {
                             if let (Some(prev), Some(washed), Some(out), Some(prod), Some(sig)) =
                                 (prev_output, washed_input, output, producer, producer_sig)
                             {
-                                if prev.len() == 32 && washed.len() == 32 && out.len() == 32 &&
-                                   prod.len() == 32 && sig.len() == 64
+                                if prev.len() == 32
+                                    && washed.len() == 32
+                                    && out.len() == 32
+                                    && prod.len() == 32
+                                    && sig.len() == 64
                                 {
                                     // Parse attestations
                                     let mut attestations = Vec::new();
                                     for att_json in attestations_arr {
-                                        if let (Some(att_round), Some(att_prev_hex), Some(att_attester_hex), Some(att_sig_hex)) = (
+                                        if let (
+                                            Some(att_round),
+                                            Some(att_prev_hex),
+                                            Some(att_attester_hex),
+                                            Some(att_sig_hex),
+                                        ) = (
                                             att_json.get("round").and_then(|r| r.as_u64()),
                                             att_json.get("prev_output").and_then(|p| p.as_str()),
                                             att_json.get("attester").and_then(|a| a.as_str()),
@@ -3248,10 +3608,16 @@ impl MeshService {
                                             let att_prev = hex::decode(att_prev_hex).ok();
                                             let att_attester = hex::decode(att_attester_hex).ok();
                                             let att_sig = hex::decode(att_sig_hex).ok();
-                                            let att_slot = att_json.get("slot").and_then(|s| s.as_u64());
+                                            let att_slot =
+                                                att_json.get("slot").and_then(|s| s.as_u64());
 
-                                            if let (Some(ap), Some(aa), Some(asig)) = (att_prev, att_attester, att_sig) {
-                                                if ap.len() == 32 && aa.len() == 32 && asig.len() == 64 {
+                                            if let (Some(ap), Some(aa), Some(asig)) =
+                                                (att_prev, att_attester, att_sig)
+                                            {
+                                                if ap.len() == 32
+                                                    && aa.len() == 32
+                                                    && asig.len() == 64
+                                                {
                                                     attestations.push(RoundAttestation {
                                                         round: att_round,
                                                         prev_output: ap.try_into().unwrap(),
@@ -3265,7 +3631,8 @@ impl MeshService {
                                     }
 
                                     // Get iterations from JSON, default to base if not present (backwards compat)
-                                    let iterations = round_json.get("iterations")
+                                    let iterations = round_json
+                                        .get("iterations")
                                         .and_then(|i| i.as_u64())
                                         .map(|i| i as u32)
                                         .unwrap_or(crate::cvdf::CVDF_ITERATIONS_BASE);
@@ -3308,8 +3675,10 @@ impl MeshService {
                 if !parsed_rounds.is_empty() && self.cvdf_should_adopt(&parsed_rounds).await {
                     let their_height = parsed_rounds.last().map(|r| r.round).unwrap_or(0);
                     let their_weight: u64 = parsed_rounds.iter().map(|r| r.weight() as u64).sum();
-                    info!("Adopting heavier CVDF chain from {} (height {}, weight {})",
-                        peer_id, their_height, their_weight);
+                    info!(
+                        "Adopting heavier CVDF chain from {} (height {}, weight {})",
+                        peer_id, their_height, their_weight
+                    );
 
                     if self.cvdf_adopt(parsed_rounds).await {
                         // Chain adopted - now process slots with tiebreaker
@@ -3327,12 +3696,14 @@ impl MeshService {
                             let coord = spiral3d_to_coord(Spiral3DIndex::new(*slot_idx));
 
                             // Process through tiebreaker - this handles conflicts
-                            let (lost, _race_won) = self.process_slot_claim(
-                                *slot_idx,
-                                their_peer_id,
-                                (coord.q, coord.r, coord.z),
-                                Some(pubkey.to_vec())
-                            ).await;
+                            let (lost, _race_won) = self
+                                .process_slot_claim(
+                                    *slot_idx,
+                                    their_peer_id,
+                                    (coord.q, coord.r, coord.z),
+                                    Some(pubkey.to_vec()),
+                                )
+                                .await;
 
                             if lost {
                                 we_lost_our_slot = true;
@@ -3356,31 +3727,41 @@ impl MeshService {
             // ==================== SPORE CONTENT SYNC HANDLERS ====================
             // NOTE: Legacy "content_have_list" removed - use "spore_sync" for O(|XOR diff|) sync
             // The old handler did O(n²) comparisons; SPORE uses range-based set operations
-
             "release_flood" => {
                 // Receive a release flooded through the mesh
                 if let Some(release_data) = msg.get("release") {
                     // Try to parse as Release
-                    if let Ok(release) = serde_json::from_value::<crate::models::Release>(release_data.clone()) {
+                    if let Ok(release) =
+                        serde_json::from_value::<crate::models::Release>(release_data.clone())
+                    {
                         // SPORE⁻¹: Check if this release is in our DoNotWantList (tombstoned)
                         let tombstone = double_hash_id(&release.id);
                         let is_tombstoned = self.state.read().await.is_tombstoned(&tombstone);
 
                         if is_tombstoned {
-                            debug!("SPORE: Ignoring tombstoned release {} (in DoNotWantList)", release.id);
+                            debug!(
+                                "SPORE: Ignoring tombstoned release {} (in DoNotWantList)",
+                                release.id
+                            );
                         } else {
                             // Use DocumentStore for CRDT merge (automatic LWW based on modified_at)
                             let mut doc_store = self.doc_store.write().await;
                             match doc_store.put(&release) {
                                 Ok((_, changed)) => {
                                     if changed {
-                                        info!("SPORE: Merged release {} from mesh (CRDT)", release.id);
+                                        info!(
+                                            "SPORE: Merged release {} from mesh (CRDT)",
+                                            release.id
+                                        );
 
                                         // SPORE: Broadcast updated HaveList so peers know our new state
                                         // This enables continuous sync as our state changes
-                                        if let Ok(all_releases) = doc_store.list::<crate::models::Release>() {
+                                        if let Ok(all_releases) =
+                                            doc_store.list::<crate::models::Release>()
+                                        {
                                             let self_id = self.state.read().await.self_id.clone();
-                                            let release_ids: Vec<String> = all_releases.iter().map(|r| r.id.clone()).collect();
+                                            let release_ids: Vec<String> =
+                                                all_releases.iter().map(|r| r.id.clone()).collect();
                                             let have_list = build_spore_havelist(&release_ids);
                                             self.flood(FloodMessage::SporeSync {
                                                 peer_id: self_id,
@@ -3390,7 +3771,10 @@ impl MeshService {
                                     }
                                 }
                                 Err(e) => {
-                                    warn!("Failed to merge flooded release {}: {:?}", release.id, e);
+                                    warn!(
+                                        "Failed to merge flooded release {}: {:?}",
+                                        release.id, e
+                                    );
                                 }
                             }
                         }
@@ -3401,14 +3785,18 @@ impl MeshService {
                 // SPORE: Receive peer's HaveList (range-based)
                 // Their WantList = their_have.complement()
                 if let Some(have_list_value) = msg.get("have_list") {
-                    if let Ok(their_have) = serde_json::from_value::<Spore>(have_list_value.clone()) {
+                    if let Ok(their_have) = serde_json::from_value::<Spore>(have_list_value.clone())
+                    {
                         // Compute their WantList (what they don't have)
                         let their_want = their_have.complement();
 
                         // Build our HaveList from doc_store
                         let doc_store = self.doc_store.read().await;
-                        let our_releases = doc_store.list::<crate::models::Release>().unwrap_or_default();
-                        let our_release_ids: Vec<String> = our_releases.iter().map(|r| r.id.clone()).collect();
+                        let our_releases = doc_store
+                            .list::<crate::models::Release>()
+                            .unwrap_or_default();
+                        let our_release_ids: Vec<String> =
+                            our_releases.iter().map(|r| r.id.clone()).collect();
                         let our_have = build_spore_havelist(&our_release_ids);
 
                         // Compute what we should send: our_have ∩ their_want
@@ -3432,7 +3820,8 @@ impl MeshService {
                         // If we have releases they want, send them as delta
                         if !to_send.is_empty() {
                             // Find which releases match the to_send ranges
-                            let releases_to_send: Vec<String> = our_releases.iter()
+                            let releases_to_send: Vec<String> = our_releases
+                                .iter()
                                 .filter(|r| {
                                     let hash = release_id_to_u256(&r.id);
                                     to_send.covers(&hash)
@@ -3441,7 +3830,11 @@ impl MeshService {
                                 .collect();
 
                             if !releases_to_send.is_empty() {
-                                info!("SPORE: Sending {} releases to peer {} (delta transfer)", releases_to_send.len(), peer_id);
+                                info!(
+                                    "SPORE: Sending {} releases to peer {} (delta transfer)",
+                                    releases_to_send.len(),
+                                    peer_id
+                                );
                                 self.flood(FloodMessage::SporeDelta {
                                     releases: releases_to_send,
                                 });
@@ -3460,13 +3853,19 @@ impl MeshService {
 
                     for release_json in releases_value {
                         if let Some(json_str) = release_json.as_str() {
-                            if let Ok(release) = serde_json::from_str::<crate::models::Release>(json_str) {
+                            if let Ok(release) =
+                                serde_json::from_str::<crate::models::Release>(json_str)
+                            {
                                 // SPORE⁻¹: Check tombstone
                                 let tombstone = double_hash_id(&release.id);
-                                let is_tombstoned = self.state.read().await.is_tombstoned(&tombstone);
+                                let is_tombstoned =
+                                    self.state.read().await.is_tombstoned(&tombstone);
 
                                 if is_tombstoned {
-                                    debug!("SPORE: Ignoring tombstoned release {} from delta", release.id);
+                                    debug!(
+                                        "SPORE: Ignoring tombstoned release {} from delta",
+                                        release.id
+                                    );
                                 } else {
                                     // Use DocumentStore for CRDT merge
                                     match doc_store.put(&release) {
@@ -3476,7 +3875,10 @@ impl MeshService {
                                             }
                                         }
                                         Err(e) => {
-                                            warn!("SPORE: Failed to merge delta release {}: {:?}", release.id, e);
+                                            warn!(
+                                                "SPORE: Failed to merge delta release {}: {:?}",
+                                                release.id, e
+                                            );
                                         }
                                     }
                                 }
@@ -3485,7 +3887,10 @@ impl MeshService {
                     }
 
                     if stored_count > 0 {
-                        info!("SPORE: Merged {} releases from delta transfer (CRDT)", stored_count);
+                        info!(
+                            "SPORE: Merged {} releases from delta transfer (CRDT)",
+                            stored_count
+                        );
                         // NOTE: Don't broadcast HaveList here - would cause feedback loop
                         // HaveLists are exchanged on connection, not on every state change
                     }
@@ -3495,14 +3900,19 @@ impl MeshService {
                 // SPORE⁻¹: Receive DoNotWantList (deletion ranges) from peer
                 // Uses Spore (range-based) for O(|diff|) → 0 convergence
                 if let Some(ranges_value) = msg.get("ranges") {
-                    if let Ok(their_do_not_want) = serde_json::from_value::<Spore>(ranges_value.clone()) {
+                    if let Ok(their_do_not_want) =
+                        serde_json::from_value::<Spore>(ranges_value.clone())
+                    {
                         // Compute XOR to find new deletions we didn't know about
                         let our_do_not_want = self.state.read().await.do_not_want_spore().clone();
                         let diff = their_do_not_want.subtract(&our_do_not_want);
 
                         if !diff.is_empty() {
-                            info!("SPORE⁻¹: Received {} new deletion ranges from peer {}",
-                                diff.range_count(), peer_id);
+                            info!(
+                                "SPORE⁻¹: Received {} new deletion ranges from peer {}",
+                                diff.range_count(),
+                                peer_id
+                            );
 
                             // Merge their deletions into ours
                             let self_id = {
@@ -3517,11 +3927,20 @@ impl MeshService {
                                 for release in releases {
                                     let tombstone = double_hash_id(&release.id);
                                     if self.state.read().await.is_tombstoned(&tombstone) {
-                                        let content_id = citadel_crdt::ContentId::hash(release.id.as_bytes());
-                                        if let Err(e) = doc_store.delete::<crate::models::Release>(&content_id) {
-                                            warn!("Failed to delete tombstoned release {}: {:?}", release.id, e);
+                                        let content_id =
+                                            citadel_crdt::ContentId::hash(release.id.as_bytes());
+                                        if let Err(e) =
+                                            doc_store.delete::<crate::models::Release>(&content_id)
+                                        {
+                                            warn!(
+                                                "Failed to delete tombstoned release {}: {:?}",
+                                                release.id, e
+                                            );
                                         } else {
-                                            info!("SPORE⁻¹: Deleted tombstoned release {}", release.id);
+                                            info!(
+                                                "SPORE⁻¹: Deleted tombstoned release {}",
+                                                release.id
+                                            );
                                         }
                                     }
                                 }
@@ -3536,7 +3955,8 @@ impl MeshService {
                             }
 
                             // Re-flood our updated do_not_want to propagate through mesh
-                            let updated_do_not_want = self.state.read().await.do_not_want_spore().clone();
+                            let updated_do_not_want =
+                                self.state.read().await.do_not_want_spore().clone();
                             self.flood(FloodMessage::DoNotWantList {
                                 peer_id: self_id.clone(),
                                 do_not_want: updated_do_not_want,
@@ -3556,7 +3976,9 @@ impl MeshService {
                 // SPORE⁻¹: Receive erasure confirmation (ranges) from peer
                 // Track which deletion ranges this peer has confirmed processing
                 if let Some(ranges_value) = msg.get("ranges") {
-                    if let Ok(their_confirmed) = serde_json::from_value::<Spore>(ranges_value.clone()) {
+                    if let Ok(their_confirmed) =
+                        serde_json::from_value::<Spore>(ranges_value.clone())
+                    {
                         let mut state = self.state.write().await;
 
                         // Update sync status using XOR
@@ -3567,8 +3989,11 @@ impl MeshService {
                             debug!("SPORE⁻¹: Erasure synced with peer {} (XOR=∅)", peer_id);
                         } else {
                             let diff = state.do_not_want.xor(&their_confirmed);
-                            debug!("SPORE⁻¹: Erasure not synced with peer {} ({} range diffs)",
-                                peer_id, diff.range_count());
+                            debug!(
+                                "SPORE⁻¹: Erasure not synced with peer {} ({} range diffs)",
+                                peer_id,
+                                diff.range_count()
+                            );
                         }
 
                         // Check if ALL peers are synced - if so, we can garbage collect
@@ -3609,7 +4034,11 @@ impl MeshService {
                     }
 
                     if !new_bad_bits.is_empty() {
-                        info!("BadBits: Added {} new entries from peer {}", new_bad_bits.len(), peer_id);
+                        info!(
+                            "BadBits: Added {} new entries from peer {}",
+                            new_bad_bits.len(),
+                            peer_id
+                        );
 
                         // Delete any releases that match new bad bits
                         let self_id = state.self_id.clone();
@@ -3620,9 +4049,15 @@ impl MeshService {
                             for release in releases {
                                 let release_hash = double_hash_id(&release.id);
                                 if new_bad_bits.contains(&release_hash) {
-                                    let content_id = citadel_crdt::ContentId::hash(release.id.as_bytes());
-                                    if let Err(e) = doc_store.delete::<crate::models::Release>(&content_id) {
-                                        warn!("BadBits: Failed to delete blocked release {}: {:?}", release.id, e);
+                                    let content_id =
+                                        citadel_crdt::ContentId::hash(release.id.as_bytes());
+                                    if let Err(e) =
+                                        doc_store.delete::<crate::models::Release>(&content_id)
+                                    {
+                                        warn!(
+                                            "BadBits: Failed to delete blocked release {}: {:?}",
+                                            release.id, e
+                                        );
                                     } else {
                                         info!("BadBits: Deleted blocked release {}", release.id);
                                     }
@@ -3648,7 +4083,8 @@ impl MeshService {
 
                     for featured_json in featured_arr {
                         if let Some(json_str) = featured_json.as_str() {
-                            if let Ok(featured) = serde_json::from_str::<FeaturedRelease>(json_str) {
+                            if let Ok(featured) = serde_json::from_str::<FeaturedRelease>(json_str)
+                            {
                                 // put() merges with existing via TotalMerge:
                                 // - Counters: max(a, b) - both increments preserved
                                 // - Sets: union(a, b) - all elements preserved
@@ -3661,7 +4097,10 @@ impl MeshService {
                                         }
                                     }
                                     Err(e) => {
-                                        warn!("SPORE: Failed to store/merge featured release {}: {}", featured.id, e);
+                                        warn!(
+                                            "SPORE: Failed to store/merge featured release {}: {}",
+                                            featured.id, e
+                                        );
                                     }
                                 }
                             }
@@ -3670,12 +4109,16 @@ impl MeshService {
 
                     // Only re-flood if we actually got NEW data (XOR was non-empty)
                     if changed_count > 0 {
-                        info!("SPORE: Merged {} new featured releases from peer {}", changed_count, peer_id);
+                        info!(
+                            "SPORE: Merged {} new featured releases from peer {}",
+                            changed_count, peer_id
+                        );
 
                         // Re-flood merged state to propagate convergence
                         let self_id = self.state.read().await.self_id.clone();
                         if let Ok(all_featured) = doc_store.list::<FeaturedRelease>() {
-                            let featured_json: Vec<String> = all_featured.iter()
+                            let featured_json: Vec<String> = all_featured
+                                .iter()
                                 .filter_map(|f| serde_json::to_string(f).ok())
                                 .collect();
                             self.flood(FloodMessage::FeaturedSync {
@@ -3761,8 +4204,14 @@ mod tests {
 
         assert!(peer_a.is_coordinated(), "Peer A should reach coordination");
         assert!(peer_b.is_coordinated(), "Peer B should reach coordination");
-        assert!(peer_a.get_bilateral_receipt().is_some(), "Peer A should have bilateral receipt");
-        assert!(peer_b.get_bilateral_receipt().is_some(), "Peer B should have bilateral receipt");
+        assert!(
+            peer_a.get_bilateral_receipt().is_some(),
+            "Peer A should have bilateral receipt"
+        );
+        assert!(
+            peer_b.get_bilateral_receipt().is_some(),
+            "Peer B should have bilateral receipt"
+        );
     }
 
     /// Test that SPIRAL slot indices produce the correct coordinates
@@ -3779,8 +4228,14 @@ mod tests {
             let coord = spiral3d_to_coord(Spiral3DIndex(slot));
             // First ring is at distance 1 from origin
             let dist = (coord.q.abs() + coord.r.abs()) / 2;
-            assert!(dist <= 2, "Slot {} should be near origin, got ({}, {}, {})",
-                    slot, coord.q, coord.r, coord.z);
+            assert!(
+                dist <= 2,
+                "Slot {} should be near origin, got ({}, {}, {})",
+                slot,
+                coord.q,
+                coord.r,
+                coord.z
+            );
         }
     }
 
@@ -3793,11 +4248,17 @@ mod tests {
 
         // Small mesh - need fewer confirmations
         let mesh_size_3_neighbors_2 = std::cmp::max(1, (2 * 3 + 19) / 20);
-        assert_eq!(mesh_size_3_neighbors_2, 1, "With 2 neighbors in mesh of 3, need 1 confirmation");
+        assert_eq!(
+            mesh_size_3_neighbors_2, 1,
+            "With 2 neighbors in mesh of 3, need 1 confirmation"
+        );
 
         // Medium mesh
         let mesh_size_10_neighbors_5 = std::cmp::max(1, (5 * 5 + 19) / 20);
-        assert_eq!(mesh_size_10_neighbors_5, 2, "With 5 neighbors in mesh of 10, need 2 confirmations");
+        assert_eq!(
+            mesh_size_10_neighbors_5, 2,
+            "With 5 neighbors in mesh of 10, need 2 confirmations"
+        );
 
         // Large mesh (full 20 neighbors)
         let full_mesh = 11; // 11/20 at full maturity
@@ -3817,7 +4278,9 @@ mod tests {
     /// 5. Slot confirmed when 11/20 threshold met (or scaled threshold for small mesh)
     #[test]
     fn test_1000_node_mesh_formation() {
-        use citadel_topology::{HexCoord, Neighbors, Spiral3DIndex, spiral3d_to_coord, coord_to_spiral3d};
+        use citadel_topology::{
+            coord_to_spiral3d, spiral3d_to_coord, HexCoord, Neighbors, Spiral3DIndex,
+        };
         use std::collections::{HashMap, HashSet, VecDeque};
 
         const NODE_COUNT: u64 = 1000;
@@ -3917,12 +4380,15 @@ mod tests {
                 }
 
                 // Add the node to the mesh (optimistically, validations confirm)
-                self.nodes.insert(claim.slot, SimNode {
-                    peer_id: claim.peer_id,
-                    coord: claim.coord,
-                    validations_received: HashSet::new(),
-                    neighbors_at_join,
-                });
+                self.nodes.insert(
+                    claim.slot,
+                    SimNode {
+                        peer_id: claim.peer_id,
+                        coord: claim.coord,
+                        validations_received: HashSet::new(),
+                        neighbors_at_join,
+                    },
+                );
                 self.coord_to_slot.insert(claim.coord, claim.slot);
             }
 
@@ -3972,7 +4438,10 @@ mod tests {
         };
         network.broadcast_claim(genesis_claim);
         network.process_all();
-        println!("  Genesis node at origin, {} packet(s)", network.packets_sent);
+        println!(
+            "  Genesis node at origin, {} packet(s)",
+            network.packets_sent
+        );
 
         // Remaining nodes join via flooding
         println!("Phase 2: {} nodes joining via flooding...", NODE_COUNT - 1);
@@ -3996,9 +4465,12 @@ mod tests {
 
             // Progress reporting
             if progress_idx < progress_points.len() && slot >= progress_points[progress_idx] {
-                println!("  {} nodes, {} packets so far ({:.2} packets/node)",
-                    slot + 1, network.packets_sent,
-                    network.packets_sent as f64 / (slot + 1) as f64);
+                println!(
+                    "  {} nodes, {} packets so far ({:.2} packets/node)",
+                    slot + 1,
+                    network.packets_sent,
+                    network.packets_sent as f64 / (slot + 1) as f64
+                );
                 progress_idx += 1;
             }
         }
@@ -4018,7 +4490,10 @@ mod tests {
             let node = network.nodes.get(&slot).unwrap();
             assert_eq!(node.coord, coord, "Node {} has wrong coordinate", slot);
         }
-        println!("  ✓ All {} slots filled in correct SPIRAL order", NODE_COUNT);
+        println!(
+            "  ✓ All {} slots filled in correct SPIRAL order",
+            NODE_COUNT
+        );
 
         // Verify validation thresholds met (based on neighbors at join time)
         let mut validation_failures = 0u64;
@@ -4041,8 +4516,14 @@ mod tests {
                 validation_failures += 1;
             }
         }
-        println!("  ✓ Validation thresholds: {} failures out of {} nodes", validation_failures, NODE_COUNT);
-        assert_eq!(validation_failures, 0, "All nodes should meet validation threshold");
+        println!(
+            "  ✓ Validation thresholds: {} failures out of {} nodes",
+            validation_failures, NODE_COUNT
+        );
+        assert_eq!(
+            validation_failures, 0,
+            "All nodes should meet validation threshold"
+        );
 
         // Verify 20-neighbor topology
         let mut total_edges = 0u64;
@@ -4063,13 +4544,18 @@ mod tests {
         }
 
         let unique_edges = total_edges / 2;
-        println!("  ✓ Topology: {} unique edges, neighbors range {} to {}",
-            unique_edges, min_neighbors, max_neighbors);
+        println!(
+            "  ✓ Topology: {} unique edges, neighbors range {} to {}",
+            unique_edges, min_neighbors, max_neighbors
+        );
 
         // Packet efficiency
         println!("\nPhase 4: Packet efficiency...");
         println!("  Total packets: {}", network.packets_sent);
-        println!("  Packets per node: {:.2}", network.packets_sent as f64 / NODE_COUNT as f64);
+        println!(
+            "  Packets per node: {:.2}",
+            network.packets_sent as f64 / NODE_COUNT as f64
+        );
         println!("  Total validations: {}", total_validations);
 
         // We want < 1000 packets for 1000 nodes? Let's see the actual count
@@ -4080,9 +4566,17 @@ mod tests {
         // For now, verify it's O(N), not O(N²)
         // O(N²) would be ~1,000,000 packets
         // O(N) with small constant should be < 50,000
-        assert!(network.packets_sent < 50000,
-            "Should be O(N) packets, got {} for {} nodes", network.packets_sent, NODE_COUNT);
-        println!("  ✓ Packet count is O(N): {} << {} (N²)", network.packets_sent, NODE_COUNT * NODE_COUNT);
+        assert!(
+            network.packets_sent < 50000,
+            "Should be O(N) packets, got {} for {} nodes",
+            network.packets_sent,
+            NODE_COUNT
+        );
+        println!(
+            "  ✓ Packet count is O(N): {} << {} (N²)",
+            network.packets_sent,
+            NODE_COUNT * NODE_COUNT
+        );
 
         // Geometric balance
         let coords: Vec<HexCoord> = (0..NODE_COUNT)
@@ -4100,11 +4594,21 @@ mod tests {
         println!("\nMesh statistics:");
         println!("  Nodes: {}", NODE_COUNT);
         println!("  Unique edges: {}", unique_edges);
-        println!("  Spatial extent: Q [{}, {}], Z [{}, {}]", min_q, max_q, min_z, max_z);
-        println!("  Avg neighbors: {:.2}", total_edges as f64 / NODE_COUNT as f64);
+        println!(
+            "  Spatial extent: Q [{}, {}], Z [{}, {}]",
+            min_q, max_q, min_z, max_z
+        );
+        println!(
+            "  Avg neighbors: {:.2}",
+            total_edges as f64 / NODE_COUNT as f64
+        );
 
-        assert!((q_span - z_span).abs() <= 2,
-            "Mesh should be balanced: Q span {} vs Z span {}", q_span, z_span);
+        assert!(
+            (q_span - z_span).abs() <= 2,
+            "Mesh should be balanced: Q span {} vs Z span {}",
+            q_span,
+            z_span
+        );
         println!("  ✓ Geometrically balanced (spherical growth)");
 
         println!("\n=== 1000-Node Flooding Mesh Test PASSED ===\n");
@@ -4119,7 +4623,7 @@ mod tests {
     /// This models Docker's depends_on ordering where node N depends on node N-1.
     #[test]
     fn test_sequential_mesh_formation() {
-        use citadel_topology::{Spiral3DIndex, spiral3d_to_coord, coord_to_spiral3d};
+        use citadel_topology::{coord_to_spiral3d, spiral3d_to_coord, Spiral3DIndex};
         use std::collections::HashMap;
 
         const NODE_COUNT: u64 = 50;
@@ -4136,7 +4640,9 @@ mod tests {
 
         impl Mesh {
             fn new() -> Self {
-                Self { nodes: HashMap::new() }
+                Self {
+                    nodes: HashMap::new(),
+                }
             }
 
             /// Node joins by contacting any existing node, learning state, then claiming
@@ -4160,12 +4666,27 @@ mod tests {
                 let mut final_known = known_slots;
                 final_known.insert(slot, node_id);
 
-                self.nodes.insert(node_id, SimNode { slot, known_slots: final_known });
+                self.nodes.insert(
+                    node_id,
+                    SimNode {
+                        slot,
+                        known_slots: final_known,
+                    },
+                );
 
                 // Propagate our claim to all existing nodes
-                let node_ids: Vec<u64> = self.nodes.keys().copied().filter(|&id| id != node_id).collect();
+                let node_ids: Vec<u64> = self
+                    .nodes
+                    .keys()
+                    .copied()
+                    .filter(|&id| id != node_id)
+                    .collect();
                 for other_id in node_ids {
-                    self.nodes.get_mut(&other_id).unwrap().known_slots.insert(slot, node_id);
+                    self.nodes
+                        .get_mut(&other_id)
+                        .unwrap()
+                        .known_slots
+                        .insert(slot, node_id);
                 }
             }
         }
@@ -4191,7 +4712,10 @@ mod tests {
         let mut slot_to_node: HashMap<u64, u64> = HashMap::new();
         for (&node_id, node) in &mesh.nodes {
             if let Some(&existing) = slot_to_node.get(&node.slot) {
-                panic!("DUPLICATE: Slot {} claimed by both node {} and node {}", node.slot, existing, node_id);
+                panic!(
+                    "DUPLICATE: Slot {} claimed by both node {} and node {}",
+                    node.slot, existing, node_id
+                );
             }
             slot_to_node.insert(node.slot, node_id);
         }
@@ -4240,7 +4764,10 @@ mod tests {
             *slot_counts.entry(*slot).or_insert(0) += 1;
         }
 
-        println!("Without state sync, {} nodes all claimed slot 0!", slot_counts.get(&0).unwrap());
+        println!(
+            "Without state sync, {} nodes all claimed slot 0!",
+            slot_counts.get(&0).unwrap()
+        );
         println!("This is exactly what we see in Docker logs.\n");
 
         // The fix: priority-based tiebreaker resolves, but requires many re-claims
@@ -4252,11 +4779,22 @@ mod tests {
         // This takes O(N) rounds of resolution!
 
         println!("With naive tiebreaker resolution:");
-        println!("  Round 1: {} nodes fight for slot 0, 1 wins, {} retry", NODE_COUNT, NODE_COUNT - 1);
-        println!("  Round 2: {} nodes fight for slot 1, 1 wins, {} retry", NODE_COUNT - 1, NODE_COUNT - 2);
+        println!(
+            "  Round 1: {} nodes fight for slot 0, 1 wins, {} retry",
+            NODE_COUNT,
+            NODE_COUNT - 1
+        );
+        println!(
+            "  Round 2: {} nodes fight for slot 1, 1 wins, {} retry",
+            NODE_COUNT - 1,
+            NODE_COUNT - 2
+        );
         println!("  ...");
         println!("  Total rounds: {} (O(N))", NODE_COUNT);
-        println!("  Total slot changes: {} (O(N²))\n", NODE_COUNT * (NODE_COUNT - 1) / 2);
+        println!(
+            "  Total slot changes: {} (O(N²))\n",
+            NODE_COUNT * (NODE_COUNT - 1) / 2
+        );
 
         println!("The FIX: Nodes must sync mesh state BEFORE claiming.");
         println!("With proper sync, each node claims a unique slot immediately.\n");
@@ -4268,9 +4806,9 @@ mod tests {
     /// Models the CORRECT behavior we want in Docker.
     #[test]
     fn test_50_node_mesh_with_state_propagation() {
-        use citadel_topology::{Spiral3DIndex, spiral3d_to_coord, coord_to_spiral3d, Neighbors};
-        use std::collections::{HashMap, BinaryHeap};
+        use citadel_topology::{coord_to_spiral3d, spiral3d_to_coord, Neighbors, Spiral3DIndex};
         use std::cmp::Ordering;
+        use std::collections::{BinaryHeap, HashMap};
 
         const NODE_COUNT: u64 = 50;
 
@@ -4283,14 +4821,25 @@ mod tests {
 
         #[derive(Clone, Debug, Eq, PartialEq)]
         enum EventType {
-            NodeStartup { node_id: u64 },
-            StateReceived { node_id: u64, from_peer: u64 },
-            SlotClaimReceived { receiver: u64, claimer: u64, slot: u64 },
+            NodeStartup {
+                node_id: u64,
+            },
+            StateReceived {
+                node_id: u64,
+                from_peer: u64,
+            },
+            SlotClaimReceived {
+                receiver: u64,
+                claimer: u64,
+                slot: u64,
+            },
         }
 
         impl Ord for Event {
             fn cmp(&self, other: &Self) -> Ordering {
-                other.time.cmp(&self.time)
+                other
+                    .time
+                    .cmp(&self.time)
                     .then_with(|| other.seq.cmp(&self.seq))
             }
         }
@@ -4343,7 +4892,11 @@ mod tests {
                         EventType::StateReceived { node_id, from_peer } => {
                             self.handle_state_received(node_id, from_peer);
                         }
-                        EventType::SlotClaimReceived { receiver, claimer, slot } => {
+                        EventType::SlotClaimReceived {
+                            receiver,
+                            claimer,
+                            slot,
+                        } => {
                             self.handle_slot_claim(receiver, claimer, slot);
                         }
                     }
@@ -4352,11 +4905,14 @@ mod tests {
 
             fn handle_startup(&mut self, node_id: u64) {
                 // Node starts but does NOT claim immediately
-                self.nodes.insert(node_id, SimNode {
-                    claimed_slot: None,
-                    known_slots: HashMap::new(),
-                    state_received: false,
-                });
+                self.nodes.insert(
+                    node_id,
+                    SimNode {
+                        claimed_slot: None,
+                        known_slots: HashMap::new(),
+                        state_received: false,
+                    },
+                );
 
                 if node_id == 0 {
                     // Genesis: no peers to sync from, claim immediately
@@ -4369,7 +4925,13 @@ mod tests {
                     // Connect to previous node and wait for state
                     let bootstrap_peer = node_id - 1;
                     // Network delay for connection + state transfer
-                    self.schedule(50, EventType::StateReceived { node_id, from_peer: bootstrap_peer });
+                    self.schedule(
+                        50,
+                        EventType::StateReceived {
+                            node_id,
+                            from_peer: bootstrap_peer,
+                        },
+                    );
                 }
             }
 
@@ -4390,7 +4952,9 @@ mod tests {
                 node.known_slots.insert(target, node_id);
 
                 // Broadcast claim to all existing nodes
-                let node_ids: Vec<u64> = self.nodes.keys()
+                let node_ids: Vec<u64> = self
+                    .nodes
+                    .keys()
                     .copied()
                     .filter(|&id| id != node_id)
                     .collect();
@@ -4398,11 +4962,14 @@ mod tests {
                 for other_id in node_ids {
                     // Variable network delay
                     let delay = 10 + (node_id ^ other_id) % 30;
-                    self.schedule(delay, EventType::SlotClaimReceived {
-                        receiver: other_id,
-                        claimer: node_id,
-                        slot: target,
-                    });
+                    self.schedule(
+                        delay,
+                        EventType::SlotClaimReceived {
+                            receiver: other_id,
+                            claimer: node_id,
+                            slot: target,
+                        },
+                    );
                 }
             }
 
@@ -4419,7 +4986,10 @@ mod tests {
 
         // Staggered startup: each node starts 5ms after previous
         // This models Docker's depends_on chain
-        println!("Phase 1: Scheduling {} nodes with staggered startup...", NODE_COUNT);
+        println!(
+            "Phase 1: Scheduling {} nodes with staggered startup...",
+            NODE_COUNT
+        );
         for i in 0..NODE_COUNT {
             sim.schedule(i * 5, EventType::NodeStartup { node_id: i });
         }
@@ -4436,7 +5006,10 @@ mod tests {
         for (&node_id, node) in &sim.nodes {
             if let Some(slot) = node.claimed_slot {
                 if let Some(&existing) = slot_to_node.get(&slot) {
-                    println!("  DUPLICATE: Slot {} claimed by nodes {} and {}", slot, existing, node_id);
+                    println!(
+                        "  DUPLICATE: Slot {} claimed by nodes {} and {}",
+                        slot, existing, node_id
+                    );
                     duplicate_count += 1;
                 } else {
                     slot_to_node.insert(slot, node_id);
@@ -4456,7 +5029,8 @@ mod tests {
         for &slot in slot_to_node.keys() {
             let coord = spiral3d_to_coord(Spiral3DIndex(slot));
             let neighbors = Neighbors::of(coord);
-            let count = neighbors.iter()
+            let count = neighbors
+                .iter()
                 .filter(|n| {
                     let neighbor_slot = coord_to_spiral3d(**n).0;
                     slot_to_node.contains_key(&neighbor_slot)
@@ -4469,10 +5043,17 @@ mod tests {
         println!("  Total nodes: {}", sim.nodes.len());
         println!("  Unique slots: {}", slot_to_node.len());
         println!("  Duplicate claims: {}", duplicate_count);
-        println!("  Avg neighbors: {:.2}", total_neighbors as f64 / NODE_COUNT as f64);
+        println!(
+            "  Avg neighbors: {:.2}",
+            total_neighbors as f64 / NODE_COUNT as f64
+        );
 
         assert_eq!(duplicate_count, 0, "No duplicates with proper state sync");
-        assert_eq!(slot_to_node.len(), NODE_COUNT as usize, "All nodes got slots");
+        assert_eq!(
+            slot_to_node.len(),
+            NODE_COUNT as usize,
+            "All nodes got slots"
+        );
 
         println!("  ✓ All {} nodes claimed unique slots", NODE_COUNT);
         println!("  ✓ State propagation prevents races");
@@ -4528,8 +5109,12 @@ mod tests {
         assert!(peer_b.is_coordinated(), "Peer B should be coordinated");
 
         // Get bilateral receipts
-        let (a_our, a_their) = peer_a.get_bilateral_receipt().expect("Should have bilateral receipt");
-        let (b_our, b_their) = peer_b.get_bilateral_receipt().expect("Should have bilateral receipt");
+        let (a_our, a_their) = peer_a
+            .get_bilateral_receipt()
+            .expect("Should have bilateral receipt");
+        let (b_our, b_their) = peer_b
+            .get_bilateral_receipt()
+            .expect("Should have bilateral receipt");
 
         // Create AuthorizedPeer from A's perspective
         let peer_id = compute_peer_id_from_bytes(kp_b.public_key().as_bytes());
@@ -4546,15 +5131,20 @@ mod tests {
         // Verify AuthorizedPeer properties
         assert_eq!(authorized.peer_id, peer_id);
         assert_eq!(authorized.public_key, *kp_b.public_key().as_bytes());
-        assert!(authorized.is_authorized(), "AuthorizedPeer should always be authorized");
+        assert!(
+            authorized.is_authorized(),
+            "AuthorizedPeer should always be authorized"
+        );
         assert!(authorized.slot.is_none(), "New AuthorizedPeer has no slot");
         assert_eq!(authorized.last_addr, addr);
 
         // Verify bilateral construction property:
         // If A has QuadProof, B must also have it (and vice versa)
         // This is TGP's core invariant: ∃QA ⇔ ∃QB
-        assert!(peer_b.get_bilateral_receipt().is_some(),
-            "Bilateral construction: if A has Q, B must have Q");
+        assert!(
+            peer_b.get_bilateral_receipt().is_some(),
+            "Bilateral construction: if A has Q, B must have Q"
+        );
 
         println!("AuthorizedPeer created successfully:");
         println!("  peer_id: {}...", &peer_id[..20]);
@@ -4572,41 +5162,52 @@ mod tests {
         let kp_c = keypair_from_seed(30);
 
         // Create mock QuadProofs (using coordinated handshake)
-        let mut create_auth_peer = |our_kp: &citadel_protocols::KeyPair, their_kp: &citadel_protocols::KeyPair| {
-            let mut peer_a = PeerCoordinator::symmetric(
-                our_kp.clone(),
-                their_kp.public_key().clone(),
-                CoordinatorConfig::default().without_timeout().with_flood_rate(FloodRateConfig::fast()),
-            );
-            let mut peer_b = PeerCoordinator::symmetric(
-                their_kp.clone(),
-                our_kp.public_key().clone(),
-                CoordinatorConfig::default().without_timeout().with_flood_rate(FloodRateConfig::fast()),
-            );
-            peer_a.set_active(true);
-            peer_b.set_active(true);
+        let mut create_auth_peer =
+            |our_kp: &citadel_protocols::KeyPair, their_kp: &citadel_protocols::KeyPair| {
+                let mut peer_a = PeerCoordinator::symmetric(
+                    our_kp.clone(),
+                    their_kp.public_key().clone(),
+                    CoordinatorConfig::default()
+                        .without_timeout()
+                        .with_flood_rate(FloodRateConfig::fast()),
+                );
+                let mut peer_b = PeerCoordinator::symmetric(
+                    their_kp.clone(),
+                    our_kp.public_key().clone(),
+                    CoordinatorConfig::default()
+                        .without_timeout()
+                        .with_flood_rate(FloodRateConfig::fast()),
+                );
+                peer_a.set_active(true);
+                peer_b.set_active(true);
 
-            for _ in 0..100 {
-                if let Ok(Some(msgs)) = peer_a.poll() {
-                    for msg in msgs { let _ = peer_b.receive(&msg); }
+                for _ in 0..100 {
+                    if let Ok(Some(msgs)) = peer_a.poll() {
+                        for msg in msgs {
+                            let _ = peer_b.receive(&msg);
+                        }
+                    }
+                    if let Ok(Some(msgs)) = peer_b.poll() {
+                        for msg in msgs {
+                            let _ = peer_a.receive(&msg);
+                        }
+                    }
+                    if peer_a.is_coordinated() && peer_b.is_coordinated() {
+                        break;
+                    }
+                    sleep(Duration::from_micros(100));
                 }
-                if let Ok(Some(msgs)) = peer_b.poll() {
-                    for msg in msgs { let _ = peer_a.receive(&msg); }
-                }
-                if peer_a.is_coordinated() && peer_b.is_coordinated() { break; }
-                sleep(Duration::from_micros(100));
-            }
 
-            let (our_q, their_q) = peer_a.get_bilateral_receipt().unwrap();
-            let peer_id = compute_peer_id_from_bytes(their_kp.public_key().as_bytes());
-            AuthorizedPeer::new(
-                peer_id,
-                *their_kp.public_key().as_bytes(),
-                our_q.clone(),
-                their_q.clone(),
-                "127.0.0.1:9000".parse().unwrap(),
-            )
-        };
+                let (our_q, their_q) = peer_a.get_bilateral_receipt().unwrap();
+                let peer_id = compute_peer_id_from_bytes(their_kp.public_key().as_bytes());
+                AuthorizedPeer::new(
+                    peer_id,
+                    *their_kp.public_key().as_bytes(),
+                    our_q.clone(),
+                    their_q.clone(),
+                    "127.0.0.1:9000".parse().unwrap(),
+                )
+            };
 
         // Create authorized peers
         let auth_b = create_auth_peer(&kp_a, &kp_b);
@@ -4624,8 +5225,14 @@ mod tests {
         let peer_b_id = compute_peer_id_from_bytes(kp_b.public_key().as_bytes());
         let peer_c_id = compute_peer_id_from_bytes(kp_c.public_key().as_bytes());
 
-        assert!(authorized_peers.contains_key(&peer_b_id), "Should find peer B");
-        assert!(authorized_peers.contains_key(&peer_c_id), "Should find peer C");
+        assert!(
+            authorized_peers.contains_key(&peer_b_id),
+            "Should find peer B"
+        );
+        assert!(
+            authorized_peers.contains_key(&peer_c_id),
+            "Should find peer C"
+        );
 
         // Verify authorization check
         for (id, peer) in &authorized_peers {

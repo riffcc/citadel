@@ -132,12 +132,7 @@ fn default_priority() -> u32 {
 
 impl FeaturedRelease {
     /// Create a new featured release with minimal required fields.
-    pub fn new(
-        id: String,
-        release_id: String,
-        start_time: String,
-        end_time: String,
-    ) -> Self {
+    pub fn new(id: String, release_id: String, start_time: String, end_time: String) -> Self {
         let now = chrono::Utc::now().to_rfc3339();
         Self {
             id,

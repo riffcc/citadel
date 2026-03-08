@@ -112,7 +112,7 @@ impl LensConfig {
     /// Create config from environment variables with sensible defaults.
     pub fn from_env() -> Self {
         let data_dir = PathBuf::from(
-            std::env::var("LENS_DATA_DIR").unwrap_or_else(|_| "./lens-data".to_string())
+            std::env::var("LENS_DATA_DIR").unwrap_or_else(|_| "./lens-data".to_string()),
         );
 
         let api_addr = std::env::var("LENS_API_BIND")
@@ -154,7 +154,8 @@ impl LensConfig {
             .map(PathBuf::from)
             .unwrap_or_else(|_| data_dir.join("admin.sock"));
 
-        let admin_public_key = std::env::var("ADMIN_PUBLIC_KEY").ok()
+        let admin_public_key = std::env::var("ADMIN_PUBLIC_KEY")
+            .ok()
             .filter(|s| !s.is_empty());
 
         Self {
@@ -217,7 +218,7 @@ impl LensNode {
             storage,
             config: config.clone(),
             mesh_state: None,
-            doc_store: None,  // Set when mesh service starts
+            doc_store: None, // Set when mesh service starts
             flood_tx: None,
             admin_event_tx: None,
         }));
@@ -274,8 +275,12 @@ impl LensNode {
         // Start admin socket server in background (with flood capability)
         let admin_socket = AdminSocket::new(
             Arc::clone(&storage),
-            self.config.admin_socket.to_str().unwrap_or("./lens-data/admin.sock"),
-        ).with_flood_tx(flood_tx.clone());
+            self.config
+                .admin_socket
+                .to_str()
+                .unwrap_or("./lens-data/admin.sock"),
+        )
+        .with_flood_tx(flood_tx.clone());
         tokio::spawn(async move {
             if let Err(e) = admin_socket.run().await {
                 tracing::error!("Admin socket error: {}", e);

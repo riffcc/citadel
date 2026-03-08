@@ -89,7 +89,13 @@ impl MeshVouch {
         let voucher = signing_key.verifying_key().to_bytes();
 
         // Build message to sign
-        let msg = Self::build_message(&voucher, voucher_slot, &alive_neighbors, vdf_height, &latencies);
+        let msg = Self::build_message(
+            &voucher,
+            voucher_slot,
+            &alive_neighbors,
+            vdf_height,
+            &latencies,
+        );
         let signature = signing_key.sign(&msg);
 
         Self {
@@ -151,12 +157,15 @@ impl MeshVouch {
 
     /// Do I witness any of the judged? (Is any of my neighbors in the alive list?)
     pub fn witness_any(&self, my_neighbors: &[[u8; 32]]) -> bool {
-        my_neighbors.iter().any(|n| self.alive_neighbors.contains(n))
+        my_neighbors
+            .iter()
+            .any(|n| self.alive_neighbors.contains(n))
     }
 
     /// Get which of my neighbors are judged by this vouch
     pub fn judged_neighbors(&self, my_neighbors: &[[u8; 32]]) -> Vec<[u8; 32]> {
-        my_neighbors.iter()
+        my_neighbors
+            .iter()
             .filter(|n| self.alive_neighbors.contains(n))
             .copied()
             .collect()
@@ -215,15 +224,14 @@ impl NodeLiveness {
 
     /// Prune expired vouches
     pub fn prune_expired(&mut self, current_height: u64) {
-        self.vouches.retain(|_, (height, _)| {
-            current_height.saturating_sub(*height) <= VOUCH_EXPIRY_ROUNDS
-        });
+        self.vouches
+            .retain(|_, (height, _)| current_height.saturating_sub(*height) <= VOUCH_EXPIRY_ROUNDS);
     }
 
     /// Check if node has sufficient vouches to be valid
     pub fn is_valid(&self) -> bool {
         match self.expected_neighbors {
-            0 => true,  // Genesis
+            0 => true, // Genesis
             1 => !self.vouches.is_empty(),
             2 => self.vouches.len() >= 1,
             3 => self.vouches.len() >= 2,
@@ -313,7 +321,8 @@ impl LivenessManager {
         // Am I one of the judged?
         if vouch.judges_me(&self.our_pubkey) {
             // Record vouch for myself
-            let liveness = self.node_liveness
+            let liveness = self
+                .node_liveness
                 .entry(self.our_pubkey)
                 .or_insert_with(|| NodeLiveness::new(self.neighbors.len()));
             liveness.record_vouch(vouch.voucher, vouch.vdf_height, vouch.alive_neighbors.len());
@@ -327,7 +336,8 @@ impl LivenessManager {
         if !judged.is_empty() {
             // Record vouches for my neighbors
             for neighbor in judged {
-                let liveness = self.node_liveness
+                let liveness = self
+                    .node_liveness
                     .entry(neighbor)
                     .or_insert_with(|| NodeLiveness::new(20)); // Assume full mesh
                 liveness.record_vouch(vouch.voucher, vouch.vdf_height, vouch.alive_neighbors.len());
@@ -382,7 +392,8 @@ impl LivenessManager {
 
         // Collect alive neighbors (those with recent latency data)
         let alive_neighbors: Vec<[u8; 32]> = self.neighbor_latencies.keys().copied().collect();
-        let latencies: Vec<([u8; 32], u64)> = self.neighbor_latencies
+        let latencies: Vec<([u8; 32], u64)> = self
+            .neighbor_latencies
             .iter()
             .map(|(k, v)| (*k, *v))
             .collect();
@@ -413,14 +424,16 @@ impl LivenessManager {
 
     /// Check if a node is currently valid (has sufficient vouches)
     pub fn is_node_valid(&self, node: &[u8; 32]) -> bool {
-        self.node_liveness.get(node)
+        self.node_liveness
+            .get(node)
             .map(|l| l.is_valid())
             .unwrap_or(false)
     }
 
     /// Get all nodes that have become invalid (for slot reclamation)
     pub fn invalid_nodes(&self) -> Vec<[u8; 32]> {
-        self.node_liveness.iter()
+        self.node_liveness
+            .iter()
             .filter(|(_, l)| !l.is_valid())
             .map(|(node, _)| *node)
             .collect()
@@ -428,7 +441,8 @@ impl LivenessManager {
 
     /// Get vouch count for a node
     pub fn vouch_count(&self, node: &[u8; 32]) -> usize {
-        self.node_liveness.get(node)
+        self.node_liveness
+            .get(node)
             .map(|l| l.vouch_count())
             .unwrap_or(0)
     }
@@ -495,13 +509,7 @@ mod tests {
 
         // Create vouch that judges our neighbor (we're witness)
         let voucher_key = SigningKey::generate(&mut OsRng);
-        let vouch = MeshVouch::new(
-            2,
-            vec![neighbor],
-            vec![(neighbor, 10)],
-            99,
-            &voucher_key,
-        );
+        let vouch = MeshVouch::new(2, vec![neighbor], vec![(neighbor, 10)], 99, &voucher_key);
 
         let decision = manager.handle_vouch(vouch);
         assert_eq!(decision, PropagationDecision::Stop);
@@ -521,13 +529,7 @@ mod tests {
 
         // Create vouch for unrelated nodes
         let voucher_key = SigningKey::generate(&mut OsRng);
-        let vouch = MeshVouch::new(
-            5,
-            vec![[10u8; 32], [11u8; 32]],
-            vec![],
-            99,
-            &voucher_key,
-        );
+        let vouch = MeshVouch::new(5, vec![[10u8; 32], [11u8; 32]], vec![], 99, &voucher_key);
 
         let decision = manager.handle_vouch(vouch);
         assert_eq!(decision, PropagationDecision::Drop);

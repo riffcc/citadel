@@ -183,7 +183,8 @@ impl<T: CvdfTransport> CvdfService<T> {
             }
             CvdfServiceMessage::SyncReq { from_height } => {
                 let rounds = self.coordinator.chain().rounds_from(from_height).to_vec();
-                self.transport.send_to(from, CvdfServiceMessage::SyncResp { rounds });
+                self.transport
+                    .send_to(from, CvdfServiceMessage::SyncResp { rounds });
             }
             CvdfServiceMessage::SyncResp { rounds } => {
                 if self.coordinator.should_adopt(&rounds) {
@@ -252,7 +253,9 @@ impl<T: CvdfTransport> CvdfService<T> {
             MergeAction::RequestSync { from_height, peer } => {
                 self.transport.send_to(
                     peer,
-                    CvdfServiceMessage::SyncReq { from_height: *from_height },
+                    CvdfServiceMessage::SyncReq {
+                        from_height: *from_height,
+                    },
                 );
             }
             MergeAction::NoAction => {}
@@ -356,7 +359,10 @@ mod tests {
     }
 
     impl TestTransport {
-        fn new() -> (Self, Arc<Mutex<Vec<(Option<[u8; 32]>, CvdfServiceMessage)>>>) {
+        fn new() -> (
+            Self,
+            Arc<Mutex<Vec<(Option<[u8; 32]>, CvdfServiceMessage)>>>,
+        ) {
             let sent = Arc::new(Mutex::new(Vec::new()));
             (Self { sent: sent.clone() }, sent)
         }
@@ -403,11 +409,18 @@ mod tests {
         service.tick();
 
         let messages = sent.lock().unwrap();
-        let has_attest = messages.iter().any(|(_, m)| matches!(m, CvdfServiceMessage::Attest(_)));
-        let has_round = messages.iter().any(|(_, m)| matches!(m, CvdfServiceMessage::Round(_)));
+        let has_attest = messages
+            .iter()
+            .any(|(_, m)| matches!(m, CvdfServiceMessage::Attest(_)));
+        let has_round = messages
+            .iter()
+            .any(|(_, m)| matches!(m, CvdfServiceMessage::Round(_)));
 
         assert!(has_attest, "Should broadcast attestation");
-        assert!(has_round, "Should broadcast round (our turn, have attestation)");
+        assert!(
+            has_round,
+            "Should broadcast round (our turn, have attestation)"
+        );
         assert_eq!(service.height(), 1);
     }
 
@@ -419,9 +432,7 @@ mod tests {
         let keys: Vec<SigningKey> = (0..num_nodes)
             .map(|_| SigningKey::generate(&mut OsRng))
             .collect();
-        let pubkeys: Vec<[u8; 32]> = keys.iter()
-            .map(|k| k.verifying_key().to_bytes())
-            .collect();
+        let pubkeys: Vec<[u8; 32]> = keys.iter().map(|k| k.verifying_key().to_bytes()).collect();
 
         // Build services
         let mut services: Vec<CvdfService<TestTransport>> = Vec::new();
@@ -509,14 +520,21 @@ mod tests {
             }
 
             let round = produced_round.unwrap_or_else(|| {
-                panic!("Duty holder {} should have produced round {} (height {})",
-                    duty_idx, round_num, next_height);
+                panic!(
+                    "Duty holder {} should have produced round {} (height {})",
+                    duty_idx, round_num, next_height
+                );
             });
 
             // Verify round has all 5 attesters
-            assert_eq!(round.attester_count(), num_nodes,
+            assert_eq!(
+                round.attester_count(),
+                num_nodes,
                 "Round {} should have {} attesters, got {}",
-                round_num, num_nodes, round.attester_count());
+                round_num,
+                num_nodes,
+                round.attester_count()
+            );
 
             // Deliver to non-duty nodes
             for i in 0..num_nodes {
@@ -531,16 +549,31 @@ mod tests {
         let weight = services[0].weight();
 
         for (i, service) in services.iter().enumerate() {
-            assert_eq!(service.height(), height,
-                "Node {} height mismatch: {} vs {}", i, service.height(), height);
-            assert_eq!(service.weight(), weight,
-                "Node {} weight mismatch: {} vs {}", i, service.weight(), weight);
+            assert_eq!(
+                service.height(),
+                height,
+                "Node {} height mismatch: {} vs {}",
+                i,
+                service.height(),
+                height
+            );
+            assert_eq!(
+                service.weight(),
+                weight,
+                "Node {} weight mismatch: {} vs {}",
+                i,
+                service.weight(),
+                weight
+            );
         }
 
         assert_eq!(height, 20, "Should have produced exactly 20 rounds");
         // Weight = genesis(1) + 20 rounds * (1 base + 5 attesters) = 1 + 120 = 121
-        assert_eq!(weight, 1 + 20 * (1 + num_nodes as u64),
-            "Weight should be genesis + 20 * (1 + 5 attesters)");
+        assert_eq!(
+            weight,
+            1 + 20 * (1 + num_nodes as u64),
+            "Weight should be genesis + 20 * (1 + 5 attesters)"
+        );
     }
 
     #[test]

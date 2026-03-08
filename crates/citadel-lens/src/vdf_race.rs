@@ -149,7 +149,11 @@ impl VdfChain {
     }
 
     /// Create chain from received links (joining existing swarm)
-    pub fn from_links(genesis_seed: [u8; 32], links: Vec<VdfLink>, our_pubkey: [u8; 32]) -> Option<Self> {
+    pub fn from_links(
+        genesis_seed: [u8; 32],
+        links: Vec<VdfLink>,
+        our_pubkey: [u8; 32],
+    ) -> Option<Self> {
         if links.is_empty() {
             return None;
         }
@@ -552,7 +556,10 @@ mod tests {
         let output = compute_vdf(seed, VDF_ITERATIONS);
         let elapsed = start.elapsed();
 
-        println!("VDF computation: {} iterations in {:?}", VDF_ITERATIONS, elapsed);
+        println!(
+            "VDF computation: {} iterations in {:?}",
+            VDF_ITERATIONS, elapsed
+        );
         println!("Output: {}", hex::encode(output));
 
         // Verify deterministic
@@ -679,18 +686,17 @@ mod tests {
         println!("\n=== VDF Race: 50 Node Bootstrap ===\n");
 
         // Create 50 nodes with their signing keys
-        let keys: Vec<SigningKey> = (0..50)
-            .map(|_| SigningKey::generate(&mut OsRng))
-            .collect();
+        let keys: Vec<SigningKey> = (0..50).map(|_| SigningKey::generate(&mut OsRng)).collect();
 
         // Genesis node starts race
-        let mut races: Vec<VdfRace> = vec![
-            VdfRace::new_genesis(genesis_seed, keys[0].clone())
-        ];
+        let mut races: Vec<VdfRace> = vec![VdfRace::new_genesis(genesis_seed, keys[0].clone())];
 
         // Genesis claims slot 0
         let genesis_claim = races[0].claim_slot(0);
-        println!("Genesis claims slot 0 at height {}", genesis_claim.vdf_height);
+        println!(
+            "Genesis claims slot 0 at height {}",
+            genesis_claim.vdf_height
+        );
 
         // Extend chain a few times
         for _ in 0..3 {
@@ -701,8 +707,8 @@ mod tests {
         for (i, key) in keys.iter().enumerate().skip(1) {
             // Join with current chain
             let chain_links = races[0].chain_links().to_vec();
-            let mut race = VdfRace::join(genesis_seed, key.clone(), chain_links)
-                .expect("Should join");
+            let mut race =
+                VdfRace::join(genesis_seed, key.clone(), chain_links).expect("Should join");
 
             // Sync existing claims to new node (simulates joining mesh and receiving state)
             for slot in 0..races[0].pending_claims.len() as u64 {
@@ -746,13 +752,19 @@ mod tests {
             if let Some(slot) = race.our_slot() {
                 assert!(
                     claimed_slots.insert(slot),
-                    "Duplicate slot {} claimed by node {}", slot, i
+                    "Duplicate slot {} claimed by node {}",
+                    slot,
+                    i
                 );
             }
         }
 
         println!("  Unique slots claimed: {}", claimed_slots.len());
-        assert_eq!(claimed_slots.len(), 50, "All 50 nodes should have unique slots");
+        assert_eq!(
+            claimed_slots.len(),
+            50,
+            "All 50 nodes should have unique slots"
+        );
 
         // Check slots are contiguous 0..50
         for slot in 0..50 {
@@ -770,9 +782,7 @@ mod tests {
         println!("\n=== Split Brain Merge Test ===\n");
 
         // Partition A: 30 nodes, longer chain
-        let keys_a: Vec<SigningKey> = (0..30)
-            .map(|_| SigningKey::generate(&mut OsRng))
-            .collect();
+        let keys_a: Vec<SigningKey> = (0..30).map(|_| SigningKey::generate(&mut OsRng)).collect();
 
         let mut chain_a = VdfChain::new_genesis(genesis_seed, keys_a[0].verifying_key().to_bytes());
 
@@ -789,9 +799,7 @@ mod tests {
         }
 
         // Partition B: 20 nodes, shorter chain (started later or fewer nodes)
-        let keys_b: Vec<SigningKey> = (0..20)
-            .map(|_| SigningKey::generate(&mut OsRng))
-            .collect();
+        let keys_b: Vec<SigningKey> = (0..20).map(|_| SigningKey::generate(&mut OsRng)).collect();
 
         let mut chain_b = VdfChain::new_genesis(genesis_seed, keys_b[0].verifying_key().to_bytes());
 
@@ -806,8 +814,16 @@ mod tests {
             chain_b.extend();
         }
 
-        println!("Partition A: {} nodes, chain height {}", keys_a.len(), chain_a.height());
-        println!("Partition B: {} nodes, chain height {}", keys_b.len(), chain_b.height());
+        println!(
+            "Partition A: {} nodes, chain height {}",
+            keys_a.len(),
+            chain_a.height()
+        );
+        println!(
+            "Partition B: {} nodes, chain height {}",
+            keys_b.len(),
+            chain_b.height()
+        );
 
         // Merge: B discovers A's longer chain
         let adopted = chain_b.try_adopt(chain_a.all_links().to_vec());

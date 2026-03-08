@@ -304,7 +304,7 @@ impl FailureProof {
     pub fn is_sufficient(&self, total_neighbors: usize) -> bool {
         // Consensus tier determines required witnesses
         match total_neighbors {
-            0 | 1 => true, // Genesis/solo - any witness counts
+            0 | 1 => true,                  // Genesis/solo - any witness counts
             2 => self.witnesses.len() >= 1, // Two-party - 1 witness
             3 => self.witnesses.len() >= 2, // Three-party - 2 witnesses
             _ => self.witnesses.len() >= (total_neighbors / 2) + 1, // BFT majority
@@ -313,7 +313,9 @@ impl FailureProof {
 
     /// Verify all witnesses
     pub fn verify(&self) -> bool {
-        self.witnesses.iter().all(|w| w.verify(&self.failed_node, &self.failure_type))
+        self.witnesses
+            .iter()
+            .all(|w| w.verify(&self.failed_node, &self.failure_type))
     }
 }
 
@@ -446,10 +448,10 @@ impl SlotValidity {
     pub fn is_valid(&self) -> bool {
         // Scales with expected neighbor count (consensus tier)
         match self.expected_neighbors {
-            0 => true, // Genesis
-            1 => !self.vouches.is_empty(), // 1 vouch needed
-            2 => self.vouches.len() >= 1, // 1 of 2
-            3 => self.vouches.len() >= 2, // 2 of 3
+            0 => true,                              // Genesis
+            1 => !self.vouches.is_empty(),          // 1 vouch needed
+            2 => self.vouches.len() >= 1,           // 1 of 2
+            3 => self.vouches.len() >= 2,           // 2 of 3
             n => self.vouches.len() >= (n / 2) + 1, // BFT majority
         }
     }
@@ -464,7 +466,9 @@ impl SlotValidity {
         if self.vouches.is_empty() {
             return None;
         }
-        let total: u64 = self.vouches.values()
+        let total: u64 = self
+            .vouches
+            .values()
             .map(|v| v.latency_proof.latency_ms())
             .sum();
         Some(total / self.vouches.len() as u64)
@@ -472,9 +476,8 @@ impl SlotValidity {
 
     /// Prune stale vouches (older than max_vdf_age)
     pub fn prune_stale(&mut self, current_vdf_height: u64, max_age: u64) {
-        self.vouches.retain(|_, v| {
-            current_vdf_height.saturating_sub(v.vdf_height) <= max_age
-        });
+        self.vouches
+            .retain(|_, v| current_vdf_height.saturating_sub(v.vdf_height) <= max_age);
     }
 }
 
@@ -534,12 +537,15 @@ impl AccountabilityTracker {
         let challenge = LatencyProof::new_challenge();
         let now = Instant::now();
 
-        self.pending_challenges.insert(challenge, PendingChallenge {
+        self.pending_challenges.insert(
             challenge,
-            target,
-            sent_at: now,
-            sent_at_ms: now_ms(),
-        });
+            PendingChallenge {
+                challenge,
+                target,
+                sent_at: now,
+                sent_at_ms: now_ms(),
+            },
+        );
 
         challenge
     }
@@ -589,7 +595,8 @@ impl AccountabilityTracker {
 
     /// Process an incoming vouch
     pub fn process_vouch(&mut self, vouch: SlotVouch, expected_neighbors: usize) -> bool {
-        let validity = self.slot_validity
+        let validity = self
+            .slot_validity
             .entry(vouch.slot)
             .or_insert_with(|| SlotValidity::new(expected_neighbors));
 
@@ -604,9 +611,7 @@ impl AccountabilityTracker {
         failure_type: FailureType,
     ) -> FailureWitness {
         let last_latency = self.latency_proofs.get(&failed_node).cloned();
-        let last_seen_ms = last_latency.as_ref()
-            .map(|p| p.received_at_ms)
-            .unwrap_or(0);
+        let last_seen_ms = last_latency.as_ref().map(|p| p.received_at_ms).unwrap_or(0);
 
         let witness = FailureWitness::new(
             failed_node,
@@ -638,14 +643,20 @@ impl AccountabilityTracker {
     }
 
     /// Get failure proof if sufficient witnesses
-    pub fn get_failure_proof(&self, failed_node: &[u8; 32], total_neighbors: usize) -> Option<&FailureProof> {
-        self.active_failures.get(failed_node)
+    pub fn get_failure_proof(
+        &self,
+        failed_node: &[u8; 32],
+        total_neighbors: usize,
+    ) -> Option<&FailureProof> {
+        self.active_failures
+            .get(failed_node)
             .filter(|p| p.is_sufficient(total_neighbors))
     }
 
     /// Check if a slot is currently valid (has sufficient vouches)
     pub fn is_slot_valid(&self, slot: u64) -> bool {
-        self.slot_validity.get(&slot)
+        self.slot_validity
+            .get(&slot)
             .map(|v| v.is_valid())
             .unwrap_or(false)
     }
@@ -671,14 +682,14 @@ impl AccountabilityTracker {
         }
 
         // Prune timed-out challenges
-        self.pending_challenges.retain(|_, p| {
-            p.sent_at.elapsed() < challenge_timeout
-        });
+        self.pending_challenges
+            .retain(|_, p| p.sent_at.elapsed() < challenge_timeout);
     }
 
     /// Get all slots that have become invalid
     pub fn invalid_slots(&self) -> Vec<u64> {
-        self.slot_validity.iter()
+        self.slot_validity
+            .iter()
             .filter(|(_, v)| !v.is_valid())
             .map(|(slot, _)| *slot)
             .collect()
@@ -763,7 +774,8 @@ mod tests {
             sig,
             1000,
             1020,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Create vouch
         let vouch = SlotVouch::new(
@@ -794,14 +806,22 @@ mod tests {
         let challenge = LatencyProof::new_challenge();
         let (response, sig) = LatencyProof::respond(&challenge, &holder_key);
         let latency_proof = LatencyProof::complete(
-            challenge, response,
+            challenge,
+            response,
             holder_key.verifying_key().to_bytes(),
-            sig, 1000, 1020,
-        ).unwrap();
+            sig,
+            1000,
+            1020,
+        )
+        .unwrap();
 
         let vouch = SlotVouch::new(
-            0, holder_key.verifying_key().to_bytes(),
-            1, latency_proof, 100, &voucher_key,
+            0,
+            holder_key.verifying_key().to_bytes(),
+            1,
+            latency_proof,
+            100,
+            &voucher_key,
         );
         validity.add_vouch(vouch);
         assert!(validity.is_valid());

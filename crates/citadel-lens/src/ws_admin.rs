@@ -20,8 +20,8 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         Query, State,
     },
-    response::IntoResponse,
     http::StatusCode,
+    response::IntoResponse,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -43,9 +43,7 @@ pub struct AdminWsQuery {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AdminEvent {
     /// Connection authenticated successfully
-    Connected {
-        admin_pubkey: String,
-    },
+    Connected { admin_pubkey: String },
     /// Initial moderation state snapshot
     Snapshot {
         pending_count: usize,
@@ -54,9 +52,7 @@ pub enum AdminEvent {
         pending_releases: Vec<ReleaseInfo>,
     },
     /// New release submitted for moderation
-    ReleaseSubmitted {
-        release: ReleaseInfo,
-    },
+    ReleaseSubmitted { release: ReleaseInfo },
     /// Release was approved
     ReleaseApproved {
         release_id: String,
@@ -77,13 +73,9 @@ pub enum AdminEvent {
         rejected: usize,
     },
     /// Heartbeat to keep connection alive
-    Heartbeat {
-        timestamp: u64,
-    },
+    Heartbeat { timestamp: u64 },
     /// Error message
-    Error {
-        message: String,
-    },
+    Error { message: String },
 }
 
 /// Simplified release info for WebSocket events
@@ -132,7 +124,10 @@ pub async fn ws_admin_handler(
     {
         let state = state.read().await;
         if !state.storage.is_admin(&query.pubkey).unwrap_or(false) {
-            warn!("Unauthorized admin WebSocket attempt from: {}", query.pubkey);
+            warn!(
+                "Unauthorized admin WebSocket attempt from: {}",
+                query.pubkey
+            );
             return Err(StatusCode::FORBIDDEN);
         }
     }
@@ -278,44 +273,47 @@ async fn create_admin_snapshot(state: &Arc<RwLock<LensState>>) -> AdminEvent {
     let state = state.read().await;
 
     // Use DocumentStore if available (CRDT path)
-    let (pending_count, approved_count, rejected_count, pending_releases) = if let Some(ref doc_store) = state.doc_store {
-        let doc_store = doc_store.read().await;
-        let all_releases: Vec<Release> = doc_store.list().unwrap_or_default();
+    let (pending_count, approved_count, rejected_count, pending_releases) =
+        if let Some(ref doc_store) = state.doc_store {
+            let doc_store = doc_store.read().await;
+            let all_releases: Vec<Release> = doc_store.list().unwrap_or_default();
 
-        let mut pending = 0usize;
-        let mut approved = 0usize;
-        let mut rejected = 0usize;
-        let mut pending_list = Vec::new();
+            let mut pending = 0usize;
+            let mut approved = 0usize;
+            let mut rejected = 0usize;
+            let mut pending_list = Vec::new();
 
-        for release in all_releases {
-            match release.status {
-                ReleaseStatus::Pending => {
-                    pending += 1;
-                    pending_list.push(ReleaseInfo::from(&release));
+            for release in all_releases {
+                match release.status {
+                    ReleaseStatus::Pending => {
+                        pending += 1;
+                        pending_list.push(ReleaseInfo::from(&release));
+                    }
+                    ReleaseStatus::Approved => approved += 1,
+                    ReleaseStatus::Rejected => rejected += 1,
+                    ReleaseStatus::Deleted => {}
                 }
-                ReleaseStatus::Approved => approved += 1,
-                ReleaseStatus::Rejected => rejected += 1,
-                ReleaseStatus::Deleted => {}
             }
-        }
 
-        (pending, approved, rejected, pending_list)
-    } else {
-        // Fallback to legacy storage
-        let counts = state.storage.count_releases_by_status().unwrap_or_default();
-        let pending_releases = state.storage.list_pending_releases()
-            .unwrap_or_default()
-            .iter()
-            .map(ReleaseInfo::from)
-            .collect();
+            (pending, approved, rejected, pending_list)
+        } else {
+            // Fallback to legacy storage
+            let counts = state.storage.count_releases_by_status().unwrap_or_default();
+            let pending_releases = state
+                .storage
+                .list_pending_releases()
+                .unwrap_or_default()
+                .iter()
+                .map(ReleaseInfo::from)
+                .collect();
 
-        (
-            *counts.get("pending").unwrap_or(&0),
-            *counts.get("approved").unwrap_or(&0),
-            *counts.get("rejected").unwrap_or(&0),
-            pending_releases,
-        )
-    };
+            (
+                *counts.get("pending").unwrap_or(&0),
+                *counts.get("approved").unwrap_or(&0),
+                *counts.get("rejected").unwrap_or(&0),
+                pending_releases,
+            )
+        };
 
     AdminEvent::Snapshot {
         pending_count,
@@ -347,18 +345,24 @@ pub fn broadcast_admin_event(tx: &AdminEventSender, event: AdminEvent) {
 
 /// Helper to broadcast a release submission event
 pub fn broadcast_release_submitted(tx: &AdminEventSender, release: &Release) {
-    broadcast_admin_event(tx, AdminEvent::ReleaseSubmitted {
-        release: ReleaseInfo::from(release),
-    });
+    broadcast_admin_event(
+        tx,
+        AdminEvent::ReleaseSubmitted {
+            release: ReleaseInfo::from(release),
+        },
+    );
 }
 
 /// Helper to broadcast a release approval event
 pub fn broadcast_release_approved(tx: &AdminEventSender, release_id: &str, moderator: &str) {
-    broadcast_admin_event(tx, AdminEvent::ReleaseApproved {
-        release_id: release_id.to_string(),
-        moderator: moderator.to_string(),
-        timestamp: chrono::Utc::now().to_rfc3339(),
-    });
+    broadcast_admin_event(
+        tx,
+        AdminEvent::ReleaseApproved {
+            release_id: release_id.to_string(),
+            moderator: moderator.to_string(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        },
+    );
 }
 
 /// Helper to broadcast a release rejection event
@@ -368,19 +372,30 @@ pub fn broadcast_release_rejected(
     moderator: &str,
     reason: Option<String>,
 ) {
-    broadcast_admin_event(tx, AdminEvent::ReleaseRejected {
-        release_id: release_id.to_string(),
-        moderator: moderator.to_string(),
-        reason,
-        timestamp: chrono::Utc::now().to_rfc3339(),
-    });
+    broadcast_admin_event(
+        tx,
+        AdminEvent::ReleaseRejected {
+            release_id: release_id.to_string(),
+            moderator: moderator.to_string(),
+            reason,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        },
+    );
 }
 
 /// Helper to broadcast stats update
-pub fn broadcast_stats_updated(tx: &AdminEventSender, pending: usize, approved: usize, rejected: usize) {
-    broadcast_admin_event(tx, AdminEvent::StatsUpdated {
-        pending,
-        approved,
-        rejected,
-    });
+pub fn broadcast_stats_updated(
+    tx: &AdminEventSender,
+    pending: usize,
+    approved: usize,
+    rejected: usize,
+) {
+    broadcast_admin_event(
+        tx,
+        AdminEvent::StatsUpdated {
+            pending,
+            approved,
+            rejected,
+        },
+    );
 }

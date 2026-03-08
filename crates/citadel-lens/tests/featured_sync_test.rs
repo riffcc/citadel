@@ -46,7 +46,8 @@ struct TestNode {
 impl TestNode {
     fn new() -> Self {
         let dir = tempdir().expect("Failed to create temp dir");
-        let store = DocumentStore::open(dir.path().join("docs.redb")).expect("Failed to open store");
+        let store =
+            DocumentStore::open(dir.path().join("docs.redb")).expect("Failed to open store");
         Self { store, _dir: dir }
     }
 }
@@ -75,8 +76,12 @@ fn releases_equivalent(a: &FeaturedRelease, b: &FeaturedRelease) -> bool {
         && a.custom_thumbnail == b.custom_thumbnail
         && a.regions.iter().collect::<std::collections::BTreeSet<_>>()
             == b.regions.iter().collect::<std::collections::BTreeSet<_>>()
-        && a.languages.iter().collect::<std::collections::BTreeSet<_>>()
-            == b.languages.iter().collect::<std::collections::BTreeSet<_>>()
+        && a.languages
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            == b.languages
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
         && a.tags.iter().collect::<std::collections::BTreeSet<_>>()
             == b.tags.iter().collect::<std::collections::BTreeSet<_>>()
         && a.variant == b.variant
@@ -113,8 +118,14 @@ fn test_featured_release_convergence_3_nodes() {
     assert_eq!(c_docs.len(), 1, "Node C should have 1 doc");
 
     // All should be identical
-    assert!(releases_equivalent(&a_docs[0], &b_docs[0]), "A and B should match");
-    assert!(releases_equivalent(&b_docs[0], &c_docs[0]), "B and C should match");
+    assert!(
+        releases_equivalent(&a_docs[0], &b_docs[0]),
+        "A and B should match"
+    );
+    assert!(
+        releases_equivalent(&b_docs[0], &c_docs[0]),
+        "B and C should match"
+    );
 }
 
 #[test]
@@ -161,16 +172,36 @@ fn test_featured_release_survives_partition() {
     sync_stores(&node_b.store, &mut node_a.store);
 
     // Get final state from both
-    let a_final: FeaturedRelease = node_a.store.list::<FeaturedRelease>().unwrap().pop().unwrap();
-    let b_final: FeaturedRelease = node_b.store.list::<FeaturedRelease>().unwrap().pop().unwrap();
+    let a_final: FeaturedRelease = node_a
+        .store
+        .list::<FeaturedRelease>()
+        .unwrap()
+        .pop()
+        .unwrap();
+    let b_final: FeaturedRelease = node_b
+        .store
+        .list::<FeaturedRelease>()
+        .unwrap()
+        .pop()
+        .unwrap();
 
     // Should be identical
-    assert!(releases_equivalent(&a_final, &b_final), "After sync, A and B should match");
+    assert!(
+        releases_equivalent(&a_final, &b_final),
+        "After sync, A and B should match"
+    );
 
     // LWW: admin fields from newer (node B)
-    assert_eq!(a_final.regions, vec!["EU".to_string()], "Regions from newer (B)");
+    assert_eq!(
+        a_final.regions,
+        vec!["EU".to_string()],
+        "Regions from newer (B)"
+    );
     assert!(!a_final.promoted, "Promoted from newer (B = false)");
-    assert!(a_final.tags.contains(&"featured".to_string()), "Tags from newer (B)");
+    assert!(
+        a_final.tags.contains(&"featured".to_string()),
+        "Tags from newer (B)"
+    );
 
     // Counters: max from both (preserves all increments)
     assert_eq!(a_final.views, 100, "Views preserved (max)");
@@ -217,17 +248,40 @@ fn test_concurrent_featured_updates_merge() {
     sync_stores(&node_b.store, &mut node_a.store);
 
     // Get final state
-    let a_final: FeaturedRelease = node_a.store.list::<FeaturedRelease>().unwrap().pop().unwrap();
-    let b_final: FeaturedRelease = node_b.store.list::<FeaturedRelease>().unwrap().pop().unwrap();
+    let a_final: FeaturedRelease = node_a
+        .store
+        .list::<FeaturedRelease>()
+        .unwrap()
+        .pop()
+        .unwrap();
+    let b_final: FeaturedRelease = node_b
+        .store
+        .list::<FeaturedRelease>()
+        .unwrap()
+        .pop()
+        .unwrap();
 
     // Must be deterministically identical
-    assert!(releases_equivalent(&a_final, &b_final), "Merge must be deterministic");
+    assert!(
+        releases_equivalent(&a_final, &b_final),
+        "Merge must be deterministic"
+    );
 
     // LWW: admin fields from newer (node B)
-    assert_eq!(a_final.start_time, "2024-12-01T00:00:00Z", "Start from newer (B)");
-    assert_eq!(a_final.end_time, "2025-09-30T23:59:59Z", "End from newer (B)");
+    assert_eq!(
+        a_final.start_time, "2024-12-01T00:00:00Z",
+        "Start from newer (B)"
+    );
+    assert_eq!(
+        a_final.end_time, "2025-09-30T23:59:59Z",
+        "End from newer (B)"
+    );
     assert_eq!(a_final.priority, 600, "Priority from newer (B)");
-    assert_eq!(a_final.custom_title, Some("B's Title".to_string()), "Title from newer (B)");
+    assert_eq!(
+        a_final.custom_title,
+        Some("B's Title".to_string()),
+        "Title from newer (B)"
+    );
 
     // Counters: max from both
     assert_eq!(a_final.views, 100, "Views: max");
@@ -315,7 +369,10 @@ fn test_merge_associativity_property() {
     let ab_c = a.merge(&b).merge(&c);
     let a_bc = a.merge(&b.merge(&c));
 
-    assert!(releases_equivalent(&ab_c, &a_bc), "merge(merge(a,b),c) == merge(a,merge(b,c))");
+    assert!(
+        releases_equivalent(&ab_c, &a_bc),
+        "merge(merge(a,b),c) == merge(a,merge(b,c))"
+    );
 }
 
 #[test]
@@ -381,16 +438,28 @@ fn test_spore_sync_efficiency() {
     // A should see it needs doc3
     let doc3_id = doc3.content_id();
     let doc3_u256 = citadel_spore::U256::from_be_bytes(doc3_id.as_bytes());
-    assert!(diff_a_sees.covers(&doc3_u256), "A should detect missing doc3");
+    assert!(
+        diff_a_sees.covers(&doc3_u256),
+        "A should detect missing doc3"
+    );
 
     // B should see it needs doc2
     let doc2_id = doc2.content_id();
     let doc2_u256 = citadel_spore::U256::from_be_bytes(doc2_id.as_bytes());
-    assert!(diff_b_sees.covers(&doc2_u256), "B should detect missing doc2");
+    assert!(
+        diff_b_sees.covers(&doc2_u256),
+        "B should detect missing doc2"
+    );
 
     // Neither should see doc1 in diff (both have it)
     let doc1_id = doc1.content_id();
     let doc1_u256 = citadel_spore::U256::from_be_bytes(doc1_id.as_bytes());
-    assert!(!diff_a_sees.covers(&doc1_u256), "doc1 should not be in A's diff");
-    assert!(!diff_b_sees.covers(&doc1_u256), "doc1 should not be in B's diff");
+    assert!(
+        !diff_a_sees.covers(&doc1_u256),
+        "doc1 should not be in A's diff"
+    );
+    assert!(
+        !diff_b_sees.covers(&doc1_u256),
+        "doc1 should not be in B's diff"
+    );
 }

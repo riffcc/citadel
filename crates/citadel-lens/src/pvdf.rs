@@ -60,7 +60,7 @@
 //!
 //! Nodes in same swarm have same VDF chain tip (or converging to it).
 
-use crate::vdf_race::{VdfChain, VdfLink, AnchoredSlotClaim, claim_has_priority, REORG_THRESHOLD};
+use crate::vdf_race::{claim_has_priority, AnchoredSlotClaim, VdfChain, VdfLink, REORG_THRESHOLD};
 use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -106,10 +106,7 @@ pub struct SwarmMergeCandidate {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MergeResult {
     /// We won - other swarm should adopt our chain
-    WeWon {
-        our_height: u64,
-        their_height: u64,
-    },
+    WeWon { our_height: u64, their_height: u64 },
     /// They won - we adopt their chain
     TheyWon {
         our_height: u64,
@@ -149,19 +146,14 @@ pub enum SwarmMessage {
         slot_count: usize,
     },
     /// Request full chain sync
-    ChainSyncRequest {
-        sender: [u8; 32],
-        from_height: u64,
-    },
+    ChainSyncRequest { sender: [u8; 32], from_height: u64 },
     /// Chain sync response
     ChainSyncResponse {
         sender: [u8; 32],
         links: Vec<VdfLink>,
     },
     /// New VDF link computed
-    VdfLinkBroadcast {
-        link: VdfLink,
-    },
+    VdfLinkBroadcast { link: VdfLink },
     /// Merge proposal (we detected a foreign swarm)
     MergeProposal {
         sender: [u8; 32],
@@ -367,7 +359,12 @@ impl SwarmState {
 
     /// Detect foreign swarm from heartbeat
     pub fn detect_foreign_swarm(&mut self, heartbeat: &SwarmMessage) -> bool {
-        if let SwarmMessage::SwarmHeartbeat { vdf_tip, vdf_height, .. } = heartbeat {
+        if let SwarmMessage::SwarmHeartbeat {
+            vdf_tip,
+            vdf_height,
+            ..
+        } = heartbeat
+        {
             // If same height but different tip, it's a foreign swarm
             if *vdf_height == self.vdf_chain.height() {
                 return *vdf_tip != self.tip_output();
@@ -382,9 +379,7 @@ impl SwarmState {
     /// Evaluate merge with a candidate swarm
     pub fn evaluate_merge(&self, candidate: &SwarmMergeCandidate) -> MergeResult {
         let our_height = self.vdf_chain.height();
-        let their_height = candidate.chain_links.last()
-            .map(|l| l.height)
-            .unwrap_or(0);
+        let their_height = candidate.chain_links.last().map(|l| l.height).unwrap_or(0);
 
         // Check if same chain (same tip)
         if let Some(their_tip) = candidate.chain_links.last() {
@@ -403,7 +398,8 @@ impl SwarmState {
 
         if their_height > our_height + REORG_THRESHOLD {
             // Find which of our slot claims might be invalidated
-            let claims_to_revalidate: Vec<u64> = self.slot_claims
+            let claims_to_revalidate: Vec<u64> = self
+                .slot_claims
                 .iter()
                 .filter(|(_, claim)| claim.vdf_height > their_height)
                 .map(|(slot, _)| *slot)
@@ -418,7 +414,9 @@ impl SwarmState {
 
         // Close heights - use deterministic tiebreaker
         let our_tip = self.tip_output();
-        let their_tip = candidate.chain_links.last()
+        let their_tip = candidate
+            .chain_links
+            .last()
             .map(|l| l.output)
             .unwrap_or([0u8; 32]);
 
@@ -433,11 +431,9 @@ impl SwarmState {
     /// Execute merge - adopt foreign swarm's chain
     pub fn execute_merge(&mut self, candidate: SwarmMergeCandidate) -> bool {
         // Verify and adopt their chain
-        if let Some(new_chain) = VdfChain::from_links(
-            self.genesis_seed,
-            candidate.chain_links,
-            self.our_pubkey,
-        ) {
+        if let Some(new_chain) =
+            VdfChain::from_links(self.genesis_seed, candidate.chain_links, self.our_pubkey)
+        {
             self.vdf_chain = new_chain;
 
             // Re-evaluate our slot claim
@@ -586,10 +582,10 @@ mod tests {
 
         // Add more nodes
         let chain = swarm1.chain_links().to_vec();
-        let mut swarm2 = SwarmState::join_swarm(genesis_seed, key2.clone(), chain.clone())
-            .expect("Should join");
-        let mut swarm3 = SwarmState::join_swarm(genesis_seed, key3.clone(), chain)
-            .expect("Should join");
+        let mut swarm2 =
+            SwarmState::join_swarm(genesis_seed, key2.clone(), chain.clone()).expect("Should join");
+        let mut swarm3 =
+            SwarmState::join_swarm(genesis_seed, key3.clone(), chain).expect("Should join");
 
         // They claim slots 1 and 2
         let claim1 = swarm2.claim_slot(1);
@@ -605,9 +601,21 @@ mod tests {
 
         // Check duty rotation at height 1
         // height 1 % 3 slots = slot 1 = swarm2's turn
-        println!("Swarm1 duty at height {}: {:?}", swarm1.height(), swarm1.vdf_duty());
-        println!("Swarm2 duty at height {}: {:?}", swarm2.height(), swarm2.vdf_duty());
-        println!("Swarm3 duty at height {}: {:?}", swarm3.height(), swarm3.vdf_duty());
+        println!(
+            "Swarm1 duty at height {}: {:?}",
+            swarm1.height(),
+            swarm1.vdf_duty()
+        );
+        println!(
+            "Swarm2 duty at height {}: {:?}",
+            swarm2.height(),
+            swarm2.vdf_duty()
+        );
+        println!(
+            "Swarm3 duty at height {}: {:?}",
+            swarm3.height(),
+            swarm3.vdf_duty()
+        );
     }
 
     #[test]
@@ -615,14 +623,11 @@ mod tests {
         let genesis_seed = [42u8; 32];
 
         // Create 5 nodes
-        let keys: Vec<SigningKey> = (0..5)
-            .map(|_| SigningKey::generate(&mut OsRng))
-            .collect();
+        let keys: Vec<SigningKey> = (0..5).map(|_| SigningKey::generate(&mut OsRng)).collect();
 
         // Genesis swarm
-        let mut swarms: Vec<SwarmState> = vec![
-            SwarmState::new_genesis(genesis_seed, keys[0].clone())
-        ];
+        let mut swarms: Vec<SwarmState> =
+            vec![SwarmState::new_genesis(genesis_seed, keys[0].clone())];
 
         // Claim slot 0
         let claim0 = swarms[0].claim_slot(0);
@@ -630,8 +635,8 @@ mod tests {
         // Other nodes join
         for key in keys.iter().skip(1) {
             let chain = swarms[0].chain_links().to_vec();
-            let swarm = SwarmState::join_swarm(genesis_seed, key.clone(), chain)
-                .expect("Should join");
+            let swarm =
+                SwarmState::join_swarm(genesis_seed, key.clone(), chain).expect("Should join");
             swarms.push(swarm);
         }
 
@@ -641,9 +646,8 @@ mod tests {
         }
 
         // Each node claims a slot
-        let claims: Vec<AnchoredSlotClaim> = (1..5)
-            .map(|i| swarms[i].claim_slot(i as u64))
-            .collect();
+        let claims: Vec<AnchoredSlotClaim> =
+            (1..5).map(|i| swarms[i].claim_slot(i as u64)).collect();
 
         // Propagate all claims
         for claim in &claims {
@@ -661,14 +665,18 @@ mod tests {
             let duty_slot = (current_height as usize) % 5;
 
             // That swarm computes
-            let link = swarms[duty_slot].compute_vdf_step()
+            let link = swarms[duty_slot]
+                .compute_vdf_step()
                 .expect("Duty holder should compute");
 
             // Broadcast to all
             for (i, swarm) in swarms.iter_mut().enumerate() {
                 if i != duty_slot {
-                    assert!(swarm.process_vdf_link(link.clone()),
-                        "Swarm {} should accept link", i);
+                    assert!(
+                        swarm.process_vdf_link(link.clone()),
+                        "Swarm {} should accept link",
+                        i
+                    );
                 }
             }
         }
@@ -680,7 +688,10 @@ mod tests {
             assert_eq!(swarm.height(), 20, "Swarm {} should be at height 20", i);
         }
 
-        println!("5 nodes cooperatively computed 20 VDF steps in {:?}", elapsed);
+        println!(
+            "5 nodes cooperatively computed 20 VDF steps in {:?}",
+            elapsed
+        );
         println!("Average: {:?} per step", elapsed / 20);
     }
 
@@ -691,9 +702,7 @@ mod tests {
         println!("\n=== Swarm Merge: Taller Chain Wins ===\n");
 
         // Swarm A: 3 nodes
-        let keys_a: Vec<SigningKey> = (0..3)
-            .map(|_| SigningKey::generate(&mut OsRng))
-            .collect();
+        let keys_a: Vec<SigningKey> = (0..3).map(|_| SigningKey::generate(&mut OsRng)).collect();
         let mut swarm_a = SwarmState::new_genesis(genesis_seed, keys_a[0].clone());
 
         // Swarm A claims slots and advances chain
@@ -703,9 +712,7 @@ mod tests {
         }
 
         // Swarm B: 2 nodes (started later, shorter chain)
-        let keys_b: Vec<SigningKey> = (0..2)
-            .map(|_| SigningKey::generate(&mut OsRng))
-            .collect();
+        let keys_b: Vec<SigningKey> = (0..2).map(|_| SigningKey::generate(&mut OsRng)).collect();
         let mut swarm_b = SwarmState::new_genesis(genesis_seed, keys_b[0].clone());
 
         swarm_b.claim_slot(0);
@@ -730,7 +737,11 @@ mod tests {
         println!("Merge result: {:?}", result);
 
         match result {
-            MergeResult::TheyWon { our_height, their_height, .. } => {
+            MergeResult::TheyWon {
+                our_height,
+                their_height,
+                ..
+            } => {
                 assert_eq!(our_height, 20);
                 assert_eq!(their_height, 50);
 
@@ -821,14 +832,11 @@ mod tests {
         println!("\n=== 50 Node Swarm Formation ===\n");
 
         // Create 50 nodes
-        let keys: Vec<SigningKey> = (0..50)
-            .map(|_| SigningKey::generate(&mut OsRng))
-            .collect();
+        let keys: Vec<SigningKey> = (0..50).map(|_| SigningKey::generate(&mut OsRng)).collect();
 
         // Genesis node
-        let mut swarms: Vec<SwarmState> = vec![
-            SwarmState::new_genesis(genesis_seed, keys[0].clone())
-        ];
+        let mut swarms: Vec<SwarmState> =
+            vec![SwarmState::new_genesis(genesis_seed, keys[0].clone())];
 
         // Genesis claims slot 0
         let genesis_claim = swarms[0].claim_slot(0);
@@ -843,8 +851,8 @@ mod tests {
         // Other 49 nodes join
         for (i, key) in keys.iter().enumerate().skip(1) {
             let chain = swarms[0].chain_links().to_vec();
-            let mut swarm = SwarmState::join_swarm(genesis_seed, key.clone(), chain)
-                .expect("Should join");
+            let mut swarm =
+                SwarmState::join_swarm(genesis_seed, key.clone(), chain).expect("Should join");
 
             // Sync existing claims
             for (slot, claim) in swarms[0].slot_claims() {
@@ -891,7 +899,9 @@ mod tests {
             if let Some(slot) = swarm.our_slot() {
                 assert!(
                     claimed_slots.insert(slot),
-                    "Duplicate slot {} at node {}", slot, i
+                    "Duplicate slot {} at node {}",
+                    slot,
+                    i
                 );
             }
         }

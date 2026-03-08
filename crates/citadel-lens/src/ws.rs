@@ -71,10 +71,7 @@ pub enum MeshEvent {
     /// Heartbeat to keep connection alive
     Heartbeat { timestamp: u64 },
     /// VDF chain updated (for bootstrap/merge)
-    VdfChainUpdate {
-        height: u64,
-        link_count: usize,
-    },
+    VdfChainUpdate { height: u64, link_count: usize },
     /// VDF-anchored slot claimed
     VdfSlotClaimed {
         slot: u64,
@@ -82,10 +79,7 @@ pub enum MeshEvent {
         claimer: String,
     },
     /// CVDF chain update (collaborative VDF)
-    CvdfChainUpdate {
-        height: u64,
-        weight: u64,
-    },
+    CvdfChainUpdate { height: u64, weight: u64 },
     /// CVDF new round produced (with SPORE sync proof)
     CvdfNewRound {
         round: u64,
@@ -168,7 +162,10 @@ async fn handle_mesh_socket(mut socket: WebSocket, state: Arc<RwLock<LensState>>
             Some(mesh) => {
                 // We need to get a flood receiver from somewhere
                 // For now, we'll just use the mesh state
-                (Some(Arc::clone(mesh)), None::<broadcast::Receiver<FloodMessage>>)
+                (
+                    Some(Arc::clone(mesh)),
+                    None::<broadcast::Receiver<FloodMessage>>,
+                )
             }
             None => (None, None),
         }
@@ -280,7 +277,12 @@ async fn create_snapshot(mesh_state: &Arc<RwLock<MeshState>>) -> MeshEvent {
             z: claim.coord.z,
         }
     } else {
-        HexSlot { index: None, q: 0, r: 0, z: 0 }
+        HexSlot {
+            index: None,
+            q: 0,
+            r: 0,
+            z: 0,
+        }
     };
 
     let self_peer = PeerInfo {
@@ -289,7 +291,11 @@ async fn create_snapshot(mesh_state: &Arc<RwLock<MeshState>>) -> MeshEvent {
         slot: self_slot,
         peer_type: "server".to_string(),
         last_heartbeat: 0, // We ARE ourselves - always fresh
-        capabilities: vec!["storage".to_string(), "relay".to_string(), "api".to_string()],
+        capabilities: vec![
+            "storage".to_string(),
+            "relay".to_string(),
+            "api".to_string(),
+        ],
         online: true,
     };
 
@@ -369,7 +375,8 @@ async fn create_snapshot(mesh_state: &Arc<RwLock<MeshState>>) -> MeshEvent {
                     seen_edges.insert((from.clone(), to.clone()));
 
                     // Look up latency stats from mesh state (PoL measurements)
-                    let latency_stats = mesh.latency_history
+                    let latency_stats = mesh
+                        .latency_history
                         .get(peer_id)
                         .and_then(|h| h.get(neighbor_id))
                         .map(|h| {
@@ -457,7 +464,7 @@ pub fn flood_to_event(msg: FloodMessage) -> Option<MeshEvent> {
             round: round.round,
             weight: round.weight() as u64,
             attestation_count: round.attestations.len(),
-            spore_ranges: spore_proof.range_count(),  // 0 at convergence
+            spore_ranges: spore_proof.range_count(), // 0 at convergence
         }),
         FloodMessage::CvdfSyncRequest { .. } => None, // Internal coordination
         FloodMessage::CvdfSyncResponse { rounds, .. } => {

@@ -32,7 +32,7 @@ pub async fn test_16_node_convergence() -> (bool, Duration, usize) {
     for i in 0..NODE_COUNT {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let storage = Arc::new(
-            Storage::open(temp_dir.path().join("storage.redb")).expect("Failed to create storage")
+            Storage::open(temp_dir.path().join("storage.redb")).expect("Failed to create storage"),
         );
         let doc_store = DocumentStore::open(temp_dir.path().join("docs.redb"))
             .expect("Failed to create doc store");
@@ -43,7 +43,9 @@ pub async fn test_16_node_convergence() -> (bool, Duration, usize) {
 
         // Bootstrap: nodes 0,1,2 connect to each other, rest connect to them
         let entry_peers: Vec<String> = if i < 3 {
-            (0..i).map(|j| format!("127.0.0.1:{}", BASE_PORT + j as u16)).collect()
+            (0..i)
+                .map(|j| format!("127.0.0.1:{}", BASE_PORT + j as u16))
+                .collect()
         } else {
             vec![
                 format!("127.0.0.1:{}", BASE_PORT),
@@ -68,7 +70,9 @@ pub async fn test_16_node_convergence() -> (bool, Duration, usize) {
     println!("Starting bootstrap nodes (0, 1, 2)...");
     for i in 0..3 {
         let node = Arc::clone(&nodes[i]);
-        tokio::spawn(async move { let _ = node.run().await; });
+        tokio::spawn(async move {
+            let _ = node.run().await;
+        });
     }
 
     // Wait for bootstrap mesh
@@ -87,7 +91,9 @@ pub async fn test_16_node_convergence() -> (bool, Duration, usize) {
     println!("Starting remaining nodes...");
     for i in 3..NODE_COUNT {
         let node = Arc::clone(&nodes[i]);
-        tokio::spawn(async move { let _ = node.run().await; });
+        tokio::spawn(async move {
+            let _ = node.run().await;
+        });
     }
 
     // Wait for all nodes to get slots
@@ -104,7 +110,12 @@ pub async fn test_16_node_convergence() -> (bool, Duration, usize) {
         }
 
         if last_log.elapsed() > Duration::from_secs(2) {
-            println!("  {}/{} nodes have slots ({:?})", slots_claimed, NODE_COUNT, converge_start.elapsed());
+            println!(
+                "  {}/{} nodes have slots ({:?})",
+                slots_claimed,
+                NODE_COUNT,
+                converge_start.elapsed()
+            );
             last_log = Instant::now();
         }
 
@@ -115,7 +126,10 @@ pub async fn test_16_node_convergence() -> (bool, Duration, usize) {
         }
 
         if converge_start.elapsed() > MAX_WAIT {
-            println!("\nTimeout: {}/{} nodes got slots", slots_claimed, NODE_COUNT);
+            println!(
+                "\nTimeout: {}/{} nodes got slots",
+                slots_claimed, NODE_COUNT
+            );
             return (false, converge_start.elapsed(), slots_claimed);
         }
 

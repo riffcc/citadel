@@ -18,8 +18,8 @@ use citadel_topology::{ghost_target, Connection, Direction, HexCoord};
 use ed25519_dalek::SigningKey;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use tokio::net::UdpSocket;
 
 use super::peer::{AuthorizedPeer, MeshPeer};
@@ -160,7 +160,6 @@ pub struct MeshState {
     //
     // This provides a complete audit trail demonstrating good-faith compliance
     // with data protection regulations requiring deletion on request.
-
     /// SPORE⁻¹: DoNotWantList - deletions as ranges in 256-bit hash space (GDPR Art. 17)
     /// Same range-based representation as SPORE HaveList, but inverted semantics
     /// Recipients DELETE content matching these ranges instead of ADD
@@ -178,7 +177,6 @@ pub struct MeshState {
     // =========================================================================
     // BadBits: Permanent blocklist (NOT for normal deletes)
     // =========================================================================
-
     /// BadBits: PERMANENT blocklist of double-hashed CIDs H(H(cid))
     /// Unlike DoNotWantList (GC'd after erasure), BadBits are forever
     /// Used for: copyright violations (DMCA), abuse material, illegal content
@@ -392,7 +390,10 @@ impl MeshState {
 
     /// Count ghost connections that are actual ghosts (span gaps).
     pub fn ghost_gap_count(&self) -> usize {
-        self.ghost_connections().iter().filter(|c| c.is_ghost).count()
+        self.ghost_connections()
+            .iter()
+            .filter(|c| c.is_ghost)
+            .count()
     }
 
     /// Get total gap size across all ghost connections.
@@ -439,7 +440,8 @@ impl MeshState {
     /// is 1/2^256 - astronomically unlikely. We panic if this ever happens.
     fn hash_to_point_range(hash: &[u8; 32]) -> citadel_spore::Range256 {
         let point = Self::hash_to_u256(hash);
-        let next = point.checked_add(&citadel_spore::U256::from_u64(1))
+        let next = point
+            .checked_add(&citadel_spore::U256::from_u64(1))
             .expect("Hash collision at U256::MAX - probability 1/2^256");
         citadel_spore::Range256::new(point, next)
     }
@@ -486,12 +488,12 @@ impl MeshState {
         self.erasure_confirmed = self.erasure_confirmed.union(confirmed);
         // Peer is synced if their confirmed XOR our do_not_want is empty
         let diff = self.do_not_want.xor(confirmed);
-        self.erasure_synced.insert(peer_id.to_string(), diff.is_empty());
+        self.erasure_synced
+            .insert(peer_id.to_string(), diff.is_empty());
     }
 
     /// Check if all peers have confirmed erasure (for GC eligibility).
     pub fn all_erasures_confirmed(&self) -> bool {
-        !self.erasure_synced.is_empty() &&
-            self.erasure_synced.values().all(|&synced| synced)
+        !self.erasure_synced.is_empty() && self.erasure_synced.values().all(|&synced| synced)
     }
 }

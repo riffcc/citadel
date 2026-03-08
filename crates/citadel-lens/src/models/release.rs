@@ -20,6 +20,155 @@ use citadel_crdt::{AssociativeMerge, CommutativeMerge, ContentId, IdempotentMerg
 use citadel_docs::Document;
 use serde::{Deserialize, Serialize};
 
+/// CRDT-friendly version metadata for release updates.
+///
+/// Kept optional to preserve compatibility with legacy release records and older peers.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct VersionInfo {
+    /// Lamport timestamp for update ordering.
+    #[serde(default)]
+    pub lamport: u64,
+
+    /// Node ID that produced this version.
+    /// Encoded as first 8 bytes of `blake3(public_key)` hex.
+    #[serde(default, with = "hex_bytes")]
+    pub node_id: [u8; 8],
+
+    /// Hash of serialized content (excluding version_info).
+    #[serde(default, with = "hex_bytes_32")]
+    pub content_hash: [u8; 32],
+
+    /// Optional pointer to content hash of prior version.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "option_hex_bytes_32"
+    )]
+    pub replaces: Option<[u8; 32]>,
+}
+
+impl VersionInfo {
+    pub fn new(node_id: [u8; 8], content_hash: [u8; 32]) -> Self {
+        Self {
+            lamport: 1,
+            node_id,
+            content_hash,
+            replaces: None,
+        }
+    }
+
+    pub fn update(&self, node_id: [u8; 8], content_hash: [u8; 32]) -> Self {
+        Self {
+            lamport: self.lamport + 1,
+            node_id,
+            content_hash,
+            replaces: Some(self.content_hash),
+        }
+    }
+
+    pub fn should_replace_with(&self, other: &VersionInfo) -> bool {
+        if other.lamport > self.lamport {
+            return true;
+        }
+        if other.lamport == self.lamport {
+            return other.node_id > self.node_id;
+        }
+        false
+    }
+
+    /// Deterministic SPORE seed based on release id + content hash.
+    pub fn spore_position(&self, release_id: &str) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(release_id.as_bytes());
+        hasher.update(&self.content_hash);
+        *hasher.finalize().as_bytes()
+    }
+}
+
+mod hex_bytes {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(bytes: &[u8; 8], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&hex::encode(bytes))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 8], D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        let bytes = hex::decode(&s).map_err(serde::de::Error::custom)?;
+        if bytes.len() != 8 {
+            return Err(serde::de::Error::custom("expected 8 bytes"));
+        }
+        let mut arr = [0u8; 8];
+        arr.copy_from_slice(&bytes);
+        Ok(arr)
+    }
+}
+
+mod hex_bytes_32 {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(bytes: &[u8; 32], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&hex::encode(bytes))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 32], D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        let bytes = hex::decode(&s).map_err(serde::de::Error::custom)?;
+        if bytes.len() != 32 {
+            return Err(serde::de::Error::custom("expected 32 bytes"));
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&bytes);
+        Ok(arr)
+    }
+}
+
+mod option_hex_bytes_32 {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(opt: &Option<[u8; 32]>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match opt {
+            Some(bytes) => serializer.serialize_some(&hex::encode(bytes)),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<[u8; 32]>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let opt: Option<String> = Option::deserialize(deserializer)?;
+        match opt {
+            Some(s) => {
+                let bytes = hex::decode(&s).map_err(serde::de::Error::custom)?;
+                if bytes.len() != 32 {
+                    return Err(serde::de::Error::custom("expected 32 bytes"));
+                }
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&bytes);
+                Ok(Some(arr))
+            }
+            None => Ok(None),
+        }
+    }
+}
+
 /// Moderation status for a release.
 ///
 /// Controls visibility in the public catalog:
@@ -114,7 +263,6 @@ pub struct Release {
     pub metadata: Option<serde_json::Value>,
 
     // === Moderation fields ===
-
     /// Moderation status (defaults to Approved for backward compatibility)
     #[serde(default)]
     pub status: ReleaseStatus,
@@ -134,6 +282,10 @@ pub struct Release {
     /// Last modification timestamp (ISO 8601) - for LWW merge
     #[serde(default = "default_modified_at")]
     pub modified_at: String,
+
+    /// Optional version info used by optional CRDT-aware sync flows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_info: Option<VersionInfo>,
 }
 
 fn default_schema_version() -> String {
@@ -170,6 +322,7 @@ impl Release {
             moderated_at: None,
             rejection_reason: None,
             modified_at: now,
+            version_info: None,
         }
     }
 
@@ -223,6 +376,94 @@ impl Release {
         }
         self
     }
+
+    /// Compute content hash for version metadata (excluding version_info).
+    pub fn compute_content_hash(&self) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(self.id.as_bytes());
+        hasher.update(self.title.as_bytes());
+        if let Some(creator) = &self.creator {
+            hasher.update(creator.as_bytes());
+        }
+        if let Some(year) = self.year {
+            hasher.update(&year.to_le_bytes());
+        }
+        hasher.update(self.category_id.as_bytes());
+        if let Some(slug) = &self.category_slug {
+            hasher.update(slug.as_bytes());
+        }
+        if let Some(thumb) = &self.thumbnail_cid {
+            hasher.update(thumb.as_bytes());
+        }
+        if let Some(content) = &self.content_cid {
+            hasher.update(content.as_bytes());
+        }
+        if let Some(description) = &self.description {
+            hasher.update(description.as_bytes());
+        }
+        for tag in &self.tags {
+            hasher.update(tag.as_bytes());
+        }
+        if let Some(site_address) = &self.site_address {
+            hasher.update(site_address.as_bytes());
+        }
+        if let Some(created_at) = &self.created_at {
+            hasher.update(created_at.as_bytes());
+        }
+        if let Some(meta) = &self.metadata {
+            hasher.update(meta.to_string().as_bytes());
+        }
+        hasher.update(self.modified_at.as_bytes());
+        hasher.update(self.status.to_string().as_bytes());
+        if let Some(moderated_by) = &self.moderated_by {
+            hasher.update(moderated_by.as_bytes());
+        }
+        if let Some(moderated_at) = &self.moderated_at {
+            hasher.update(moderated_at.as_bytes());
+        }
+        if let Some(rejection_reason) = &self.rejection_reason {
+            hasher.update(rejection_reason.as_bytes());
+        }
+        *hasher.finalize().as_bytes()
+    }
+
+    /// Initialize version info for new releases.
+    pub fn init_version(&mut self, node_id: [u8; 8]) {
+        let content_hash = self.compute_content_hash();
+        self.version_info = Some(VersionInfo::new(node_id, content_hash));
+    }
+
+    /// Update version info after changes.
+    pub fn update_version(&mut self, node_id: [u8; 8]) {
+        let content_hash = self.compute_content_hash();
+        self.version_info = Some(match self.version_info {
+            Some(ref old) => old.update(node_id, content_hash),
+            None => VersionInfo::new(node_id, content_hash),
+        });
+    }
+
+    /// Return deterministic SPORE seed for current release state.
+    pub fn spore_position(&self) -> [u8; 32] {
+        if let Some(ref vi) = self.version_info {
+            vi.spore_position(&self.id)
+        } else {
+            let content_hash = self.compute_content_hash();
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(self.id.as_bytes());
+            hasher.update(&content_hash);
+            *hasher.finalize().as_bytes()
+        }
+    }
+
+    /// CRDT-style precedence check for versioned records.
+    pub fn should_replace_with(&self, other: &Release) -> bool {
+        match (&self.version_info, &other.version_info) {
+            (Some(self_vi), Some(other_vi)) => self_vi.should_replace_with(other_vi),
+            (None, Some(_)) => true,
+            (Some(_), None) => false,
+            (None, None) => false,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -271,6 +512,7 @@ mod tests {
             moderated_at: None,
             rejection_reason: None,
             modified_at: "2024-01-01T00:00:00Z".to_string(),
+            version_info: None,
         };
 
         let json = serde_json::to_string(&release).unwrap();
@@ -471,6 +713,8 @@ impl TotalMerge for Release {
 
             // modified_at from newer
             modified_at: newer.modified_at.clone(),
+
+            version_info: newer.version_info.clone(),
 
             // created_at: min (preserve original creation time)
             created_at: merge_timestamp_min(&self.created_at, &other.created_at),

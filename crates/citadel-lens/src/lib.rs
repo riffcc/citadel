@@ -27,28 +27,28 @@
 //! - [`node`] - LensNode server orchestration
 
 // === CVDF Core — always available ===
-pub mod cvdf;
-pub mod pvdf;
-pub mod vdf_race;
-pub mod proof_of_latency;
 pub mod accountability;
-pub mod liveness;
+pub mod cvdf;
 pub mod error;
+pub mod liveness;
+pub mod proof_of_latency;
+pub mod pvdf;
 pub mod service;
+pub mod vdf_race;
 
 // === Server — gated behind "server" feature ===
 #[cfg(feature = "server")]
-pub mod models;
-#[cfg(feature = "server")]
-pub mod storage;
-#[cfg(feature = "server")]
-pub mod node;
+pub mod admin_socket;
 #[cfg(feature = "server")]
 pub mod api;
 #[cfg(feature = "server")]
-pub mod admin_socket;
-#[cfg(feature = "server")]
 pub mod mesh;
+#[cfg(feature = "server")]
+pub mod models;
+#[cfg(feature = "server")]
+pub mod node;
+#[cfg(feature = "server")]
+pub mod storage;
 #[cfg(feature = "server")]
 pub mod ws;
 #[cfg(feature = "server")]
@@ -70,6 +70,6 @@ pub use models::{
     Resource, StandardMetadata,
 };
 #[cfg(feature = "server")]
-pub use storage::Storage;
+pub use node::{LensConfig, LensNode};
 #[cfg(feature = "server")]
-pub use node::{LensNode, LensConfig};
+pub use storage::Storage;

@@ -22,7 +22,7 @@
 //!   lens-admin show     # Show configuration
 
 use clap::{Parser, Subcommand};
-use ed25519_dalek::{SigningKey, Signer, SECRET_KEY_LENGTH};
+use ed25519_dalek::{Signer, SigningKey, SECRET_KEY_LENGTH};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
@@ -171,8 +171,8 @@ fn load_keypair(config_dir: &PathBuf) -> Result<SigningKey, String> {
     let keypair_path = get_keypair_path(config_dir);
 
     if keypair_path.exists() {
-        let key_bytes = fs::read(&keypair_path)
-            .map_err(|e| format!("Failed to read keypair: {}", e))?;
+        let key_bytes =
+            fs::read(&keypair_path).map_err(|e| format!("Failed to read keypair: {}", e))?;
 
         if key_bytes.len() != SECRET_KEY_LENGTH {
             return Err(format!(
@@ -240,7 +240,11 @@ fn cmd_init(config_dir: &PathBuf) -> Result<(), String> {
 }
 
 /// Show configuration
-fn cmd_show(config_dir: &PathBuf, api_url: Option<&String>, data_dir: Option<&PathBuf>) -> Result<(), String> {
+fn cmd_show(
+    config_dir: &PathBuf,
+    api_url: Option<&String>,
+    data_dir: Option<&PathBuf>,
+) -> Result<(), String> {
     println!("lens-admin configuration");
     println!("========================");
     println!();
@@ -284,7 +288,10 @@ fn get_socket_path(data_dir: Option<&PathBuf>) -> PathBuf {
 }
 
 /// Send command via local Unix socket
-fn send_socket_command(cmd: AdminCommand, data_dir: Option<&PathBuf>) -> Result<AdminResponse, String> {
+fn send_socket_command(
+    cmd: AdminCommand,
+    data_dir: Option<&PathBuf>,
+) -> Result<AdminResponse, String> {
     let socket_path = get_socket_path(data_dir);
 
     let mut stream = UnixStream::connect(&socket_path).map_err(|e| {
@@ -390,10 +397,7 @@ async fn cmd_upload(
     let headers = create_auth_headers(signing_key)?;
 
     if path.is_file() {
-        let file_name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("file");
+        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
 
         let cid = upload_file(client, archivist_url, &headers, path).await?;
         println!("Uploaded: {}", file_name);
@@ -419,8 +423,7 @@ async fn upload_file(
         .unwrap_or("file")
         .to_string();
 
-    let file_bytes = fs::read(path)
-        .map_err(|e| format!("Failed to read file: {}", e))?;
+    let file_bytes = fs::read(path).map_err(|e| format!("Failed to read file: {}", e))?;
 
     // Guess content type from extension
     let content_type = match path.extension().and_then(|e| e.to_str()) {
@@ -443,7 +446,10 @@ async fn upload_file(
     };
 
     // Archivist upload endpoint: POST /api/archivist/v1/data
-    let url = format!("{}/api/archivist/v1/data", archivist_url.trim_end_matches('/'));
+    let url = format!(
+        "{}/api/archivist/v1/data",
+        archivist_url.trim_end_matches('/')
+    );
 
     let mut req = client.post(&url);
 
@@ -453,9 +459,10 @@ async fn upload_file(
     }
 
     // Add content headers
-    req = req
-        .header("content-type", content_type)
-        .header("content-disposition", format!("attachment; filename=\"{}\"", file_name));
+    req = req.header("content-type", content_type).header(
+        "content-disposition",
+        format!("attachment; filename=\"{}\"", file_name),
+    );
 
     let response = req
         .body(file_bytes)
@@ -530,8 +537,8 @@ fn walkdir(path: &PathBuf) -> Result<Vec<PathBuf>, String> {
     let mut entries = Vec::new();
 
     fn walk_recursive(dir: &PathBuf, entries: &mut Vec<PathBuf>) -> Result<(), String> {
-        let read_dir = fs::read_dir(dir)
-            .map_err(|e| format!("Failed to read directory {:?}: {}", dir, e))?;
+        let read_dir =
+            fs::read_dir(dir).map_err(|e| format!("Failed to read directory {:?}: {}", dir, e))?;
 
         for entry in read_dir {
             let entry = entry.map_err(|e| format!("Failed to read entry: {}", e))?;
@@ -580,7 +587,10 @@ fn handle_response(response: AdminResponse) -> Result<(), String> {
             Ok(())
         }
         AdminResponse::Profile { data } => {
-            println!("{}", serde_json::to_string_pretty(&data).unwrap_or_else(|_| data.to_string()));
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&data).unwrap_or_else(|_| data.to_string())
+            );
             Ok(())
         }
     }
@@ -605,7 +615,9 @@ async fn run() -> Result<(), String> {
 
         // Upload goes directly to Archivist (auth validated by Lens via forward_auth)
         Commands::Upload { path } => {
-            let archivist_url = cli.archivist.as_ref()
+            let archivist_url = cli
+                .archivist
+                .as_ref()
                 .ok_or("Upload requires --archivist <URL> for the Archivist endpoint")?;
 
             let signing_key = load_keypair(&config_dir)?;
@@ -622,51 +634,103 @@ async fn run() -> Result<(), String> {
 
                 match cmd {
                     Commands::Ping => {
-                        let resp = send_http_command(&client, url, &signing_key, AdminCommand::Ping).await?;
+                        let resp =
+                            send_http_command(&client, url, &signing_key, AdminCommand::Ping)
+                                .await?;
                         handle_response(resp)
                     }
                     Commands::AddAdmin { public_key } => {
-                        let resp = send_http_command(&client, url, &signing_key, AdminCommand::AddAdmin { public_key }).await?;
+                        let resp = send_http_command(
+                            &client,
+                            url,
+                            &signing_key,
+                            AdminCommand::AddAdmin { public_key },
+                        )
+                        .await?;
                         handle_response(resp)
                     }
                     Commands::RemoveAdmin { public_key } => {
-                        let resp = send_http_command(&client, url, &signing_key, AdminCommand::RemoveAdmin { public_key }).await?;
+                        let resp = send_http_command(
+                            &client,
+                            url,
+                            &signing_key,
+                            AdminCommand::RemoveAdmin { public_key },
+                        )
+                        .await?;
                         handle_response(resp)
                     }
                     Commands::GrantUpload { public_key } => {
-                        let resp = send_http_command(&client, url, &signing_key, AdminCommand::GrantUpload { public_key }).await?;
+                        let resp = send_http_command(
+                            &client,
+                            url,
+                            &signing_key,
+                            AdminCommand::GrantUpload { public_key },
+                        )
+                        .await?;
                         handle_response(resp)
                     }
                     Commands::RevokeUpload { public_key } => {
-                        let resp = send_http_command(&client, url, &signing_key, AdminCommand::RevokeUpload { public_key }).await?;
+                        let resp = send_http_command(
+                            &client,
+                            url,
+                            &signing_key,
+                            AdminCommand::RevokeUpload { public_key },
+                        )
+                        .await?;
                         handle_response(resp)
                     }
                     Commands::ListAdmins => {
-                        let resp = send_http_command(&client, url, &signing_key, AdminCommand::ListAdmins).await?;
+                        let resp =
+                            send_http_command(&client, url, &signing_key, AdminCommand::ListAdmins)
+                                .await?;
                         handle_response(resp)
                     }
                     Commands::IsAdmin { public_key } => {
-                        let resp = send_http_command(&client, url, &signing_key, AdminCommand::IsAdmin { public_key }).await?;
+                        let resp = send_http_command(
+                            &client,
+                            url,
+                            &signing_key,
+                            AdminCommand::IsAdmin { public_key },
+                        )
+                        .await?;
                         handle_response(resp)
                     }
                     Commands::StartProfiling => {
-                        let resp = send_http_command(&client, url, &signing_key, AdminCommand::StartProfiling).await?;
+                        let resp = send_http_command(
+                            &client,
+                            url,
+                            &signing_key,
+                            AdminCommand::StartProfiling,
+                        )
+                        .await?;
                         handle_response(resp)
                     }
                     Commands::StopProfiling => {
-                        let resp = send_http_command(&client, url, &signing_key, AdminCommand::StopProfiling).await?;
+                        let resp = send_http_command(
+                            &client,
+                            url,
+                            &signing_key,
+                            AdminCommand::StopProfiling,
+                        )
+                        .await?;
                         handle_response(resp)
                     }
                     Commands::CpuProfile => {
-                        let resp = send_http_command(&client, url, &signing_key, AdminCommand::CpuProfile).await?;
+                        let resp =
+                            send_http_command(&client, url, &signing_key, AdminCommand::CpuProfile)
+                                .await?;
                         handle_response(resp)
                     }
                     Commands::MemProfile => {
-                        let resp = send_http_command(&client, url, &signing_key, AdminCommand::MemProfile).await?;
+                        let resp =
+                            send_http_command(&client, url, &signing_key, AdminCommand::MemProfile)
+                                .await?;
                         handle_response(resp)
                     }
                     Commands::MeshStats => {
-                        let resp = send_http_command(&client, url, &signing_key, AdminCommand::MeshStats).await?;
+                        let resp =
+                            send_http_command(&client, url, &signing_key, AdminCommand::MeshStats)
+                                .await?;
                         handle_response(resp)
                     }
                     Commands::Init | Commands::Show | Commands::Upload { .. } => unreachable!(),
@@ -676,9 +740,15 @@ async fn run() -> Result<(), String> {
                 let admin_cmd = match cmd {
                     Commands::Ping => AdminCommand::Ping,
                     Commands::AddAdmin { public_key } => AdminCommand::AddAdmin { public_key },
-                    Commands::RemoveAdmin { public_key } => AdminCommand::RemoveAdmin { public_key },
-                    Commands::GrantUpload { public_key } => AdminCommand::GrantUpload { public_key },
-                    Commands::RevokeUpload { public_key } => AdminCommand::RevokeUpload { public_key },
+                    Commands::RemoveAdmin { public_key } => {
+                        AdminCommand::RemoveAdmin { public_key }
+                    }
+                    Commands::GrantUpload { public_key } => {
+                        AdminCommand::GrantUpload { public_key }
+                    }
+                    Commands::RevokeUpload { public_key } => {
+                        AdminCommand::RevokeUpload { public_key }
+                    }
                     Commands::ListAdmins => AdminCommand::ListAdmins,
                     Commands::IsAdmin { public_key } => AdminCommand::IsAdmin { public_key },
                     Commands::StartProfiling => AdminCommand::StartProfiling,

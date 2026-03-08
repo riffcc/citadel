@@ -1,13 +1,11 @@
 //! HTTP API for Lens.
 
+use crate::admin_socket;
 use crate::mesh::{double_hash_id, FloodMessage};
 use crate::models::{Category, FeaturedRelease, Release, ReleaseStatus};
 use crate::node::LensState;
-use citadel_crdt::ContentId;
-use citadel_docs::Document;
 use crate::ws::ws_mesh_handler;
 use crate::ws_admin;
-use crate::admin_socket;
 use axum::{
     body::Bytes,
     extract::{Path, Query, State},
@@ -15,7 +13,9 @@ use axum::{
     routing::{delete, get, post, put},
     Json, Router,
 };
-use ed25519_dalek::{Signature, VerifyingKey, Verifier};
+use citadel_crdt::ContentId;
+use citadel_docs::Document;
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -51,34 +51,42 @@ fn verify_signature(public_key: &str, message: &[u8], signature_hex: &str) -> Re
         .strip_prefix("ed25519p/")
         .ok_or_else(|| "Invalid public key format: must start with 'ed25519p/'")?;
 
-    let key_bytes = hex::decode(key_hex)
-        .map_err(|e| format!("Invalid public key hex: {}", e))?;
+    let key_bytes = hex::decode(key_hex).map_err(|e| format!("Invalid public key hex: {}", e))?;
 
     if key_bytes.len() != 32 {
-        return Err(format!("Invalid public key length: expected 32 bytes, got {}", key_bytes.len()));
+        return Err(format!(
+            "Invalid public key length: expected 32 bytes, got {}",
+            key_bytes.len()
+        ));
     }
 
-    let key_array: [u8; 32] = key_bytes.try_into()
+    let key_array: [u8; 32] = key_bytes
+        .try_into()
         .map_err(|_| "Failed to convert public key to array")?;
 
-    let verifying_key = VerifyingKey::from_bytes(&key_array)
-        .map_err(|e| format!("Invalid public key: {}", e))?;
+    let verifying_key =
+        VerifyingKey::from_bytes(&key_array).map_err(|e| format!("Invalid public key: {}", e))?;
 
     // Parse signature
-    let sig_bytes = hex::decode(signature_hex)
-        .map_err(|e| format!("Invalid signature hex: {}", e))?;
+    let sig_bytes =
+        hex::decode(signature_hex).map_err(|e| format!("Invalid signature hex: {}", e))?;
 
     if sig_bytes.len() != 64 {
-        return Err(format!("Invalid signature length: expected 64 bytes, got {}", sig_bytes.len()));
+        return Err(format!(
+            "Invalid signature length: expected 64 bytes, got {}",
+            sig_bytes.len()
+        ));
     }
 
-    let sig_array: [u8; 64] = sig_bytes.try_into()
+    let sig_array: [u8; 64] = sig_bytes
+        .try_into()
         .map_err(|_| "Failed to convert signature to array")?;
 
     let signature = Signature::from_bytes(&sig_array);
 
     // Verify
-    verifying_key.verify(message, &signature)
+    verifying_key
+        .verify(message, &signature)
         .map_err(|e| format!("Signature verification failed: {}", e))?;
 
     Ok(())
@@ -110,8 +118,8 @@ fn require_admin_signature(
 ) -> Result<(), String> {
     // Reconstruct the signed message: "{timestamp}:{body}"
     // This matches what Flagship signs
-    let body_str = std::str::from_utf8(body)
-        .map_err(|e| format!("Invalid UTF-8 in request body: {}", e))?;
+    let body_str =
+        std::str::from_utf8(body).map_err(|e| format!("Invalid UTF-8 in request body: {}", e))?;
     let message = format!("{}:{}", timestamp, body_str);
 
     // Verify the signature
@@ -147,6 +155,20 @@ fn require_admin_signature_delete(
     }
 
     Ok(())
+}
+
+fn node_id_from_public_key(public_key: &str) -> Option<[u8; 8]> {
+    let key_hex = public_key.strip_prefix("ed25519p/").unwrap_or(public_key);
+
+    let key_bytes = hex::decode(key_hex).ok()?;
+    if key_bytes.is_empty() {
+        return None;
+    }
+
+    let hash = blake3::hash(&key_bytes);
+    let mut node_id = [0u8; 8];
+    node_id.copy_from_slice(&hash.as_bytes()[..8]);
+    Some(node_id)
 }
 
 type AppState = Arc<RwLock<LensState>>;
@@ -185,10 +207,22 @@ pub fn build_router(state: AppState) -> Router {
         // Featured releases (for flagship home page)
         .route("/api/v1/featured-releases", get(list_featured_releases))
         // Admin: Featured releases management
-        .route("/api/v1/admin/featured-releases", post(create_featured_release))
-        .route("/api/v1/admin/featured-releases/:id", get(get_featured_release))
-        .route("/api/v1/admin/featured-releases/:id", put(update_featured_release))
-        .route("/api/v1/admin/featured-releases/:id", delete(delete_featured_release))
+        .route(
+            "/api/v1/admin/featured-releases",
+            post(create_featured_release),
+        )
+        .route(
+            "/api/v1/admin/featured-releases/:id",
+            get(get_featured_release),
+        )
+        .route(
+            "/api/v1/admin/featured-releases/:id",
+            put(update_featured_release),
+        )
+        .route(
+            "/api/v1/admin/featured-releases/:id",
+            delete(delete_featured_release),
+        )
         // Account (identity management)
         .route("/api/v1/account/:public_key", get(get_account))
         // Upload permission validation (for nginx auth_request)
@@ -304,12 +338,10 @@ async fn list_releases(
     // Use DocumentStore for CRDT-based sync (no legacy fallback - use import/export to migrate)
     let releases = if let Some(ref doc_store) = state.doc_store {
         let doc_store = doc_store.read().await;
-        doc_store
-            .list::<Release>()
-            .map_err(|e| {
-                tracing::error!("DocumentStore list failed: {:?}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?
+        doc_store.list::<Release>().map_err(|e| {
+            tracing::error!("DocumentStore list failed: {:?}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
     } else {
         tracing::warn!("doc_store not initialized");
         Vec::new()
@@ -327,13 +359,21 @@ async fn list_releases(
             "rejected" => ReleaseStatus::Rejected,
             _ => return Err(StatusCode::BAD_REQUEST),
         };
-        releases.into_iter().filter(|r| r.status == target_status).collect()
+        releases
+            .into_iter()
+            .filter(|r| r.status == target_status)
+            .collect()
     } else {
         // Default: return only approved releases (public catalog)
-        releases.into_iter().filter(|r| r.status == ReleaseStatus::Approved).collect()
+        releases
+            .into_iter()
+            .filter(|r| r.status == ReleaseStatus::Approved)
+            .collect()
     };
 
-    Ok(Json(filtered.into_iter().map(|r| r.with_defaults()).collect()))
+    Ok(Json(
+        filtered.into_iter().map(|r| r.with_defaults()).collect(),
+    ))
 }
 
 /// Request for creating a release.
@@ -379,46 +419,74 @@ async fn create_release(
     let public_key = headers
         .get("X-Public-Key")
         .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
-            "error": "Missing X-Public-Key header"
-        }))))?;
+        .ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": "Missing X-Public-Key header"
+                })),
+            )
+        })?;
 
     let signature = headers
         .get("X-Signature")
         .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
-            "error": "Missing X-Signature header"
-        }))))?;
+        .ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": "Missing X-Signature header"
+                })),
+            )
+        })?;
 
     let timestamp = headers
         .get("X-Timestamp")
         .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
-            "error": "Missing X-Timestamp header"
-        }))))?;
+        .ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": "Missing X-Timestamp header"
+                })),
+            )
+        })?;
 
     // Verify signature and admin status
     {
         let state = state.read().await;
-        if let Err(e) = require_admin_signature(&state.storage, public_key, signature, timestamp, &body) {
+        if let Err(e) =
+            require_admin_signature(&state.storage, public_key, signature, timestamp, &body)
+        {
             tracing::warn!("Auth failed for create_release: {}", e);
-            return Err((StatusCode::FORBIDDEN, Json(serde_json::json!({
-                "error": e
-            }))));
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": e
+                })),
+            ));
         }
     }
 
     // Parse the request body
-    let req: CreateReleaseRequest = serde_json::from_slice(&body)
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-            "error": format!("Invalid request body: {}", e)
-        }))))?;
+    let req: CreateReleaseRequest = serde_json::from_slice(&body).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("Invalid request body: {}", e)
+            })),
+        )
+    })?;
 
     // Generate ID from name + timestamp
-    let content = format!("{}:{}", req.name, std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis());
+    let content = format!(
+        "{}:{}",
+        req.name,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+    );
     let id = Release::generate_id(content.as_bytes());
 
     // BadBits: Check if this release is on the permanent blocklist
@@ -429,10 +497,15 @@ async fn create_release(
             let mesh = mesh_state.read().await;
             let release_hash = double_hash_id(&id);
             if mesh.bad_bits.contains(&release_hash) {
-                tracing::warn!("BadBits: Rejected upload of blocked content (hash matches blocklist)");
-                return Err((StatusCode::FORBIDDEN, Json(serde_json::json!({
-                    "error": "Content is on blocklist"
-                }))));
+                tracing::warn!(
+                    "BadBits: Rejected upload of blocked content (hash matches blocklist)"
+                );
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({
+                        "error": "Content is on blocklist"
+                    })),
+                ));
             }
         }
     }
@@ -455,6 +528,10 @@ async fn create_release(
         };
     }
 
+    if let Some(node_id) = node_id_from_public_key(public_key) {
+        release.init_version(node_id);
+    }
+
     let state = state.read().await;
 
     // Use DocumentStore if available (CRDT path with automatic merge)
@@ -462,19 +539,24 @@ async fn create_release(
         let mut doc_store = doc_store.write().await;
         let (_, _changed) = doc_store.put(&release).map_err(|e| {
             tracing::error!("DocumentStore put failed: {:?}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-                "error": "Failed to save release"
-            })))
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "Failed to save release"
+                })),
+            )
         })?;
         tracing::info!("Created release {} in DocumentStore", release.id);
     } else {
         // Fallback to legacy storage
-        state
-            .storage
-            .put_release(&release)
-            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-                "error": "Failed to save release"
-            }))))?;
+        state.storage.put_release(&release).map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "Failed to save release"
+                })),
+            )
+        })?;
     }
 
     // SPORE: Flood the release to propagate across mesh
@@ -570,40 +652,64 @@ async fn update_release(
     let public_key = headers
         .get("X-Public-Key")
         .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
-            "error": "Missing X-Public-Key header"
-        }))))?;
+        .ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": "Missing X-Public-Key header"
+                })),
+            )
+        })?;
 
     let signature = headers
         .get("X-Signature")
         .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
-            "error": "Missing X-Signature header"
-        }))))?;
+        .ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": "Missing X-Signature header"
+                })),
+            )
+        })?;
 
     let timestamp = headers
         .get("X-Timestamp")
         .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
-            "error": "Missing X-Timestamp header"
-        }))))?;
+        .ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": "Missing X-Timestamp header"
+                })),
+            )
+        })?;
 
     // Verify signature and admin status
     {
         let state = state.read().await;
-        if let Err(e) = require_admin_signature(&state.storage, public_key, signature, timestamp, &body) {
+        if let Err(e) =
+            require_admin_signature(&state.storage, public_key, signature, timestamp, &body)
+        {
             tracing::warn!("Auth failed for update_release: {}", e);
-            return Err((StatusCode::FORBIDDEN, Json(serde_json::json!({
-                "error": e
-            }))));
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": e
+                })),
+            ));
         }
     }
 
     // Parse the request body
-    let req: UpdateReleaseRequest = serde_json::from_slice(&body)
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-            "error": format!("Invalid request body: {}", e)
-        }))))?;
+    let req: UpdateReleaseRequest = serde_json::from_slice(&body).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("Invalid request body: {}", e)
+            })),
+        )
+    })?;
 
     let state = state.read().await;
 
@@ -613,18 +719,31 @@ async fn update_release(
         let content_id = citadel_crdt::ContentId::hash(id.as_bytes());
         match doc_store.get::<Release>(&content_id) {
             Ok(Some(r)) => r,
-            Ok(None) => return Err((StatusCode::NOT_FOUND, Json(serde_json::json!({
-                "error": "Release not found"
-            })))),
-            Err(_) => return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-                "error": "Failed to get release"
-            })))),
+            Ok(None) => {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({
+                        "error": "Release not found"
+                    })),
+                ))
+            }
+            Err(_) => {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": "Failed to get release"
+                    })),
+                ))
+            }
         }
     } else {
         tracing::warn!("doc_store not initialized");
-        return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-            "error": "doc_store not initialized"
-        }))));
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "doc_store not initialized"
+            })),
+        ));
     };
 
     // Update fields if provided
@@ -659,7 +778,9 @@ async fn update_release(
     if let Some(new_metadata) = req.metadata {
         // Merge new metadata with existing metadata instead of replacing
         if let Some(existing) = release.metadata.as_mut() {
-            if let (Some(existing_obj), Some(new_obj)) = (existing.as_object_mut(), new_metadata.as_object()) {
+            if let (Some(existing_obj), Some(new_obj)) =
+                (existing.as_object_mut(), new_metadata.as_object())
+            {
                 for (key, value) in new_obj {
                     existing_obj.insert(key.clone(), value.clone());
                 }
@@ -675,23 +796,32 @@ async fn update_release(
     // Update modified_at for LWW merge semantics
     release.modified_at = chrono::Utc::now().to_rfc3339();
 
+    if let Some(node_id) = node_id_from_public_key(public_key) {
+        release.update_version(node_id);
+    }
+
     // Save updated release - use DocumentStore if available (CRDT merge)
     if let Some(ref doc_store) = state.doc_store {
         let mut doc_store = doc_store.write().await;
         let (_, _changed) = doc_store.put(&release).map_err(|e| {
             tracing::error!("DocumentStore put failed: {:?}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-                "error": "Failed to save release"
-            })))
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "Failed to save release"
+                })),
+            )
         })?;
         tracing::debug!("Updated release {} in DocumentStore", release.id);
     } else {
-        state
-            .storage
-            .put_release(&release)
-            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-                "error": "Failed to save release"
-            }))))?;
+        state.storage.put_release(&release).map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "Failed to save release"
+                })),
+            )
+        })?;
     }
 
     // SPORE: Flood the updated release to propagate across mesh
@@ -714,23 +844,38 @@ async fn delete_release(
     let public_key = headers
         .get("X-Public-Key")
         .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
-            "error": "Missing X-Public-Key header"
-        }))))?;
+        .ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": "Missing X-Public-Key header"
+                })),
+            )
+        })?;
 
     let signature = headers
         .get("X-Signature")
         .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
-            "error": "Missing X-Signature header"
-        }))))?;
+        .ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": "Missing X-Signature header"
+                })),
+            )
+        })?;
 
     let timestamp = headers
         .get("X-Timestamp")
         .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
-            "error": "Missing X-Timestamp header"
-        }))))?;
+        .ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": "Missing X-Timestamp header"
+                })),
+            )
+        })?;
 
     // For DELETE, signature is over "{timestamp}:DELETE:/releases/{id}"
     let path = format!("/releases/{}", id);
@@ -738,11 +883,16 @@ async fn delete_release(
     // Verify signature and admin status
     {
         let state = state.read().await;
-        if let Err(e) = require_admin_signature_delete(&state.storage, public_key, signature, timestamp, &path) {
+        if let Err(e) =
+            require_admin_signature_delete(&state.storage, public_key, signature, timestamp, &path)
+        {
             tracing::warn!("Auth failed for delete_release: {}", e);
-            return Err((StatusCode::FORBIDDEN, Json(serde_json::json!({
-                "error": e
-            }))));
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": e
+                })),
+            ));
         }
     }
 
@@ -754,16 +904,22 @@ async fn delete_release(
         let mut doc_store = doc_store.write().await;
         if let Err(e) = doc_store.delete::<Release>(&content_id) {
             tracing::warn!("Failed to delete release from DocumentStore: {:?}", e);
-            return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-                "error": "Failed to delete release"
-            }))));
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "Failed to delete release"
+                })),
+            ));
         }
         tracing::debug!("Deleted release {} from DocumentStore", id);
     } else {
         tracing::warn!("doc_store not initialized");
-        return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-            "error": "doc_store not initialized"
-        }))));
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "doc_store not initialized"
+            })),
+        ));
     }
 
     // SPORE⁻¹: Compute double-hash tombstone and add to DoNotWantList
@@ -803,22 +959,31 @@ async fn list_pending_releases(
     let public_key = headers
         .get("X-Public-Key")
         .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
-            "error": "Missing X-Public-Key header"
-        }))))?;
+        .ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": "Missing X-Public-Key header"
+                })),
+            )
+        })?;
 
     let state = state.read().await;
 
     if !state.storage.is_admin(public_key).unwrap_or(false) {
-        return Err((StatusCode::FORBIDDEN, Json(serde_json::json!({
-            "error": "Admin permission required"
-        }))));
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "Admin permission required"
+            })),
+        ));
     }
 
     // Use DocumentStore if available (CRDT path)
     let releases: Vec<Release> = if let Some(ref doc_store) = state.doc_store {
         let doc_store = doc_store.read().await;
-        doc_store.list::<Release>()
+        doc_store
+            .list::<Release>()
             .unwrap_or_default()
             .into_iter()
             .filter(|r| r.status == ReleaseStatus::Pending)
@@ -829,9 +994,14 @@ async fn list_pending_releases(
         state
             .storage
             .list_pending_releases()
-            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-                "error": "Failed to list pending releases"
-            }))))?
+            .map_err(|_| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": "Failed to list pending releases"
+                    })),
+                )
+            })?
             .into_iter()
             .map(|r| r.with_defaults())
             .collect()
@@ -858,32 +1028,52 @@ async fn approve_release(
     let public_key = headers
         .get("X-Public-Key")
         .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
-            "error": "Missing X-Public-Key header"
-        }))))?;
+        .ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": "Missing X-Public-Key header"
+                })),
+            )
+        })?;
 
     let signature = headers
         .get("X-Signature")
         .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
-            "error": "Missing X-Signature header"
-        }))))?;
+        .ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": "Missing X-Signature header"
+                })),
+            )
+        })?;
 
     let timestamp = headers
         .get("X-Timestamp")
         .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
-            "error": "Missing X-Timestamp header"
-        }))))?;
+        .ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": "Missing X-Timestamp header"
+                })),
+            )
+        })?;
 
     // Verify signature and admin status
     {
         let state = state.read().await;
-        if let Err(e) = require_admin_signature(&state.storage, public_key, signature, timestamp, &body) {
+        if let Err(e) =
+            require_admin_signature(&state.storage, public_key, signature, timestamp, &body)
+        {
             tracing::warn!("Auth failed for approve_release: {}", e);
-            return Err((StatusCode::FORBIDDEN, Json(serde_json::json!({
-                "error": e
-            }))));
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": e
+                })),
+            ));
         }
     }
 
@@ -895,18 +1085,31 @@ async fn approve_release(
         let content_id = citadel_crdt::ContentId::hash(id.as_bytes());
         match doc_store.get::<Release>(&content_id) {
             Ok(Some(r)) => r,
-            Ok(None) => return Err((StatusCode::NOT_FOUND, Json(serde_json::json!({
-                "error": "Release not found"
-            })))),
-            Err(_) => return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-                "error": "Failed to get release"
-            })))),
+            Ok(None) => {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({
+                        "error": "Release not found"
+                    })),
+                ))
+            }
+            Err(_) => {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": "Failed to get release"
+                    })),
+                ))
+            }
         }
     } else {
         tracing::warn!("doc_store not initialized");
-        return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-            "error": "doc_store not initialized"
-        }))));
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "doc_store not initialized"
+            })),
+        ));
     };
 
     // Approve the release
@@ -920,16 +1123,22 @@ async fn approve_release(
             Ok(_) => {}
             Err(e) => {
                 tracing::error!("Failed to save approved release to DocumentStore: {:?}", e);
-                return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-                    "error": "Failed to approve release"
-                }))));
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": "Failed to approve release"
+                    })),
+                ));
             }
         }
     } else {
         tracing::warn!("doc_store not initialized");
-        return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-            "error": "doc_store not initialized"
-        }))));
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "doc_store not initialized"
+            })),
+        ));
     }
 
     tracing::info!("Release {} approved by {}", id, public_key);
@@ -969,38 +1178,58 @@ async fn reject_release(
     let public_key = headers
         .get("X-Public-Key")
         .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
-            "error": "Missing X-Public-Key header"
-        }))))?;
+        .ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": "Missing X-Public-Key header"
+                })),
+            )
+        })?;
 
     let signature = headers
         .get("X-Signature")
         .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
-            "error": "Missing X-Signature header"
-        }))))?;
+        .ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": "Missing X-Signature header"
+                })),
+            )
+        })?;
 
     let timestamp = headers
         .get("X-Timestamp")
         .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
-            "error": "Missing X-Timestamp header"
-        }))))?;
+        .ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": "Missing X-Timestamp header"
+                })),
+            )
+        })?;
 
     // Verify signature and admin status
     {
         let state = state.read().await;
-        if let Err(e) = require_admin_signature(&state.storage, public_key, signature, timestamp, &body) {
+        if let Err(e) =
+            require_admin_signature(&state.storage, public_key, signature, timestamp, &body)
+        {
             tracing::warn!("Auth failed for reject_release: {}", e);
-            return Err((StatusCode::FORBIDDEN, Json(serde_json::json!({
-                "error": e
-            }))));
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": e
+                })),
+            ));
         }
     }
 
     // Parse the request body for rejection reason
-    let req: RejectReleaseRequest = serde_json::from_slice(&body)
-        .unwrap_or(RejectReleaseRequest { reason: None });
+    let req: RejectReleaseRequest =
+        serde_json::from_slice(&body).unwrap_or(RejectReleaseRequest { reason: None });
 
     let state = state.read().await;
 
@@ -1010,18 +1239,31 @@ async fn reject_release(
         let content_id = citadel_crdt::ContentId::hash(id.as_bytes());
         match doc_store.get::<Release>(&content_id) {
             Ok(Some(r)) => r,
-            Ok(None) => return Err((StatusCode::NOT_FOUND, Json(serde_json::json!({
-                "error": "Release not found"
-            })))),
-            Err(_) => return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-                "error": "Failed to get release"
-            })))),
+            Ok(None) => {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({
+                        "error": "Release not found"
+                    })),
+                ))
+            }
+            Err(_) => {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": "Failed to get release"
+                    })),
+                ))
+            }
         }
     } else {
         tracing::warn!("doc_store not initialized");
-        return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-            "error": "doc_store not initialized"
-        }))));
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "doc_store not initialized"
+            })),
+        ));
     };
 
     // Reject the release
@@ -1035,21 +1277,29 @@ async fn reject_release(
             Ok(_) => {}
             Err(e) => {
                 tracing::error!("Failed to save rejected release to DocumentStore: {:?}", e);
-                return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-                    "error": "Failed to reject release"
-                }))));
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": "Failed to reject release"
+                    })),
+                ));
             }
         }
     } else {
         tracing::warn!("doc_store not initialized");
-        return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-            "error": "doc_store not initialized"
-        }))));
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "doc_store not initialized"
+            })),
+        ));
     }
 
     tracing::info!(
         "Release {} rejected by {} (reason: {:?})",
-        id, public_key, req.reason
+        id,
+        public_key,
+        req.reason
     );
 
     // SPORE: Flood the updated release status to propagate across mesh
@@ -1087,24 +1337,34 @@ async fn moderation_stats(
     let public_key = headers
         .get("X-Public-Key")
         .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
-            "error": "Missing X-Public-Key header"
-        }))))?;
+        .ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": "Missing X-Public-Key header"
+                })),
+            )
+        })?;
 
     let state = state.read().await;
 
     if !state.storage.is_admin(public_key).unwrap_or(false) {
-        return Err((StatusCode::FORBIDDEN, Json(serde_json::json!({
-            "error": "Admin permission required"
-        }))));
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "Admin permission required"
+            })),
+        ));
     }
 
-    let counts = state
-        .storage
-        .count_releases_by_status()
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-            "error": "Failed to get moderation stats"
-        }))))?;
+    let counts = state.storage.count_releases_by_status().map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "Failed to get moderation stats"
+            })),
+        )
+    })?;
 
     let pending = *counts.get("pending").unwrap_or(&0);
     let approved = *counts.get("approved").unwrap_or(&0);
@@ -1120,9 +1380,7 @@ async fn moderation_stats(
 
 // --- Category endpoints ---
 
-async fn list_categories(
-    State(state): State<AppState>,
-) -> Result<Json<Vec<Category>>, StatusCode> {
+async fn list_categories(State(state): State<AppState>) -> Result<Json<Vec<Category>>, StatusCode> {
     let state = state.read().await;
     let categories = state
         .storage
@@ -1168,7 +1426,11 @@ async fn create_category(
     let state_read = state.read().await;
 
     // Check if requester is admin
-    if !state_read.storage.is_admin(&req.public_key).unwrap_or(false) {
+    if !state_read
+        .storage
+        .is_admin(&req.public_key)
+        .unwrap_or(false)
+    {
         return Ok(Json(serde_json::json!({
             "error": "Admin permission required to create categories"
         })));
@@ -1178,24 +1440,24 @@ async fn create_category(
     // Use categoryId or id
     let id = match req.category_id.or(req.id) {
         Some(id) => id,
-        None => return Ok(Json(serde_json::json!({
-            "error": "Category ID is required"
-        }))),
+        None => {
+            return Ok(Json(serde_json::json!({
+                "error": "Category ID is required"
+            })))
+        }
     };
     // Use displayName or name
     let name = match req.display_name.or(req.name) {
         Some(name) => name,
-        None => return Ok(Json(serde_json::json!({
-            "error": "Category name is required"
-        }))),
+        None => {
+            return Ok(Json(serde_json::json!({
+                "error": "Category name is required"
+            })))
+        }
     };
 
-    let category = Category::with_schema(
-        id,
-        name,
-        req.featured.unwrap_or(false),
-        req.metadata_schema,
-    );
+    let category =
+        Category::with_schema(id, name, req.featured.unwrap_or(false), req.metadata_schema);
 
     let state = state.write().await;
     state
@@ -1214,7 +1476,11 @@ async fn update_category(
     let state_write = state.write().await;
 
     // Check if requester is admin
-    if !state_write.storage.is_admin(&req.public_key).unwrap_or(false) {
+    if !state_write
+        .storage
+        .is_admin(&req.public_key)
+        .unwrap_or(false)
+    {
         return Ok(Json(serde_json::json!({
             "error": "Admin permission required to update categories"
         })));
@@ -1228,9 +1494,11 @@ async fn update_category(
 
     let existing = match categories.into_iter().find(|c| c.id == id) {
         Some(cat) => cat,
-        None => return Ok(Json(serde_json::json!({
-            "error": "Category not found"
-        }))),
+        None => {
+            return Ok(Json(serde_json::json!({
+                "error": "Category not found"
+            })))
+        }
     };
 
     // Update fields
@@ -1293,13 +1561,14 @@ async fn list_featured_releases(
     // Use DocumentStore if available (new CRDT-based sync)
     if let Some(ref doc_store) = state.doc_store {
         let doc_store = doc_store.read().await;
-        let featured = doc_store
-            .list::<FeaturedRelease>()
-            .map_err(|e| {
-                tracing::error!("DocumentStore list failed: {:?}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
-        tracing::debug!("Listed {} featured releases from DocumentStore", featured.len());
+        let featured = doc_store.list::<FeaturedRelease>().map_err(|e| {
+            tracing::error!("DocumentStore list failed: {:?}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        tracing::debug!(
+            "Listed {} featured releases from DocumentStore",
+            featured.len()
+        );
         return Ok(Json(featured));
     }
 
@@ -1381,7 +1650,11 @@ async fn create_featured_release(
         let release_exists = if let Some(ref doc_store) = state.doc_store {
             let doc_store = doc_store.read().await;
             let content_id = citadel_crdt::ContentId::hash(req.release_id.as_bytes());
-            doc_store.get::<Release>(&content_id).ok().flatten().is_some()
+            doc_store
+                .get::<Release>(&content_id)
+                .ok()
+                .flatten()
+                .is_some()
         } else {
             false
         };
@@ -1391,12 +1664,7 @@ async fn create_featured_release(
     }
 
     let id = FeaturedRelease::generate_id();
-    let mut featured = FeaturedRelease::new(
-        id,
-        req.release_id,
-        req.start_time,
-        req.end_time,
-    );
+    let mut featured = FeaturedRelease::new(id, req.release_id, req.start_time, req.end_time);
 
     // Apply optional fields
     featured.promoted = req.promoted;
@@ -1417,12 +1685,10 @@ async fn create_featured_release(
     if let Some(ref doc_store) = state.doc_store {
         tracing::info!("Creating featured release in DocumentStore");
         let mut doc_store = doc_store.write().await;
-        doc_store
-            .put(&featured)
-            .map_err(|e| {
-                tracing::error!("DocumentStore put failed: {:?}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
+        doc_store.put(&featured).map_err(|e| {
+            tracing::error!("DocumentStore put failed: {:?}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
         tracing::info!("Featured release created successfully: {}", featured.id);
         return Ok((StatusCode::CREATED, Json(featured)));
     }
@@ -1437,7 +1703,8 @@ async fn create_featured_release(
     // SPORE: Flood featured releases so they propagate across the mesh
     if let Some(ref flood_tx) = state.flood_tx {
         if let Ok(all_featured) = state.storage.list_featured_releases() {
-            let featured_json: Vec<String> = all_featured.iter()
+            let featured_json: Vec<String> = all_featured
+                .iter()
                 .filter_map(|f| serde_json::to_string(f).ok())
                 .collect();
             let _ = flood_tx.send(FloodMessage::FeaturedSync {
@@ -1485,7 +1752,11 @@ async fn update_featured_release(
         let release_exists = if let Some(ref doc_store) = state.doc_store {
             let doc_store = doc_store.read().await;
             let content_id = citadel_crdt::ContentId::hash(req.release_id.as_bytes());
-            doc_store.get::<Release>(&content_id).ok().flatten().is_some()
+            doc_store
+                .get::<Release>(&content_id)
+                .ok()
+                .flatten()
+                .is_some()
         } else {
             false
         };
@@ -1494,12 +1765,8 @@ async fn update_featured_release(
         }
 
         // Create updated featured release with the same ID
-        let mut featured = FeaturedRelease::new(
-            id.clone(),
-            req.release_id,
-            req.start_time,
-            req.end_time,
-        );
+        let mut featured =
+            FeaturedRelease::new(id.clone(), req.release_id, req.start_time, req.end_time);
         featured.promoted = req.promoted;
         featured.priority = req.priority;
         featured.order = req.order;
@@ -1539,7 +1806,11 @@ async fn update_featured_release(
         let release_exists = if let Some(ref doc_store) = state.doc_store {
             let doc_store = doc_store.read().await;
             let content_id = citadel_crdt::ContentId::hash(req.release_id.as_bytes());
-            doc_store.get::<Release>(&content_id).ok().flatten().is_some()
+            doc_store
+                .get::<Release>(&content_id)
+                .ok()
+                .flatten()
+                .is_some()
         } else {
             false
         };
@@ -1572,7 +1843,8 @@ async fn update_featured_release(
     // SPORE: Flood featured releases so they propagate across the mesh
     if let Some(ref flood_tx) = state.flood_tx {
         if let Ok(all_featured) = state.storage.list_featured_releases() {
-            let featured_json: Vec<String> = all_featured.iter()
+            let featured_json: Vec<String> = all_featured
+                .iter()
                 .filter_map(|f| serde_json::to_string(f).ok())
                 .collect();
             let _ = flood_tx.send(FloodMessage::FeaturedSync {
@@ -1605,7 +1877,10 @@ async fn delete_featured_release(
             Ok(Some(_)) => {
                 drop(doc_store_read); // Release read lock before write
                 let mut doc_store_write = doc_store.write().await;
-                if doc_store_write.delete::<FeaturedRelease>(&content_id).is_ok() {
+                if doc_store_write
+                    .delete::<FeaturedRelease>(&content_id)
+                    .is_ok()
+                {
                     return StatusCode::NO_CONTENT;
                 } else {
                     return StatusCode::INTERNAL_SERVER_ERROR;
@@ -1623,14 +1898,17 @@ async fn delete_featured_release(
                 // SPORE: Flood updated featured releases so deletion propagates
                 if let Some(ref flood_tx) = state.flood_tx {
                     if let Ok(all_featured) = state.storage.list_featured_releases() {
-                        let featured_json: Vec<String> = all_featured.iter()
+                        let featured_json: Vec<String> = all_featured
+                            .iter()
                             .filter_map(|f| serde_json::to_string(f).ok())
                             .collect();
                         let _ = flood_tx.send(FloodMessage::FeaturedSync {
                             peer_id: "api".to_string(),
                             featured: featured_json,
                         });
-                        tracing::debug!("SPORE: Broadcast FeaturedSync after deleting featured release");
+                        tracing::debug!(
+                            "SPORE: Broadcast FeaturedSync after deleting featured release"
+                        );
                     }
                 }
                 StatusCode::NO_CONTENT
@@ -1676,7 +1954,10 @@ async fn get_account(
         )
     } else {
         // Regular user - check if they have upload permission
-        let has_upload = state.storage.has_permission(&public_key, "upload").unwrap_or(false);
+        let has_upload = state
+            .storage
+            .has_permission(&public_key, "upload")
+            .unwrap_or(false);
         let permissions = if has_upload {
             vec!["upload".to_string()]
         } else {
@@ -1703,10 +1984,7 @@ async fn get_account(
 /// - X-Timestamp: Unix timestamp (seconds) when signature was created
 ///
 /// The signature must be recent (within 5 minutes) to prevent replay attacks.
-async fn validate_upload(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> StatusCode {
+async fn validate_upload(State(state): State<AppState>, headers: HeaderMap) -> StatusCode {
     // Get required headers
     let public_key = match headers.get("X-Pubkey").and_then(|v| v.to_str().ok()) {
         Some(key) => key,
@@ -1771,7 +2049,11 @@ async fn validate_upload(
     }
 
     // Check if has upload permission
-    if state.storage.has_permission(public_key, "upload").unwrap_or(false) {
+    if state
+        .storage
+        .has_permission(public_key, "upload")
+        .unwrap_or(false)
+    {
         tracing::debug!(
             "validate_upload: {} has upload permission, allowed",
             public_key
@@ -1779,7 +2061,10 @@ async fn validate_upload(
         return StatusCode::OK;
     }
 
-    tracing::debug!("validate_upload: {} denied - no upload permission", public_key);
+    tracing::debug!(
+        "validate_upload: {} denied - no upload permission",
+        public_key
+    );
     StatusCode::FORBIDDEN
 }
 
@@ -1841,9 +2126,9 @@ pub struct LatencyStats {
 struct PeerEdge {
     from: String,
     to: String,
-    connection_type: String,  // "neighbor" or "relay"
-    latency_ms: Option<u32>,  // Most recent measurement
-    latency_stats: LatencyStats,  // Multi-window averages for hover display
+    connection_type: String,     // "neighbor" or "relay"
+    latency_ms: Option<u32>,     // Most recent measurement
+    latency_stats: LatencyStats, // Multi-window averages for hover display
     bidirectional: bool,
 }
 
@@ -1856,9 +2141,7 @@ struct NetworkStats {
     avg_latency_ms: Option<f64>,
 }
 
-async fn get_network_map(
-    State(state): State<AppState>,
-) -> Json<NetworkMap> {
+async fn get_network_map(State(state): State<AppState>) -> Json<NetworkMap> {
     let state = state.read().await;
     let config = &state.config;
 
@@ -1880,17 +2163,26 @@ async fn get_network_map(
         }
     } else {
         // No slot claimed yet - position at origin until claimed
-        HexSlot { index: None, q: 0, r: 0, z: 0 }
+        HexSlot {
+            index: None,
+            q: 0,
+            r: 0,
+            z: 0,
+        }
     };
 
     let short_self_id = short_peer_id(&self_id);
     let self_node = PeerNode {
         id: short_self_id.clone(),
-        label: short_self_id.clone(),  // Use peer ID as label, not IP
+        label: short_self_id.clone(), // Use peer ID as label, not IP
         slot: slot.clone(),
         peer_type: "server".to_string(),
-        last_heartbeat: 0,  // We ARE ourselves - always fresh
-        capabilities: vec!["storage".to_string(), "relay".to_string(), "api".to_string()],
+        last_heartbeat: 0, // We ARE ourselves - always fresh
+        capabilities: vec![
+            "storage".to_string(),
+            "relay".to_string(),
+            "api".to_string(),
+        ],
         online: true,
     };
 
@@ -1948,7 +2240,8 @@ async fn get_network_map(
 
         // Second pass: compute SPIRAL edges based on actual hex neighbor topology
         // For each node, check which of its 20 theoretical neighbors exist in the mesh
-        let mut seen_edges: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+        let mut seen_edges: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
 
         for (coord, node_id) in &coord_to_node {
             let neighbor_coords = Neighbors::of(*coord);
@@ -1966,7 +2259,8 @@ async fn get_network_map(
                         seen_edges.insert((from.clone(), to.clone()));
 
                         // Look up latency stats from accountability tracker if available
-                        let latency_stats = mesh.latency_history
+                        let latency_stats = mesh
+                            .latency_history
                             .get(node_id)
                             .and_then(|history| history.get(neighbor_id))
                             .map(|h| h.compute_stats())
@@ -2056,42 +2350,59 @@ struct PeerSummary {
     last_seen_ms: u64,
 }
 
-async fn get_mesh_state(
-    State(state): State<AppState>,
-) -> Json<MeshStateResponse> {
+async fn get_mesh_state(State(state): State<AppState>) -> Json<MeshStateResponse> {
     let state = state.read().await;
 
-    let (self_id, our_slot, peer_count, slot_claims, peers) = if let Some(ref mesh_state) = state.mesh_state {
-        let mesh = mesh_state.read().await;
+    let (self_id, our_slot, peer_count, slot_claims, peers) =
+        if let Some(ref mesh_state) = state.mesh_state {
+            let mesh = mesh_state.read().await;
 
-        let our_slot = mesh.self_slot.as_ref().map(|s| SlotInfo {
-            index: s.index,
-            peer_id: short_peer_id(&mesh.self_id),
-            coord: CoordInfo { q: s.coord.q, r: s.coord.r, z: s.coord.z },
-        });
+            let our_slot = mesh.self_slot.as_ref().map(|s| SlotInfo {
+                index: s.index,
+                peer_id: short_peer_id(&mesh.self_id),
+                coord: CoordInfo {
+                    q: s.coord.q,
+                    r: s.coord.r,
+                    z: s.coord.z,
+                },
+            });
 
-        let slot_claims: Vec<SlotInfo> = mesh.claimed_slots.iter()
-            .map(|(idx, claim)| SlotInfo {
-                index: *idx,
-                peer_id: short_peer_id(&claim.peer_id),
-                coord: CoordInfo { q: claim.coord.q, r: claim.coord.r, z: claim.coord.z },
-            })
-            .collect();
+            let slot_claims: Vec<SlotInfo> = mesh
+                .claimed_slots
+                .iter()
+                .map(|(idx, claim)| SlotInfo {
+                    index: *idx,
+                    peer_id: short_peer_id(&claim.peer_id),
+                    coord: CoordInfo {
+                        q: claim.coord.q,
+                        r: claim.coord.r,
+                        z: claim.coord.z,
+                    },
+                })
+                .collect();
 
-        let peers: Vec<PeerSummary> = mesh.peers.iter()
-            .map(|(id, peer)| PeerSummary {
-                id: short_peer_id(id),
-                addr: peer.addr.to_string(),
-                slot: peer.slot.as_ref().map(|s| s.index),
-                coordinated: peer.coordinated,
-                last_seen_ms: peer.last_seen.elapsed().as_millis() as u64,
-            })
-            .collect();
+            let peers: Vec<PeerSummary> = mesh
+                .peers
+                .iter()
+                .map(|(id, peer)| PeerSummary {
+                    id: short_peer_id(id),
+                    addr: peer.addr.to_string(),
+                    slot: peer.slot.as_ref().map(|s| s.index),
+                    coordinated: peer.coordinated,
+                    last_seen_ms: peer.last_seen.elapsed().as_millis() as u64,
+                })
+                .collect();
 
-        (mesh.self_id.clone(), our_slot, mesh.peers.len(), slot_claims, peers)
-    } else {
-        (String::new(), None, 0, Vec::new(), Vec::new())
-    };
+            (
+                mesh.self_id.clone(),
+                our_slot,
+                mesh.peers.len(),
+                slot_claims,
+                peers,
+            )
+        } else {
+            (String::new(), None, 0, Vec::new(), Vec::new())
+        };
 
     Json(MeshStateResponse {
         self_id: short_peer_id(&self_id),
@@ -2220,40 +2531,64 @@ async fn import_releases(
     let public_key = headers
         .get("X-Public-Key")
         .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
-            "error": "Missing X-Public-Key header"
-        }))))?;
+        .ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": "Missing X-Public-Key header"
+                })),
+            )
+        })?;
 
     let signature = headers
         .get("X-Signature")
         .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
-            "error": "Missing X-Signature header"
-        }))))?;
+        .ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": "Missing X-Signature header"
+                })),
+            )
+        })?;
 
     let timestamp = headers
         .get("X-Timestamp")
         .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
-            "error": "Missing X-Timestamp header"
-        }))))?;
+        .ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": "Missing X-Timestamp header"
+                })),
+            )
+        })?;
 
     // Verify signature and admin status
     {
         let state = state.read().await;
-        if let Err(e) = require_admin_signature(&state.storage, public_key, signature, timestamp, &body) {
+        if let Err(e) =
+            require_admin_signature(&state.storage, public_key, signature, timestamp, &body)
+        {
             tracing::warn!("Auth failed for import_releases: {}", e);
-            return Err((StatusCode::FORBIDDEN, Json(serde_json::json!({
-                "error": e
-            }))));
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": e
+                })),
+            ));
         }
     }
 
     // Parse the import data (body is the legacy export JSON directly)
-    let legacy_export: LegacyExport = serde_json::from_slice(&body)
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-            "error": format!("Failed to parse import data: {}", e)
-        }))))?;
+    let legacy_export: LegacyExport = serde_json::from_slice(&body).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("Failed to parse import data: {}", e)
+            })),
+        )
+    })?;
 
     let state = state.read().await;
 
@@ -2271,9 +2606,12 @@ async fn import_releases(
     let doc_store = match state.doc_store.as_ref() {
         Some(ds) => ds,
         None => {
-            return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-                "error": "doc_store not initialized"
-            }))));
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "doc_store not initialized"
+                })),
+            ));
         }
     };
 
@@ -2282,7 +2620,12 @@ async fn import_releases(
         let content_id = citadel_crdt::ContentId::hash(legacy_release.id.as_bytes());
         {
             let doc_store_read = doc_store.read().await;
-            if doc_store_read.get::<Release>(&content_id).ok().flatten().is_some() {
+            if doc_store_read
+                .get::<Release>(&content_id)
+                .ok()
+                .flatten()
+                .is_some()
+            {
                 tracing::debug!("Skipping existing release: {}", legacy_release.id);
                 skipped += 1;
                 continue;
@@ -2295,7 +2638,9 @@ async fn import_releases(
         let mut release = Release::new(
             legacy_release.id.clone(),
             legacy_release.name,
-            legacy_release.category_slug.unwrap_or(legacy_release.category_id),
+            legacy_release
+                .category_slug
+                .unwrap_or(legacy_release.category_id),
         );
         release.creator = creator;
         release.thumbnail_cid = legacy_release.thumbnail_cid;
@@ -2318,7 +2663,10 @@ async fn import_releases(
         {
             let mut doc_store_write = doc_store.write().await;
             if let Err(e) = doc_store_write.put(&release) {
-                errors.push(format!("Failed to save release {}: {:?}", legacy_release.id, e));
+                errors.push(format!(
+                    "Failed to save release {}: {:?}",
+                    legacy_release.id, e
+                ));
                 continue;
             }
         }
@@ -2334,14 +2682,24 @@ async fn import_releases(
         imported += 1;
     }
 
-    tracing::info!("Releases import complete: {} imported, {} skipped", imported, skipped);
+    tracing::info!(
+        "Releases import complete: {} imported, {} skipped",
+        imported,
+        skipped
+    );
 
     // Import featured releases if present
     let mut featured_imported = 0;
     let mut featured_skipped = 0;
     for featured in legacy_export.featured_releases {
         // Check if featured release already exists
-        if state.storage.get_featured_release(&featured.id).ok().flatten().is_some() {
+        if state
+            .storage
+            .get_featured_release(&featured.id)
+            .ok()
+            .flatten()
+            .is_some()
+        {
             tracing::debug!("Skipping existing featured release: {}", featured.id);
             featured_skipped += 1;
             continue;
@@ -2349,7 +2707,10 @@ async fn import_releases(
 
         // Save featured release
         if let Err(e) = state.storage.put_featured_release(&featured) {
-            errors.push(format!("Failed to save featured release {}: {}", featured.id, e));
+            errors.push(format!(
+                "Failed to save featured release {}: {}",
+                featured.id, e
+            ));
             continue;
         }
 
@@ -2357,7 +2718,11 @@ async fn import_releases(
     }
 
     if featured_imported > 0 || featured_skipped > 0 {
-        tracing::info!("Featured releases import: {} imported, {} skipped", featured_imported, featured_skipped);
+        tracing::info!(
+            "Featured releases import: {} imported, {} skipped",
+            featured_imported,
+            featured_skipped
+        );
     }
 
     // SPORE: Flood imported featured releases so they propagate across mesh
@@ -2390,7 +2755,10 @@ async fn import_releases(
                     peer_id: "api-import".to_string(), // API doesn't have mesh identity
                     release_ids,
                 });
-                tracing::info!("SPORE: Broadcast ContentHaveList with {} releases after import", all_releases.len());
+                tracing::info!(
+                    "SPORE: Broadcast ContentHaveList with {} releases after import",
+                    all_releases.len()
+                );
             }
         }
     }
@@ -2406,20 +2774,24 @@ async fn import_releases(
 }
 
 /// GET /api/v1/export - Export all releases and featured releases
-async fn export_releases(
-    State(state): State<AppState>,
-) -> Result<Json<ExportData>, StatusCode> {
+async fn export_releases(State(state): State<AppState>) -> Result<Json<ExportData>, StatusCode> {
     let state = state.read().await;
 
-    let releases = state.storage
+    let releases = state
+        .storage
         .list_releases()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let featured_releases = state.storage
+    let featured_releases = state
+        .storage
         .list_featured_releases()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    tracing::info!("Exporting {} releases and {} featured releases", releases.len(), featured_releases.len());
+    tracing::info!(
+        "Exporting {} releases and {} featured releases",
+        releases.len(),
+        featured_releases.len()
+    );
 
     Ok(Json(ExportData {
         version: "2.0".to_string(),
@@ -2516,9 +2888,8 @@ fn verify_admin_auth(
 
     // Verify signature (CLI signs "{timestamp}:UPLOAD" for admin commands)
     let message = format!("{}:UPLOAD", timestamp);
-    verify_signature(pubkey, message.as_bytes(), signature).map_err(|e| AdminApiResponse::Error {
-        error: e,
-    })?;
+    verify_signature(pubkey, message.as_bytes(), signature)
+        .map_err(|e| AdminApiResponse::Error { error: e })?;
 
     // Check admin status
     if !storage.is_admin(pubkey).unwrap_or(false) {
@@ -2700,18 +3071,16 @@ async fn admin_cpu_profile(
     tracing::info!("CPU profiling: collecting for 5 seconds via HTTP...");
 
     // Run profiling in a blocking task since it uses std::thread::sleep
-    let profile_result = tokio::task::spawn_blocking(|| {
-        admin_socket::collect_cpu_profile(5)
-    })
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(AdminApiResponse::Error {
-                error: format!("Task join error: {}", e),
-            }),
-        )
-    })?;
+    let profile_result = tokio::task::spawn_blocking(|| admin_socket::collect_cpu_profile(5))
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(AdminApiResponse::Error {
+                    error: format!("Task join error: {}", e),
+                }),
+            )
+        })?;
 
     match profile_result {
         Ok(data) => Ok(Json(AdminApiResponse::Profile { data })),

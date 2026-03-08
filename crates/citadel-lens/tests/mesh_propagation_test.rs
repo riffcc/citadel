@@ -25,9 +25,9 @@
 //! - Range-based: uses Spore for O(|diff|) convergence
 //! - GDPR Article 17 compliant: provides audit trail for erasure
 
+use citadel_lens::mesh::peer::double_hash_id;
 use citadel_lens::models::Release;
 use citadel_lens::storage::Storage;
-use citadel_lens::mesh::peer::double_hash_id;
 use citadel_spore::Spore;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -51,7 +51,9 @@ struct MeshNode {
 impl MeshNode {
     fn new(id: &str) -> Self {
         let dir = tempdir().expect("Failed to create temp dir");
-        let storage = Arc::new(Storage::open(dir.path().join("storage.redb")).expect("Failed to open storage"));
+        let storage = Arc::new(
+            Storage::open(dir.path().join("storage.redb")).expect("Failed to open storage"),
+        );
 
         Self {
             id: id.to_string(),
@@ -71,7 +73,9 @@ impl MeshNode {
             return; // Reject tombstoned content
         }
 
-        self.storage.put_release(&release).expect("Failed to store release");
+        self.storage
+            .put_release(&release)
+            .expect("Failed to store release");
         self.releases.insert(release.id.clone(), release);
     }
 
@@ -104,7 +108,8 @@ impl MeshNode {
 
     /// Check if a release is deleted (status = Deleted)
     fn is_deleted(&self, id: &str) -> bool {
-        self.releases.get(id)
+        self.releases
+            .get(id)
             .map(|r| r.status == citadel_lens::models::ReleaseStatus::Deleted)
             .unwrap_or(false)
     }
@@ -173,7 +178,8 @@ impl TestMesh {
                 // Check tombstone before accepting
                 let tombstone = double_hash_id(&release_clone.id);
                 if !node.do_not_want.contains(&tombstone) {
-                    node.releases.insert(release_clone.id.clone(), release_clone.clone());
+                    node.releases
+                        .insert(release_clone.id.clone(), release_clone.clone());
                     let _ = node.storage.put_release(&release_clone);
                 }
             }
@@ -217,7 +223,8 @@ impl TestMesh {
                 let tombstone = double_hash_id(&release_clone.id);
                 if !node.do_not_want.contains(&tombstone) {
                     // Update the release with deleted status
-                    node.releases.insert(release_clone.id.clone(), release_clone.clone());
+                    node.releases
+                        .insert(release_clone.id.clone(), release_clone.clone());
                     let _ = node.storage.put_release(&release_clone);
                 }
             }
@@ -243,11 +250,13 @@ impl TestMesh {
                     // Merge: newer timestamp wins (simple LWW for releases)
                     if let Some(existing) = node.releases.get(&release_clone.id) {
                         if release_clone.moderated_at > existing.moderated_at {
-                            node.releases.insert(release_clone.id.clone(), release_clone.clone());
+                            node.releases
+                                .insert(release_clone.id.clone(), release_clone.clone());
                             let _ = node.storage.put_release(&release_clone);
                         }
                     } else {
-                        node.releases.insert(release_clone.id.clone(), release_clone.clone());
+                        node.releases
+                            .insert(release_clone.id.clone(), release_clone.clone());
                         let _ = node.storage.put_release(&release_clone);
                     }
                 }
@@ -340,7 +349,9 @@ fn test_release_propagates_to_all_nodes() {
 
     // Upload a release to node-0
     let release = make_release("release-001", "Test Album");
-    mesh.node_mut("node-0").unwrap().upload_release(release.clone());
+    mesh.node_mut("node-0")
+        .unwrap()
+        .upload_release(release.clone());
 
     // Flood from node-0
     mesh.flood_release("node-0", &release);
@@ -373,7 +384,9 @@ fn test_release_edits_propagate() {
 
     // Upload initial release
     let mut release = make_release("release-002", "Original Title");
-    mesh.node_mut("node-0").unwrap().upload_release(release.clone());
+    mesh.node_mut("node-0")
+        .unwrap()
+        .upload_release(release.clone());
     mesh.flood_release("node-0", &release);
 
     // All nodes should have original
@@ -388,7 +401,9 @@ fn test_release_edits_propagate() {
     // Edit on node-1
     release.title = "Edited Title".to_string();
     release.moderated_at = Some(chrono::Utc::now().to_rfc3339());
-    mesh.node_mut("node-1").unwrap().upload_release(release.clone());
+    mesh.node_mut("node-1")
+        .unwrap()
+        .upload_release(release.clone());
     mesh.flood_edit("node-1", &release);
 
     // All nodes should have the edit
@@ -418,7 +433,9 @@ fn test_deletes_propagate_as_edits() {
 
     // Upload a release
     let mut release = make_release("release-003", "To Be Deleted");
-    mesh.node_mut("node-0").unwrap().upload_release(release.clone());
+    mesh.node_mut("node-0")
+        .unwrap()
+        .upload_release(release.clone());
     mesh.flood_release("node-0", &release);
 
     // All nodes should have it with Approved status
@@ -430,7 +447,9 @@ fn test_deletes_propagate_as_edits() {
     }
 
     // Delete on node-2 (status change, not ban)
-    mesh.node_mut("node-2").unwrap().delete_release("release-003");
+    mesh.node_mut("node-2")
+        .unwrap()
+        .delete_release("release-003");
     release.status = citadel_lens::models::ReleaseStatus::Deleted;
     release.moderated_at = Some(chrono::Utc::now().to_rfc3339());
     mesh.flood_delete("node-2", &release);
@@ -463,7 +482,9 @@ fn test_bans_propagate() {
 
     // Upload a release
     let release = make_release("release-004", "To Be Banned");
-    mesh.node_mut("node-0").unwrap().upload_release(release.clone());
+    mesh.node_mut("node-0")
+        .unwrap()
+        .upload_release(release.clone());
     mesh.flood_release("node-0", &release);
 
     // All nodes should have it
@@ -499,7 +520,9 @@ fn test_bans_prevent_reupload() {
 
     // Upload and ban
     let release = make_release("release-005", "Will Be Blocked");
-    mesh.node_mut("node-a").unwrap().upload_release(release.clone());
+    mesh.node_mut("node-a")
+        .unwrap()
+        .upload_release(release.clone());
     mesh.flood_release("node-a", &release);
 
     mesh.node_mut("node-a").unwrap().ban_release("release-005");
@@ -511,10 +534,16 @@ fn test_bans_prevent_reupload() {
 
     // Try to re-upload from node-b (should be blocked by ban)
     let reupload = make_release("release-005", "Attempted Reupload");
-    mesh.node_mut("node-b").unwrap().upload_release(reupload.clone());
+    mesh.node_mut("node-b")
+        .unwrap()
+        .upload_release(reupload.clone());
 
     // Should still not have the release (ban blocks it)
-    assert!(mesh.node("node-b").unwrap().get_release("release-005").is_none());
+    assert!(mesh
+        .node("node-b")
+        .unwrap()
+        .get_release("release-005")
+        .is_none());
 }
 
 // ============================================================================
@@ -585,18 +614,19 @@ fn test_no_resource_leaks() {
 
         // Upload many releases
         for r in 0..releases_per_iteration {
-            let release = make_release(
-                &format!("release-{}-{}", iter, r),
-                &format!("Title {}", r),
-            );
-            mesh.node_mut(&format!("node-{}-0", iter)).unwrap().upload_release(release.clone());
+            let release = make_release(&format!("release-{}-{}", iter, r), &format!("Title {}", r));
+            mesh.node_mut(&format!("node-{}-0", iter))
+                .unwrap()
+                .upload_release(release.clone());
             mesh.flood_release(&format!("node-{}-0", iter), &release);
         }
 
         // Delete half of them
         for r in 0..(releases_per_iteration / 2) {
             let id = format!("release-{}-{}", iter, r);
-            mesh.node_mut(&format!("node-{}-0", iter)).unwrap().delete_release(&id);
+            mesh.node_mut(&format!("node-{}-0", iter))
+                .unwrap()
+                .delete_release(&id);
             mesh.flood_ban(&format!("node-{}-0", iter), &id);
         }
 
@@ -638,7 +668,9 @@ fn test_memory_stable_under_churn() {
     for round in 0..50 {
         // Upload a release
         let release = make_release(&format!("release-{}", round), &format!("Round {}", round));
-        mesh.node_mut("node-0").unwrap().upload_release(release.clone());
+        mesh.node_mut("node-0")
+            .unwrap()
+            .upload_release(release.clone());
         mesh.flood_release("node-0", &release);
 
         // Every 10 rounds, "churn" - remove a node and add a new one
@@ -682,7 +714,9 @@ fn test_large_mesh_propagation() {
     for i in 0..100 {
         let node_id = format!("node-{}", i % 50);
         let release = make_release(&format!("release-{}", i), &format!("Album {}", i));
-        mesh.node_mut(&node_id).unwrap().upload_release(release.clone());
+        mesh.node_mut(&node_id)
+            .unwrap()
+            .upload_release(release.clone());
         mesh.flood_release(&node_id, &release);
     }
 
@@ -736,9 +770,14 @@ use tokio::time::{sleep, Duration as TokioDuration};
 async fn create_test_peer(
     port: u16,
     entry_peers: Vec<String>,
-) -> (Arc<MeshService>, TempDir, Arc<RwLock<citadel_lens::mesh::state::MeshState>>) {
+) -> (
+    Arc<MeshService>,
+    TempDir,
+    Arc<RwLock<citadel_lens::mesh::state::MeshState>>,
+) {
     let dir = tempdir().expect("Failed to create temp dir");
-    let storage = Arc::new(Storage::open(dir.path().join("storage.redb")).expect("Failed to open storage"));
+    let storage =
+        Arc::new(Storage::open(dir.path().join("storage.redb")).expect("Failed to open storage"));
 
     let doc_store_path = dir.path().join("docs.redb");
     let doc_store = DocumentStore::open(&doc_store_path).expect("Failed to open doc store");
@@ -758,7 +797,11 @@ async fn create_test_peer(
 }
 
 /// Wait for peers to discover each other
-async fn wait_for_peers(state: &Arc<RwLock<citadel_lens::mesh::state::MeshState>>, min_peers: usize, timeout_ms: u64) -> bool {
+async fn wait_for_peers(
+    state: &Arc<RwLock<citadel_lens::mesh::state::MeshState>>,
+    min_peers: usize,
+    timeout_ms: u64,
+) -> bool {
     let start = std::time::Instant::now();
     loop {
         let peer_count = state.read().await.peers.len();
@@ -833,9 +876,7 @@ async fn test_spore_deletion_propagates_10_peers() {
     }
 
     // Get the do_not_want Spore from peer 0
-    let peer0_dnw = {
-        states[0].read().await.do_not_want_spore().clone()
-    };
+    let peer0_dnw = { states[0].read().await.do_not_want_spore().clone() };
 
     // Manually propagate to other peers (simulating flood)
     // In real mesh this happens via TCP, here we directly merge
@@ -867,7 +908,10 @@ async fn test_spore_deletion_propagates_10_peers() {
         );
     }
 
-    println!("SPORE⁻¹: {} peers converged on tombstone with XOR=∅", num_peers);
+    println!(
+        "SPORE⁻¹: {} peers converged on tombstone with XOR=∅",
+        num_peers
+    );
 
     // Cleanup: abort all peer tasks
     for handle in handles {
@@ -885,7 +929,11 @@ async fn test_spore_multiple_deletions_converge() {
     let mut dirs = Vec::new();
 
     for i in 0..num_peers {
-        let entry = if i == 0 { vec![] } else { vec![format!("127.0.0.1:{}", base_port)] };
+        let entry = if i == 0 {
+            vec![]
+        } else {
+            vec![format!("127.0.0.1:{}", base_port)]
+        };
         let (_peer, dir, state) = create_test_peer(base_port + i as u16, entry).await;
         dirs.push(dir);
         states.push(state);
@@ -932,11 +980,7 @@ async fn test_spore_multiple_deletions_converge() {
     for (i, state) in states.iter().enumerate().skip(1) {
         let s = state.read().await;
         let diff = first_dnw.xor(s.do_not_want_spore());
-        assert!(
-            diff.is_empty(),
-            "Peer {} should be XOR-synced",
-            i
-        );
+        assert!(diff.is_empty(), "Peer {} should be XOR-synced", i);
     }
 
     // Verify specific tombstones are present everywhere
@@ -956,7 +1000,10 @@ async fn test_spore_multiple_deletions_converge() {
         }
     }
 
-    println!("SPORE⁻¹: {} peers converged with {} tombstones each", num_peers, expected_count);
+    println!(
+        "SPORE⁻¹: {} peers converged with {} tombstones each",
+        num_peers, expected_count
+    );
 }
 
 #[tokio::test]
@@ -965,7 +1012,8 @@ async fn test_spore_erasure_confirmation_flow() {
 
     // Create 2 peers
     let (_peer_a, _dir_a, state_a) = create_test_peer(base_port, vec![]).await;
-    let (_peer_b, _dir_b, state_b) = create_test_peer(base_port + 1, vec![format!("127.0.0.1:{}", base_port)]).await;
+    let (_peer_b, _dir_b, state_b) =
+        create_test_peer(base_port + 1, vec![format!("127.0.0.1:{}", base_port)]).await;
 
     // Peer A initiates GDPR deletion
     let tombstone = double_hash_id("gdpr-content-123");
@@ -1024,10 +1072,7 @@ async fn test_tombstone_blocks_release_acceptance() {
     // Verify tombstone blocks acceptance
     {
         let s = state.read().await;
-        assert!(
-            s.is_tombstoned(&tombstone),
-            "Release should be tombstoned"
-        );
+        assert!(s.is_tombstoned(&tombstone), "Release should be tombstoned");
         // Different release should not be blocked
         let other = double_hash_id("other-release");
         assert!(
