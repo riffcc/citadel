@@ -330,6 +330,7 @@ fn make_release(id: &str, title: &str) -> Release {
         moderated_at: Some(now.clone()),
         rejection_reason: None,
         modified_at: now,
+        version_info: None,
     }
 }
 
