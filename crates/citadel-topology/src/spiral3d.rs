@@ -255,7 +255,11 @@ const fn total_slots_through_shell_2d(n: u64) -> u64 {
 
 /// Slots in 2D ring n: 6n (or 1 for n=0)
 const fn slots_in_ring_2d(n: u64) -> u64 {
-    if n == 0 { 1 } else { 6 * n }
+    if n == 0 {
+        1
+    } else {
+        6 * n
+    }
 }
 
 /// Get the coordinate at a given offset within ring n (2D).
@@ -276,14 +280,7 @@ fn ring_coord(ring: u64, offset: u64) -> HexCoord {
         (ring as i64, -(ring as i64)),
     ];
 
-    let directions = [
-        (-1i64, 1i64),
-        (-1, 0),
-        (0, -1),
-        (1, -1),
-        (1, 0),
-        (0, 1),
-    ];
+    let directions = [(-1i64, 1i64), (-1, 0), (0, -1), (1, -1), (1, 0), (0, 1)];
 
     let (cq, cr) = corners[edge as usize];
     let (dq, dr) = directions[edge as usize];
@@ -306,14 +303,7 @@ fn coord_to_ring_offset(ring: u64, coord: HexCoord) -> u64 {
         (ring as i64, -(ring as i64)),
     ];
 
-    let directions = [
-        (-1i64, 1i64),
-        (-1, 0),
-        (0, -1),
-        (1, -1),
-        (1, 0),
-        (0, 1),
-    ];
+    let directions = [(-1i64, 1i64), (-1, 0), (0, -1), (1, -1), (1, 0), (0, 1)];
 
     for edge in 0..6 {
         let (cq, cr) = corners[edge];
@@ -345,7 +335,10 @@ fn disk_coord(max_ring: u64, offset: u64) -> HexCoord {
         remaining -= ring_size;
     }
 
-    panic!("Offset {} exceeds disk size for max_ring {}", offset, max_ring);
+    panic!(
+        "Offset {} exceeds disk size for max_ring {}",
+        offset, max_ring
+    );
 }
 
 /// Get the offset of a coordinate within disk (rings 0 to n).
@@ -355,7 +348,12 @@ fn coord_to_disk_offset(max_ring: u64, coord: HexCoord) -> u64 {
     }
 
     let ring = coord.hex_distance(&HexCoord::ORIGIN) as u64;
-    assert!(ring <= max_ring, "Coordinate ring {} exceeds max {}", ring, max_ring);
+    assert!(
+        ring <= max_ring,
+        "Coordinate ring {} exceeds max {}",
+        ring,
+        max_ring
+    );
 
     let base = if ring > 0 {
         total_slots_through_shell_2d(ring - 1)
@@ -374,17 +372,30 @@ pub struct Spiral3D {
 
 impl Spiral3D {
     pub fn new() -> Self {
-        Self { current: 0, limit: None }
+        Self {
+            current: 0,
+            limit: None,
+        }
     }
 
     pub fn take_slots(count: u64) -> Self {
-        Self { current: 0, limit: Some(count) }
+        Self {
+            current: 0,
+            limit: Some(count),
+        }
     }
 
     pub fn shells(start: u64, end: u64) -> Self {
-        let start_slot = if start == 0 { 0 } else { total_slots_through_shell(start - 1) };
+        let start_slot = if start == 0 {
+            0
+        } else {
+            total_slots_through_shell(start - 1)
+        };
         let end_slot = total_slots_through_shell(end);
-        Self { current: start_slot, limit: Some(end_slot) }
+        Self {
+            current: start_slot,
+            limit: Some(end_slot),
+        }
     }
 }
 
@@ -417,17 +428,17 @@ mod tests {
     #[test]
     fn shell_size_formula() {
         assert_eq!(slots_in_shell(0), 1);
-        assert_eq!(slots_in_shell(1), 20);  // 18 + 2
-        assert_eq!(slots_in_shell(2), 74);  // 72 + 2
+        assert_eq!(slots_in_shell(1), 20); // 18 + 2
+        assert_eq!(slots_in_shell(2), 74); // 72 + 2
         assert_eq!(slots_in_shell(3), 164); // 162 + 2
     }
 
     #[test]
     fn total_through_shell_formula() {
         assert_eq!(total_slots_through_shell(0), 1);
-        assert_eq!(total_slots_through_shell(1), 21);   // 1 + 20
-        assert_eq!(total_slots_through_shell(2), 95);   // 21 + 74
-        assert_eq!(total_slots_through_shell(3), 259);  // 95 + 164
+        assert_eq!(total_slots_through_shell(1), 21); // 1 + 20
+        assert_eq!(total_slots_through_shell(2), 95); // 21 + 74
+        assert_eq!(total_slots_through_shell(3), 259); // 95 + 164
     }
 
     #[test]
@@ -438,7 +449,9 @@ mod tests {
 
     #[test]
     fn shell_1_has_20_unique_coords() {
-        let shell_1: Vec<_> = (1..=20).map(|i| spiral3d_to_coord(Spiral3DIndex(i))).collect();
+        let shell_1: Vec<_> = (1..=20)
+            .map(|i| spiral3d_to_coord(Spiral3DIndex(i)))
+            .collect();
 
         // All should have shell_radius = 1
         for coord in &shell_1 {
@@ -450,7 +463,13 @@ mod tests {
         // All should be unique
         for i in 0..shell_1.len() {
             for j in (i + 1)..shell_1.len() {
-                assert_ne!(shell_1[i], shell_1[j], "Duplicate at {} and {}", i + 1, j + 1);
+                assert_ne!(
+                    shell_1[i],
+                    shell_1[j],
+                    "Duplicate at {} and {}",
+                    i + 1,
+                    j + 1
+                );
             }
         }
     }
@@ -460,10 +479,16 @@ mod tests {
         use crate::Neighbors;
 
         let neighbors = Neighbors::of(HexCoord::ORIGIN);
-        let shell_1: Vec<_> = (1..=20).map(|i| spiral3d_to_coord(Spiral3DIndex(i))).collect();
+        let shell_1: Vec<_> = (1..=20)
+            .map(|i| spiral3d_to_coord(Spiral3DIndex(i)))
+            .collect();
 
         for coord in &shell_1 {
-            assert!(neighbors.contains(coord), "Shell-1 coord {:?} is not a neighbor of origin", coord);
+            assert!(
+                neighbors.contains(coord),
+                "Shell-1 coord {:?} is not a neighbor of origin",
+                coord
+            );
         }
     }
 
@@ -474,7 +499,11 @@ mod tests {
         for i in 0..total {
             let coord = spiral3d_to_coord(Spiral3DIndex(i));
             let back = coord_to_spiral3d(coord);
-            assert_eq!(back.0, i, "Round-trip failed for index {}: coord {:?} -> {}", i, coord, back.0);
+            assert_eq!(
+                back.0, i,
+                "Round-trip failed for index {}: coord {:?} -> {}",
+                i, coord, back.0
+            );
         }
     }
 
@@ -485,7 +514,11 @@ mod tests {
         for i in 0..total {
             let coord = spiral3d_to_coord(Spiral3DIndex(i));
             let back = coord_to_spiral3d(coord);
-            assert_eq!(back.0, i, "Round-trip failed for index {}: coord {:?} -> {}", i, coord, back.0);
+            assert_eq!(
+                back.0, i,
+                "Round-trip failed for index {}: coord {:?} -> {}",
+                i, coord, back.0
+            );
         }
     }
 
@@ -494,18 +527,26 @@ mod tests {
         use crate::Neighbors;
 
         let directions = Neighbors::all_directions();
-        let shell_1: Vec<_> = (1..=20).map(|i| spiral3d_to_coord(Spiral3DIndex(i))).collect();
+        let shell_1: Vec<_> = (1..=20)
+            .map(|i| spiral3d_to_coord(Spiral3DIndex(i)))
+            .collect();
 
         // Every shell-1 coord should be one of the 20 directions
         for coord in &shell_1 {
-            assert!(directions.contains(coord),
-                "Shell-1 coord {:?} is not a neighbor direction", coord);
+            assert!(
+                directions.contains(coord),
+                "Shell-1 coord {:?} is not a neighbor direction",
+                coord
+            );
         }
 
         // Every direction should appear in shell-1
         for dir in &directions {
-            assert!(shell_1.contains(dir),
-                "Direction {:?} not found in shell-1", dir);
+            assert!(
+                shell_1.contains(dir),
+                "Direction {:?} not found in shell-1",
+                dir
+            );
         }
     }
 
@@ -566,8 +607,13 @@ mod tests {
             let canonical = Neighbors::all_directions();
 
             for dir in &dirs_from_here {
-                assert!(canonical.contains(dir),
-                    "Node {} at {:?} has non-canonical neighbor direction {:?}", idx, coord, dir);
+                assert!(
+                    canonical.contains(dir),
+                    "Node {} at {:?} has non-canonical neighbor direction {:?}",
+                    idx,
+                    coord,
+                    dir
+                );
             }
         }
     }
@@ -580,7 +626,11 @@ mod tests {
         use std::collections::HashSet;
 
         for shell in 1..=4 {
-            let start = if shell == 1 { 1 } else { total_slots_through_shell(shell - 1) };
+            let start = if shell == 1 {
+                1
+            } else {
+                total_slots_through_shell(shell - 1)
+            };
             let end = total_slots_through_shell(shell);
 
             let coords: Vec<_> = (start..end)
@@ -610,7 +660,10 @@ mod tests {
 
             println!(
                 "Shell {}: {} coords, z range {:?}, q range {:?}",
-                shell, coords.len(), z_values, q_values
+                shell,
+                coords.len(),
+                z_values,
+                q_values
             );
         }
     }
@@ -645,9 +698,11 @@ mod tests {
 
             // All axes should grow symmetrically for complete shells
             // (q_span should equal z_span at shell boundaries)
-            assert_eq!(q_span, z_span,
+            assert_eq!(
+                q_span, z_span,
                 "At {} nodes (shell boundary), Q span {} should equal Z span {}",
-                count, q_span, z_span);
+                count, q_span, z_span
+            );
         }
     }
 
@@ -659,8 +714,14 @@ mod tests {
         let test_points = [10, 21, 50, 75, 95, 100, 150, 200, 259];
 
         println!("\nMesh growth analysis:");
-        println!("{:>6} | {:>12} | {:>12} | {:>12} | {:>6}", "Nodes", "Q range", "R range", "Z range", "Shell");
-        println!("{:-<6}-+-{:-<12}-+-{:-<12}-+-{:-<12}-+-{:-<6}", "", "", "", "", "");
+        println!(
+            "{:>6} | {:>12} | {:>12} | {:>12} | {:>6}",
+            "Nodes", "Q range", "R range", "Z range", "Shell"
+        );
+        println!(
+            "{:-<6}-+-{:-<12}-+-{:-<12}-+-{:-<12}-+-{:-<6}",
+            "", "", "", "", ""
+        );
 
         for count in test_points {
             let coords: Vec<_> = (0..count as u64)

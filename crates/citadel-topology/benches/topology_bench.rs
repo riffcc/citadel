@@ -6,12 +6,11 @@
 //! - Neighbor lookups
 //! - Routing simulation
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId, Throughput};
 use citadel_topology::{
-    HexCoord, Neighbors, Spiral3D, Spiral3DIndex,
-    spiral3d_to_coord, coord_to_spiral3d,
-    slots_in_shell, total_slots_through_shell,
+    coord_to_spiral3d, slots_in_shell, spiral3d_to_coord, total_slots_through_shell, HexCoord,
+    Neighbors, Spiral3D, Spiral3DIndex,
 };
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
 /// Benchmark spiral index to coordinate conversion
 fn bench_spiral_to_coord(c: &mut Criterion) {
@@ -20,13 +19,9 @@ fn bench_spiral_to_coord(c: &mut Criterion) {
     // Test at different scales
     for &index in &[0u64, 10, 100, 1000, 10_000, 100_000, 1_000_000] {
         group.throughput(Throughput::Elements(1));
-        group.bench_with_input(
-            BenchmarkId::from_parameter(index),
-            &index,
-            |b, &idx| {
-                b.iter(|| spiral3d_to_coord(black_box(Spiral3DIndex(idx))))
-            },
-        );
+        group.bench_with_input(BenchmarkId::from_parameter(index), &index, |b, &idx| {
+            b.iter(|| spiral3d_to_coord(black_box(Spiral3DIndex(idx))))
+        });
     }
     group.finish();
 }
@@ -46,16 +41,14 @@ fn bench_coord_to_spiral(c: &mut Criterion) {
     ];
 
     for coord in coords {
-        let shell = coord.z.unsigned_abs()
+        let shell = coord
+            .z
+            .unsigned_abs()
             .max(coord.hex_distance(&HexCoord::new(0, 0, coord.z)) as u64);
         group.throughput(Throughput::Elements(1));
-        group.bench_with_input(
-            BenchmarkId::new("shell", shell),
-            &coord,
-            |b, &c| {
-                b.iter(|| coord_to_spiral3d(black_box(c)))
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("shell", shell), &coord, |b, &c| {
+            b.iter(|| coord_to_spiral3d(black_box(c)))
+        });
     }
     group.finish();
 }
@@ -66,14 +59,10 @@ fn bench_shell_detection(c: &mut Criterion) {
 
     for &index in &[0u64, 20, 94, 258, 10_000, 100_000, 1_000_000] {
         group.throughput(Throughput::Elements(1));
-        group.bench_with_input(
-            BenchmarkId::from_parameter(index),
-            &index,
-            |b, &idx| {
-                let spiral_idx = Spiral3DIndex(idx);
-                b.iter(|| black_box(spiral_idx).shell())
-            },
-        );
+        group.bench_with_input(BenchmarkId::from_parameter(index), &index, |b, &idx| {
+            let spiral_idx = Spiral3DIndex(idx);
+            b.iter(|| black_box(spiral_idx).shell())
+        });
     }
     group.finish();
 }
@@ -89,16 +78,14 @@ fn bench_neighbors(c: &mut Criterion) {
     ];
 
     for coord in coords {
-        let shell = coord.z.unsigned_abs()
+        let shell = coord
+            .z
+            .unsigned_abs()
             .max(coord.hex_distance(&HexCoord::new(0, 0, coord.z)) as u64);
         group.throughput(Throughput::Elements(20)); // 20 neighbors
-        group.bench_with_input(
-            BenchmarkId::new("shell", shell),
-            &coord,
-            |b, &c| {
-                b.iter(|| Neighbors::of(black_box(c)))
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("shell", shell), &coord, |b, &c| {
+            b.iter(|| Neighbors::of(black_box(c)))
+        });
     }
     group.finish();
 }
@@ -109,15 +96,9 @@ fn bench_spiral_iteration(c: &mut Criterion) {
 
     for &count in &[100u64, 1000, 10_000, 100_000] {
         group.throughput(Throughput::Elements(count));
-        group.bench_with_input(
-            BenchmarkId::from_parameter(count),
-            &count,
-            |b, &n| {
-                b.iter(|| {
-                    Spiral3D::take_slots(black_box(n)).count()
-                })
-            },
-        );
+        group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, &n| {
+            b.iter(|| Spiral3D::take_slots(black_box(n)).count())
+        });
     }
     group.finish();
 }
@@ -130,17 +111,13 @@ fn bench_shell_formulas(c: &mut Criterion) {
         group.bench_with_input(
             BenchmarkId::new("slots_in_shell", shell),
             &shell,
-            |b, &n| {
-                b.iter(|| slots_in_shell(black_box(n)))
-            },
+            |b, &n| b.iter(|| slots_in_shell(black_box(n))),
         );
 
         group.bench_with_input(
             BenchmarkId::new("total_through_shell", shell),
             &shell,
-            |b, &n| {
-                b.iter(|| total_slots_through_shell(black_box(n)))
-            },
+            |b, &n| b.iter(|| total_slots_through_shell(black_box(n))),
         );
     }
     group.finish();
@@ -152,16 +129,12 @@ fn bench_roundtrip(c: &mut Criterion) {
 
     for &index in &[0u64, 100, 1000, 10_000] {
         group.throughput(Throughput::Elements(1));
-        group.bench_with_input(
-            BenchmarkId::from_parameter(index),
-            &index,
-            |b, &idx| {
-                b.iter(|| {
-                    let coord = spiral3d_to_coord(Spiral3DIndex(black_box(idx)));
-                    coord_to_spiral3d(coord)
-                })
-            },
-        );
+        group.bench_with_input(BenchmarkId::from_parameter(index), &index, |b, &idx| {
+            b.iter(|| {
+                let coord = spiral3d_to_coord(Spiral3DIndex(black_box(idx)));
+                coord_to_spiral3d(coord)
+            })
+        });
     }
     group.finish();
 }
@@ -173,8 +146,14 @@ fn bench_routing_simulation(c: &mut Criterion) {
     // Pre-compute some source/destination pairs
     let pairs: Vec<(HexCoord, HexCoord)> = vec![
         (HexCoord::ORIGIN, spiral3d_to_coord(Spiral3DIndex(100))),
-        (spiral3d_to_coord(Spiral3DIndex(50)), spiral3d_to_coord(Spiral3DIndex(200))),
-        (spiral3d_to_coord(Spiral3DIndex(1000)), spiral3d_to_coord(Spiral3DIndex(5000))),
+        (
+            spiral3d_to_coord(Spiral3DIndex(50)),
+            spiral3d_to_coord(Spiral3DIndex(200)),
+        ),
+        (
+            spiral3d_to_coord(Spiral3DIndex(1000)),
+            spiral3d_to_coord(Spiral3DIndex(5000)),
+        ),
     ];
 
     for (idx, (src, dst)) in pairs.iter().enumerate() {
@@ -182,9 +161,7 @@ fn bench_routing_simulation(c: &mut Criterion) {
         group.bench_with_input(
             BenchmarkId::new("pair", format!("{}_dist{}", idx, distance)),
             &(*src, *dst),
-            |b, &(s, d)| {
-                b.iter(|| greedy_route(black_box(s), black_box(d)))
-            },
+            |b, &(s, d)| b.iter(|| greedy_route(black_box(s), black_box(d))),
         );
     }
     group.finish();
@@ -246,13 +223,9 @@ fn bench_routing_at_scale(c: &mut Criterion) {
         let dst = spiral3d_to_coord(Spiral3DIndex(total_slots_through_shell(shell) - 1));
         let _expected_hops = shell; // Should be roughly O(shell)
 
-        group.bench_with_input(
-            BenchmarkId::new("shell_distance", shell),
-            &dst,
-            |b, &d| {
-                b.iter(|| greedy_route(black_box(HexCoord::ORIGIN), black_box(d)))
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("shell_distance", shell), &dst, |b, &d| {
+            b.iter(|| greedy_route(black_box(HexCoord::ORIGIN), black_box(d)))
+        });
     }
     group.finish();
 }

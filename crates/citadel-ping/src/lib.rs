@@ -193,11 +193,7 @@ impl PeerTracker {
     }
 
     /// Create with custom timeouts.
-    pub fn with_timeouts(
-        my_id: U256,
-        stale_timeout: Duration,
-        ping_interval: Duration,
-    ) -> Self {
+    pub fn with_timeouts(my_id: U256, stale_timeout: Duration, ping_interval: Duration) -> Self {
         Self {
             my_id,
             peers: HashMap::new(),
@@ -268,8 +264,11 @@ impl PeerTracker {
 
     /// Get the peer with lowest load that has a capability.
     pub fn best_peer_for(&self, cap: Capability) -> Option<&PeerInfo> {
-        self.peers_with_capability(cap)
-            .min_by(|a, b| a.load.partial_cmp(&b.load).unwrap_or(std::cmp::Ordering::Equal))
+        self.peers_with_capability(cap).min_by(|a, b| {
+            a.load
+                .partial_cmp(&b.load)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
     }
 
     /// Count of known peers.
@@ -436,8 +435,11 @@ mod tests {
 
     #[test]
     fn test_stale_detection() {
-        let mut tracker =
-            PeerTracker::with_timeouts(make_node_id(1), Duration::from_millis(10), Duration::from_secs(1));
+        let mut tracker = PeerTracker::with_timeouts(
+            make_node_id(1),
+            Duration::from_millis(10),
+            Duration::from_secs(1),
+        );
 
         let ping = Ping::new(make_node_id(2), vec![], 0.0);
         tracker.receive_ping(&ping);
@@ -456,8 +458,11 @@ mod tests {
 
     #[test]
     fn test_should_ping() {
-        let mut tracker =
-            PeerTracker::with_timeouts(make_node_id(1), Duration::from_secs(60), Duration::from_millis(10));
+        let mut tracker = PeerTracker::with_timeouts(
+            make_node_id(1),
+            Duration::from_secs(60),
+            Duration::from_millis(10),
+        );
 
         assert!(tracker.should_ping());
 

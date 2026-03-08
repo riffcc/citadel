@@ -21,17 +21,25 @@
 //! All invariants are proven in Lean4. See `proofs/CitadelProofs/Topology.lean`
 //! and `proofs/CitadelProofs/Spiral.lean`.
 
+mod gap_and_wrap;
 mod hex;
+mod neighbors;
 mod spiral;
 mod spiral3d;
-mod neighbors;
-mod gap_and_wrap;
 
+pub use gap_and_wrap::{
+    compute_all_connections, ghost_target, is_bidirectional, theoretical_neighbor, Connection,
+    Direction,
+};
 pub use hex::HexCoord;
-pub use spiral::{SpiralIndex, Spiral, slots_in_ring, total_slots_through, spiral_to_coord, coord_to_spiral};
-pub use spiral3d::{Spiral3DIndex, Spiral3D, slots_in_shell, total_slots_through_shell, spiral3d_to_coord, coord_to_spiral3d};
-pub use neighbors::{Neighbors, are_neighbors, count_present_neighbors};
-pub use gap_and_wrap::{Direction, Connection, theoretical_neighbor, ghost_target, compute_all_connections, is_bidirectional};
+pub use neighbors::{are_neighbors, count_present_neighbors, Neighbors};
+pub use spiral::{
+    coord_to_spiral, slots_in_ring, spiral_to_coord, total_slots_through, Spiral, SpiralIndex,
+};
+pub use spiral3d::{
+    coord_to_spiral3d, slots_in_shell, spiral3d_to_coord, total_slots_through_shell, Spiral3D,
+    Spiral3DIndex,
+};
 
 /// Total number of connections per node (invariant: always 20)
 pub const CONNECTIONS_PER_NODE: usize = 20;

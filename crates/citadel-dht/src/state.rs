@@ -1,7 +1,7 @@
 //! DHT state management.
 
+use crate::{DhtEntry, DhtKey, DhtValue};
 use std::collections::HashMap;
-use crate::{DhtKey, DhtEntry, DhtValue};
 
 /// Local DHT state.
 ///
@@ -76,7 +76,9 @@ impl DhtState {
 
     /// Get entries newer than a timestamp.
     pub fn entries_since(&self, timestamp: u64) -> impl Iterator<Item = &DhtEntry> {
-        self.entries.values().filter(move |e| e.timestamp > timestamp)
+        self.entries
+            .values()
+            .filter(move |e| e.timestamp > timestamp)
     }
 
     /// Number of entries.
@@ -102,9 +104,9 @@ impl DhtState {
     /// Iterate with prefix filter.
     /// Note: This is O(n) - use sparingly.
     pub fn iter_prefix<'a>(&'a self, prefix_bytes: &'a [u8]) -> impl Iterator<Item = &'a DhtEntry> {
-        self.entries.values().filter(move |e| {
-            e.key.0.starts_with(prefix_bytes)
-        })
+        self.entries
+            .values()
+            .filter(move |e| e.key.0.starts_with(prefix_bytes))
     }
 }
 
@@ -173,7 +175,10 @@ mod tests {
         // key1 should keep state1's value (0 updates from key1)
         assert_eq!(updated, 1);
         assert_eq!(state1.len(), 3);
-        assert_eq!(state1.get(&key1).unwrap().value.as_str(), Some("state1-new"));
+        assert_eq!(
+            state1.get(&key1).unwrap().value.as_str(),
+            Some("state1-new")
+        );
         assert_eq!(state1.get(&key3).unwrap().value.as_str(), Some("state2"));
     }
 

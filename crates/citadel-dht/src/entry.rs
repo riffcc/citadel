@@ -108,12 +108,20 @@ impl DhtEntry {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
-        Self { key, value, timestamp }
+        Self {
+            key,
+            value,
+            timestamp,
+        }
     }
 
     /// Create an entry with explicit timestamp.
     pub fn with_timestamp(key: DhtKey, value: DhtValue, timestamp: u64) -> Self {
-        Self { key, value, timestamp }
+        Self {
+            key,
+            value,
+            timestamp,
+        }
     }
 
     /// Check if this entry is newer than another.

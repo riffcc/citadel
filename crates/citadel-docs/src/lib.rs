@@ -66,7 +66,7 @@
 
 use citadel_crdt::{ContentId, TotalMerge};
 use citadel_spore::{Range256, Spore, U256};
-use redb::{Database, ReadableTable, ReadableDatabase, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{de::DeserializeOwned, Serialize};
 use std::marker::PhantomData;
 use std::path::Path;
@@ -183,10 +183,7 @@ impl DocumentStore {
         // Rebuild HaveList from existing documents
         let have_list = Self::rebuild_havelist(&db)?;
 
-        debug!(
-            docs = have_list.range_count(),
-            "Opened document store"
-        );
+        debug!(docs = have_list.range_count(), "Opened document store");
 
         Ok(Self {
             db: Arc::new(db),
@@ -239,8 +236,7 @@ impl DocumentStore {
         let write_txn = self.db.begin_write()?;
         let changed = {
             // Open table by TYPE_PREFIX (one table per document type)
-            let table_def: TableDefinition<&[u8; 32], &[u8]> =
-                TableDefinition::new(D::TYPE_PREFIX);
+            let table_def: TableDefinition<&[u8; 32], &[u8]> = TableDefinition::new(D::TYPE_PREFIX);
             let mut table = write_txn.open_table(table_def)?;
 
             // Check for existing document
@@ -286,8 +282,7 @@ impl DocumentStore {
     /// Get a document by content ID.
     pub fn get<D: Document>(&self, content_id: &ContentId) -> Result<Option<D>> {
         let key_bytes: [u8; 32] = *content_id.as_bytes();
-        let table_def: TableDefinition<&[u8; 32], &[u8]> =
-            TableDefinition::new(D::TYPE_PREFIX);
+        let table_def: TableDefinition<&[u8; 32], &[u8]> = TableDefinition::new(D::TYPE_PREFIX);
 
         let read_txn = self.db.begin_read()?;
         let table = match read_txn.open_table(table_def) {
@@ -309,8 +304,7 @@ impl DocumentStore {
     /// Check if a document exists.
     pub fn contains<D: Document>(&self, content_id: &ContentId) -> Result<bool> {
         let key_bytes: [u8; 32] = *content_id.as_bytes();
-        let table_def: TableDefinition<&[u8; 32], &[u8]> =
-            TableDefinition::new(D::TYPE_PREFIX);
+        let table_def: TableDefinition<&[u8; 32], &[u8]> = TableDefinition::new(D::TYPE_PREFIX);
 
         let read_txn = self.db.begin_read()?;
         let table = match read_txn.open_table(table_def) {
@@ -325,8 +319,7 @@ impl DocumentStore {
 
     /// List all documents of a given type.
     pub fn list<D: Document>(&self) -> Result<Vec<D>> {
-        let table_def: TableDefinition<&[u8; 32], &[u8]> =
-            TableDefinition::new(D::TYPE_PREFIX);
+        let table_def: TableDefinition<&[u8; 32], &[u8]> = TableDefinition::new(D::TYPE_PREFIX);
 
         let read_txn = self.db.begin_read()?;
         let table = match read_txn.open_table(table_def) {
@@ -352,8 +345,7 @@ impl DocumentStore {
     /// not physical deletion. Use with caution.
     pub fn delete<D: Document>(&mut self, content_id: &ContentId) -> Result<()> {
         let key_bytes: [u8; 32] = *content_id.as_bytes();
-        let table_def: TableDefinition<&[u8; 32], &[u8]> =
-            TableDefinition::new(D::TYPE_PREFIX);
+        let table_def: TableDefinition<&[u8; 32], &[u8]> = TableDefinition::new(D::TYPE_PREFIX);
 
         let write_txn = self.db.begin_write()?;
         {
@@ -381,8 +373,7 @@ impl DocumentStore {
 
     /// Apply a batch of document operations atomically.
     pub fn batch<D: Document>(&mut self, ops: Vec<BatchOp<D>>) -> Result<()> {
-        let table_def: TableDefinition<&[u8; 32], &[u8]> =
-            TableDefinition::new(D::TYPE_PREFIX);
+        let table_def: TableDefinition<&[u8; 32], &[u8]> = TableDefinition::new(D::TYPE_PREFIX);
 
         let write_txn = self.db.begin_write()?;
         {

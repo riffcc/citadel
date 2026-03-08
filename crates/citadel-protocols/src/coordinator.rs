@@ -287,7 +287,11 @@ impl PeerCoordinator {
     /// // They will have opposite Alice/Bob roles automatically
     /// ```
     #[must_use]
-    pub fn symmetric(keypair: KeyPair, counterparty_key: PublicKey, config: CoordinatorConfig) -> Self {
+    pub fn symmetric(
+        keypair: KeyPair,
+        counterparty_key: PublicKey,
+        config: CoordinatorConfig,
+    ) -> Self {
         let protocol = if let Some(ref msg) = config.commitment_message {
             AdaptiveTGP::symmetric_with_commitment(
                 keypair,
@@ -663,7 +667,11 @@ mod tests {
 
         // Rate should have increased
         let burst_rate = alice.current_rate();
-        assert!(burst_rate > 1, "Rate should increase in burst mode: {}", burst_rate);
+        assert!(
+            burst_rate > 1,
+            "Rate should increase in burst mode: {}",
+            burst_rate
+        );
 
         // Disable burst mode
         alice.set_active(false);
@@ -789,7 +797,10 @@ mod tests {
 
     #[test]
     fn test_coordinator_state_display() {
-        assert_eq!(format!("{}", CoordinatorState::Coordinating), "Coordinating");
+        assert_eq!(
+            format!("{}", CoordinatorState::Coordinating),
+            "Coordinating"
+        );
         assert_eq!(format!("{}", CoordinatorState::Coordinated), "Coordinated");
         assert_eq!(format!("{}", CoordinatorState::Aborted), "Aborted");
     }

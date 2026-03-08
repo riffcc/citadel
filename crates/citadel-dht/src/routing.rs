@@ -2,8 +2,8 @@
 //!
 //! Maps keys to slots and provides greedy geometric routing.
 
-use citadel_topology::{HexCoord, Spiral3DIndex, spiral3d_to_coord};
 use crate::DhtKey;
+use citadel_topology::{spiral3d_to_coord, HexCoord, Spiral3DIndex};
 
 /// Map a DHT key to a slot index in the mesh.
 ///
@@ -76,11 +76,7 @@ pub fn estimate_hops(from: HexCoord, key: &DhtKey, mesh_size: u64) -> u64 {
 /// A node is responsible if:
 /// 1. It owns the target slot, OR
 /// 2. The target slot doesn't exist yet and this is the closest node
-pub fn is_responsible_for(
-    coord: HexCoord,
-    key: &DhtKey,
-    mesh_size: u64,
-) -> bool {
+pub fn is_responsible_for(coord: HexCoord, key: &DhtKey, mesh_size: u64) -> bool {
     let target = key_to_coord(key, mesh_size);
     coord == target
 }
@@ -143,7 +139,11 @@ mod tests {
 
         // Should reach target or get very close
         let final_dist = current.distance(&target);
-        assert!(final_dist <= 1, "Should reach target or adjacent, got dist {}", final_dist);
+        assert!(
+            final_dist <= 1,
+            "Should reach target or adjacent, got dist {}",
+            final_dist
+        );
     }
 
     #[test]
@@ -153,7 +153,9 @@ mod tests {
         let target = key_to_coord(&key, mesh_size);
 
         assert!(is_responsible_for(target, &key, mesh_size));
-        assert!(!is_responsible_for(HexCoord::ORIGIN, &key, mesh_size) || target == HexCoord::ORIGIN);
+        assert!(
+            !is_responsible_for(HexCoord::ORIGIN, &key, mesh_size) || target == HexCoord::ORIGIN
+        );
     }
 
     #[test]
@@ -163,6 +165,11 @@ mod tests {
 
         let hops = estimate_hops(HexCoord::ORIGIN, &key, mesh_size);
         // For a mesh of 1000 nodes (roughly 10 shells), max distance should be ~10
-        assert!(hops <= 20, "Hops {} seems too high for mesh size {}", hops, mesh_size);
+        assert!(
+            hops <= 20,
+            "Hops {} seems too high for mesh size {}",
+            hops,
+            mesh_size
+        );
     }
 }

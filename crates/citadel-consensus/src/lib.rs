@@ -27,13 +27,13 @@
 //!
 //! Security scales with network size. Bootstrap is trusted, mature network is BFT.
 
+mod convergence;
 mod threshold;
 mod validity;
-mod convergence;
 
+pub use convergence::{ConvergenceState, Correction, Tension};
 pub use threshold::validation_threshold;
-pub use validity::{SlotValidity, NodeValidity};
-pub use convergence::{Tension, Correction, ConvergenceState};
+pub use validity::{NodeValidity, SlotValidity};
 
 #[cfg(test)]
 mod tests {
@@ -41,13 +41,13 @@ mod tests {
 
     #[test]
     fn threshold_scales_correctly() {
-        assert_eq!(validation_threshold(0), 0);   // Origin
-        assert_eq!(validation_threshold(1), 1);   // Need the one neighbor
-        assert_eq!(validation_threshold(2), 2);   // Need both
-        assert_eq!(validation_threshold(3), 2);   // 2/3
-        assert_eq!(validation_threshold(6), 4);   // 4/6
-        assert_eq!(validation_threshold(10), 6);  // 6/10
-        assert_eq!(validation_threshold(15), 9);  // 9/15
+        assert_eq!(validation_threshold(0), 0); // Origin
+        assert_eq!(validation_threshold(1), 1); // Need the one neighbor
+        assert_eq!(validation_threshold(2), 2); // Need both
+        assert_eq!(validation_threshold(3), 2); // 2/3
+        assert_eq!(validation_threshold(6), 4); // 4/6
+        assert_eq!(validation_threshold(10), 6); // 6/10
+        assert_eq!(validation_threshold(15), 9); // 9/15
         assert_eq!(validation_threshold(20), 11); // 11/20 - full BFT
     }
 }

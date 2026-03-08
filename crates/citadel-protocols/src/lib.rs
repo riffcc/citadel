@@ -70,5 +70,6 @@ pub use spore_sync::{ContentBlock, ContentType, SporeSync, SporeSyncManager, Spo
 // Re-export core TGP types for convenience
 pub use two_generals::{
     crypto::{KeyPair, PublicKey, Signature},
-    Commitment, Decision, DoubleProof, Message, MessagePayload, Party, ProtocolState as TgpState, QuadProof, TripleProof,
+    Commitment, Decision, DoubleProof, Message, MessagePayload, Party, ProtocolState as TgpState,
+    QuadProof, TripleProof,
 };

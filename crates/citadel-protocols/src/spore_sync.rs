@@ -142,7 +142,9 @@ impl SporeSync {
         self.content.insert(hash, block);
 
         // Create a single-value range for this hash
-        let end = hash_u256.checked_add(&U256::from_u64(1)).unwrap_or(U256::MAX);
+        let end = hash_u256
+            .checked_add(&U256::from_u64(1))
+            .unwrap_or(U256::MAX);
         let range = Range256::new(hash_u256, end);
         let range_spore = Spore::from_range(range);
 
@@ -152,8 +154,12 @@ impl SporeSync {
         // Update WantList SPORE - remove this content (we no longer want what we have)
         self.sync_state.my_want = self.sync_state.my_want.subtract(&range_spore);
 
-        trace!("Added content {}..., HaveList now has {} ranges, WantList has {} ranges",
-               hex::encode(&hash[..8]), self.sync_state.my_have.range_count(), self.sync_state.my_want.range_count());
+        trace!(
+            "Added content {}..., HaveList now has {} ranges, WantList has {} ranges",
+            hex::encode(&hash[..8]),
+            self.sync_state.my_have.range_count(),
+            self.sync_state.my_want.range_count()
+        );
     }
 
     /// Check if we have content with the given hash.
@@ -253,7 +259,9 @@ impl SporeSync {
         let hash_u256 = U256::from_be_bytes(&hash);
         let range = Range256::new(
             hash_u256,
-            hash_u256.checked_add(&U256::from_u64(1)).unwrap_or(U256::MAX),
+            hash_u256
+                .checked_add(&U256::from_u64(1))
+                .unwrap_or(U256::MAX),
         );
         // Remove this range from our WantList
         self.sync_state.my_want = self.sync_state.my_want.subtract(&Spore::from_range(range));
@@ -367,7 +375,9 @@ impl SporeSyncManager {
 
     /// Get SPORE message to send to a peer.
     pub fn create_spore_message(&self, peer_id: &U256) -> Option<SporeMessage> {
-        self.peers.get(peer_id).map(|sync| sync.create_spore_message())
+        self.peers
+            .get(peer_id)
+            .map(|sync| sync.create_spore_message())
     }
 
     /// Receive content block from a peer.
@@ -551,7 +561,8 @@ mod tests {
 
         // Alice starts with some content
         for i in 0..10 {
-            let block = ContentBlock::new(ContentType::Release, format!("release {}", i).into_bytes());
+            let block =
+                ContentBlock::new(ContentType::Release, format!("release {}", i).into_bytes());
             alice.add_content(block);
         }
 

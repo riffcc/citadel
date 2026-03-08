@@ -6,7 +6,7 @@
 //!
 //! We extend to 3D with a layer coordinate for the mesh topology.
 
-use std::ops::{Add, Sub, Neg};
+use std::ops::{Add, Neg, Sub};
 
 /// A position in 3D hexagonal space.
 ///
@@ -67,18 +67,18 @@ impl HexCoord {
 
     /// The six planar neighbor directions.
     pub const PLANAR_DIRECTIONS: [Self; 6] = [
-        Self { q: 1, r: 0, z: 0 },   // East
-        Self { q: 1, r: -1, z: 0 },  // Northeast
-        Self { q: 0, r: -1, z: 0 },  // Northwest
-        Self { q: -1, r: 0, z: 0 },  // West
-        Self { q: -1, r: 1, z: 0 },  // Southwest
-        Self { q: 0, r: 1, z: 0 },   // Southeast
+        Self { q: 1, r: 0, z: 0 },  // East
+        Self { q: 1, r: -1, z: 0 }, // Northeast
+        Self { q: 0, r: -1, z: 0 }, // Northwest
+        Self { q: -1, r: 0, z: 0 }, // West
+        Self { q: -1, r: 1, z: 0 }, // Southwest
+        Self { q: 0, r: 1, z: 0 },  // Southeast
     ];
 
     /// The two vertical directions.
     pub const VERTICAL_DIRECTIONS: [Self; 2] = [
-        Self { q: 0, r: 0, z: 1 },   // Up
-        Self { q: 0, r: 0, z: -1 },  // Down
+        Self { q: 0, r: 0, z: 1 },  // Up
+        Self { q: 0, r: 0, z: -1 }, // Down
     ];
 
     /// Get all six planar neighbors.

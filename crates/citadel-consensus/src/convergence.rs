@@ -20,8 +20,8 @@
 //! - Cannot forge honest neighbors' acknowledgments
 //! - With 6 Byzantine out of 20, honest node still has 14 > 11 potential bindings
 
-use crate::validity::{NodeId, Epoch, PortBinding, select_winner};
-use crate::threshold::{validation_threshold, MAX_NEIGHBORS, FULL_THRESHOLD};
+use crate::threshold::{validation_threshold, FULL_THRESHOLD, MAX_NEIGHBORS};
+use crate::validity::{select_winner, Epoch, NodeId, PortBinding};
 use citadel_topology::SpiralIndex;
 
 /// Tension in the mesh - a node that doesn't fit the topology.

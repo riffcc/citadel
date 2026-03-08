@@ -19,8 +19,8 @@
 //! For slot N with neighbor M, the port `toward(M, N)` binds to AT MOST ONE node.
 //! Binding requires bidirectional mutual signatures (both endpoints sign).
 
-use citadel_topology::{HexCoord, SpiralIndex, Neighbors};
 use crate::threshold::validation_threshold;
+use citadel_topology::{HexCoord, Neighbors, SpiralIndex};
 
 /// A cryptographic node identifier (e.g., public key hash).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -62,19 +62,11 @@ impl PortBinding {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlotValidity {
     /// Node has sufficient valid port bindings to occupy this slot
-    Valid {
-        bindings: usize,
-        threshold: usize,
-    },
+    Valid { bindings: usize, threshold: usize },
     /// Node doesn't have enough bindings
-    Insufficient {
-        bindings: usize,
-        needed: usize,
-    },
+    Insufficient { bindings: usize, needed: usize },
     /// Node is being challenged by another with better hash
-    Challenged {
-        challenger: NodeId,
-    },
+    Challenged { challenger: NodeId },
 }
 
 /// Select winner among contenders using deterministic hash.

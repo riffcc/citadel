@@ -182,10 +182,7 @@ pub struct Connection {
 /// This guarantees exactly min(20, N-1) unique neighbors per node.
 /// The wrapping maintains spatial balance: neighbors form a balanced shell
 /// even when the mesh is small.
-pub fn compute_all_connections(
-    occupied: &HashSet<HexCoord>,
-    coord: HexCoord,
-) -> Vec<Connection> {
+pub fn compute_all_connections(occupied: &HashSet<HexCoord>, coord: HexCoord) -> Vec<Connection> {
     let mut chosen: HashSet<HexCoord> = HashSet::new();
     chosen.insert(coord); // never connect to self
 
@@ -253,9 +250,7 @@ fn wrap_opposite(
         .iter()
         .filter(|c| !already_chosen.contains(c))
         .min_by_key(|c| {
-            let proj = (c.q - origin.q) * d.q
-                + (c.r - origin.r) * d.r
-                + (c.z - origin.z) * d.z;
+            let proj = (c.q - origin.q) * d.q + (c.r - origin.r) * d.r + (c.z - origin.z) * d.z;
             // Most negative projection first (antipodal edge).
             // Tie-break: prefer closer nodes (smaller shell distance).
             let shell = shell_distance(origin, **c);
@@ -322,8 +317,12 @@ mod tests {
         // All theoretical neighbors should be in the 20-neighbor set
         for d in Direction::all() {
             let neighbor = theoretical_neighbor(origin, d);
-            assert!(all_neighbors.contains(&neighbor),
-                "Direction {:?} gives {:?} which is not in neighbors", d, neighbor);
+            assert!(
+                all_neighbors.contains(&neighbor),
+                "Direction {:?} gives {:?} which is not in neighbors",
+                d,
+                neighbor
+            );
         }
     }
 
@@ -378,7 +377,7 @@ mod tests {
     fn compute_all_connections_sparse_mesh() {
         let mut occupied = HashSet::new();
         let a = HexCoord::ORIGIN;
-        let b = HexCoord::new(5, 0, 0);  // Far away
+        let b = HexCoord::new(5, 0, 0); // Far away
 
         occupied.insert(a);
         occupied.insert(b);
@@ -556,7 +555,10 @@ mod tests {
         // At N=40, some asymmetry is expected.
         // At N=400+, asymmetry should approach zero.
         let stats_20 = mesh_stats(20);
-        assert_eq!(stats_20.2, 0, "N=20 (fully connected) should have zero asymmetry");
+        assert_eq!(
+            stats_20.2, 0,
+            "N=20 (fully connected) should have zero asymmetry"
+        );
 
         // N=40: asymmetry is expected, just verify it's bounded.
         let stats_40 = mesh_stats(40);
