@@ -610,12 +610,21 @@ mod tests {
         println!("Swarm3 duty at height {}: {:?}", swarm3.height(), swarm3.vdf_duty());
     }
 
+    #[cfg(feature = "heavy_tests")]
     #[test]
-    fn test_cooperative_vdf_advancement() {
+    fn test_cooperative_vdf_advancement_heavy() {
+        run_test_cooperative_vdf_advancement(5, 20);
+    }
+    #[cfg(not(feature = "heavy_tests"))]
+    #[test]
+    fn test_cooperative_vdf_advancement_light() {
+        run_test_cooperative_vdf_advancement(3, 10);
+    }
+    fn run_test_cooperative_vdf_advancement(node_count: usize, adv_count: u64) {
         let genesis_seed = [42u8; 32];
 
         // Create 5 nodes
-        let keys: Vec<SigningKey> = (0..5)
+        let keys: Vec<SigningKey> = (0..node_count)
             .map(|_| SigningKey::generate(&mut OsRng))
             .collect();
 
@@ -641,7 +650,7 @@ mod tests {
         }
 
         // Each node claims a slot
-        let claims: Vec<AnchoredSlotClaim> = (1..5)
+        let claims: Vec<AnchoredSlotClaim> = (1..node_count)
             .map(|i| swarms[i].claim_slot(i as u64))
             .collect();
 
@@ -655,10 +664,10 @@ mod tests {
         // Now cooperatively advance VDF 20 times
         let start = std::time::Instant::now();
 
-        for _ in 0..20 {
+        for _ in 0..adv_count {
             // Find who has duty
             let current_height = swarms[0].height();
-            let duty_slot = (current_height as usize) % 5;
+            let duty_slot = (current_height as usize) % node_count;
 
             // That swarm computes
             let link = swarms[duty_slot].compute_vdf_step()
@@ -677,11 +686,11 @@ mod tests {
 
         // All swarms should be at height 20
         for (i, swarm) in swarms.iter().enumerate() {
-            assert_eq!(swarm.height(), 20, "Swarm {} should be at height 20", i);
+            assert_eq!(swarm.height(), adv_count, "Swarm {} should be at height {}", i, adv_count);
         }
 
-        println!("5 nodes cooperatively computed 20 VDF steps in {:?}", elapsed);
-        println!("Average: {:?} per step", elapsed / 20);
+        println!("{} nodes cooperatively computed 20 VDF steps in {:?}", node_count, elapsed);
+        println!("Average: {:?} per step", elapsed / adv_count as u32);
     }
 
     #[test]
@@ -814,14 +823,23 @@ mod tests {
         println!("\n=== Deterministic Tie PASSED ===\n");
     }
 
+    #[cfg(feature = "heavy_tests")]
     #[test]
-    fn test_50_nodes_swarm_formation() {
+    fn test_n_nodes_swarm_formation_heavy() {
+        run_test_n_nodes_swarm_formation(50);
+    }
+    #[cfg(not(feature = "heavy_tests"))]
+    #[test]
+    fn test_n_nodes_swarm_formation_light() {
+        run_test_n_nodes_swarm_formation(5);
+    }
+    fn run_test_n_nodes_swarm_formation(node_count: usize) {
         let genesis_seed = [42u8; 32];
 
-        println!("\n=== 50 Node Swarm Formation ===\n");
+        println!("\n=== {} Node Swarm Formation ===\n", node_count);
 
         // Create 50 nodes
-        let keys: Vec<SigningKey> = (0..50)
+        let keys: Vec<SigningKey> = (0..node_count)
             .map(|_| SigningKey::generate(&mut OsRng))
             .collect();
 
@@ -840,7 +858,7 @@ mod tests {
 
         let start = Instant::now();
 
-        // Other 49 nodes join
+        // Other N-1 nodes join
         for (i, key) in keys.iter().enumerate().skip(1) {
             let chain = swarms[0].chain_links().to_vec();
             let mut swarm = SwarmState::join_swarm(genesis_seed, key.clone(), chain)
@@ -862,8 +880,15 @@ mod tests {
 
             swarms.push(swarm);
 
+            let advance_period = if node_count > 20 {
+                node_count / 10
+            } else if node_count > 10 {
+                node_count / 3
+            } else {
+                node_count / 2
+            };
             // Cooperatively advance VDF periodically
-            if i % 10 == 0 {
+            if i % advance_period == 0 {
                 // Find duty holder
                 let height = swarms[0].height();
                 let active_slots = swarms[0].active_slot_count();
@@ -885,7 +910,7 @@ mod tests {
 
         let formation_time = start.elapsed();
 
-        // Verify all 50 nodes have unique slots
+        // Verify all the nodes have unique slots
         let mut claimed_slots: HashSet<u64> = HashSet::new();
         for (i, swarm) in swarms.iter().enumerate() {
             if let Some(slot) = swarm.our_slot() {
@@ -896,17 +921,17 @@ mod tests {
             }
         }
 
-        assert_eq!(claimed_slots.len(), 50, "All 50 nodes should have slots");
+        assert_eq!(claimed_slots.len(), node_count, "All {} nodes should have slots", node_count);
 
-        // Verify slots are contiguous 0..50
-        for slot in 0..50 {
-            assert!(claimed_slots.contains(&slot), "Missing slot {}", slot);
+        // Verify slots are contiguous 0..node_count
+        for slot in 0..node_count {
+            assert!(claimed_slots.contains(&(slot as u64)), "Missing slot {}", slot);
         }
 
         println!("Formation time: {:?}", formation_time);
         println!("Final chain height: {}", swarms[0].height());
-        println!("All 50 nodes claimed unique slots 0-49");
+        println!("All {} nodes claimed unique slots 0-{}", node_count, node_count - 1);
 
-        println!("\n=== 50 Node Swarm Formation PASSED ===\n");
+        println!("\n=== {} Node Swarm Formation PASSED ===\n", node_count);
     }
 }

@@ -32,6 +32,8 @@ server = [
     "dep:citadel-docs",
 ]
 
+[features]
+heavy_tests = []
 [dependencies]
 # Citadel crates (always available)
 citadel-topology = { path = "../citadel-topology" }

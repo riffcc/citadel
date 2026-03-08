@@ -565,6 +565,7 @@ fn test_non_participating_peers_ejected() {
 // TEST: No CPU/RAM Leaks in Mesh Operations
 // ============================================================================
 
+#[cfg(feature = "heavy_tests")]
 #[test]
 fn test_no_resource_leaks() {
     // Measure baseline memory
