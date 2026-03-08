@@ -698,6 +698,7 @@ dependencies = [
  "citadel-protocols",
  "citadel-spore",
  "citadel-topology",
+ "citadel-ygg",
  "clap",
  "dirs",
  "ed25519-dalek",
@@ -839,6 +840,18 @@ dependencies = [
  "tracing-subscriber",
  "wgpu",
  "winit",
+]
+
+[[package]]
+name = "citadel-ygg"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.17",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

@@ -58,6 +58,7 @@ pub async fn test_16_node_convergence() -> (bool, Duration, usize) {
             listen_addr,
             None,
             entry_peers,
+            None,
             storage,
             doc_store,
         ));

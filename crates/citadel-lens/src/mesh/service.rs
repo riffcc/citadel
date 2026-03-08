@@ -14,6 +14,7 @@ use crate::liveness::{LivenessManager, MeshVouch, PropagationDecision};
 use crate::models::FeaturedRelease;
 use crate::storage::Storage;
 use crate::vdf_race::{claim_has_priority, AnchoredSlotClaim, VdfLink, VdfRace};
+use citadel_ygg::{find_peer_by_remote_ip, query_peers, YggMetricsStore};
 use citadel_docs::DocumentStore;
 use citadel_protocols::{
     CoordinatorConfig, FloodRateConfig, KeyPair, Message as TgpMessage, MessagePayload,
@@ -49,6 +50,8 @@ pub struct MeshService {
     announce_addr: Option<SocketAddr>,
     /// Bootstrap peers to connect to
     entry_peers: Vec<String>,
+    /// Optional Yggdrasil admin socket for overlay-aware entry-peer routing.
+    ygg_admin_socket: Option<String>,
     /// Shared storage for replication
     storage: Arc<Storage>,
     /// Document store for CRDT documents with SPORE sync (featured releases, etc.)
@@ -70,6 +73,8 @@ pub struct MeshService {
     claiming_in_progress: std::sync::atomic::AtomicBool,
     /// Traffic statistics for aggregate logging
     traffic_stats: Arc<super::state::TrafficStats>,
+    /// Cached Yggdrasil link metrics from admin socket queries.
+    ygg_metrics: Arc<RwLock<YggMetricsStore>>,
 }
 
 impl MeshService {
@@ -82,11 +87,33 @@ impl MeshService {
         }
     }
 
+    async fn query_ygg_overlay_target(&self, resolved_addrs: &[SocketAddr]) -> Option<SocketAddr> {
+        let socket_path = self.ygg_admin_socket.as_deref()?;
+        let peers = match query_peers(socket_path).await {
+            Ok(peers) => peers,
+            Err(err) => {
+                debug!("ygg query failed for {}: {}", socket_path, err);
+                return None;
+            }
+        };
+
+        self.ygg_metrics.write().await.update(peers.clone());
+
+        for resolved_addr in resolved_addrs {
+            if let Some(ygg_addr) = find_peer_by_remote_ip(&peers, &resolved_addr.ip()) {
+                return Some(SocketAddr::new(std::net::IpAddr::V6(ygg_addr), resolved_addr.port()));
+            }
+        }
+
+        None
+    }
+
     /// Create a new mesh service
     pub fn new(
         listen_addr: SocketAddr,
         announce_addr: Option<SocketAddr>,
         entry_peers: Vec<String>,
+        ygg_admin_socket: Option<String>,
         storage: Arc<Storage>,
         doc_store: DocumentStore,
     ) -> Self {
@@ -127,6 +154,7 @@ impl MeshService {
             listen_addr,
             announce_addr,
             entry_peers,
+            ygg_admin_socket,
             storage,
             doc_store: Arc::new(tokio::sync::RwLock::new(doc_store)),
             state: Arc::new(RwLock::new(MeshState {
@@ -169,6 +197,7 @@ impl MeshService {
             claiming_in_progress: std::sync::atomic::AtomicBool::new(false),
             // Traffic statistics for aggregate logging (instead of per-packet spam)
             traffic_stats: Arc::new(super::state::TrafficStats::new()),
+            ygg_metrics: Arc::new(RwLock::new(YggMetricsStore::new())),
         }
     }
 
@@ -2181,12 +2210,23 @@ impl MeshService {
                 continue;
             }
 
+            let mut candidate_addrs = resolved_addrs.clone();
+            if let Some(ygg_addr) = self.query_ygg_overlay_target(&resolved_addrs).await {
+                if !candidate_addrs.contains(&ygg_addr) {
+                    info!(
+                        "Entry peer {} has Ygg overlay path {}; preferring overlay dial",
+                        peer_addr, ygg_addr
+                    );
+                    candidate_addrs.insert(0, ygg_addr);
+                }
+            }
+
             // Try each resolved address (IPv4 preferred) with 5s timeout
             let mut peer_connected = false;
-            let addr_count = resolved_addrs.len();
+            let addr_count = candidate_addrs.len();
             let connect_timeout = std::time::Duration::from_secs(5);
 
-            for resolved_addr in resolved_addrs {
+            for resolved_addr in candidate_addrs {
                 debug!("Trying {} -> {}", peer_addr, resolved_addr);
 
                 match tokio::time::timeout(connect_timeout, TcpStream::connect(resolved_addr)).await
