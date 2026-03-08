@@ -19,6 +19,7 @@ members = [
     "crates/citadel-logging",
     "crates/citadel-metrics",
     "crates/citadel-utils",
+    "crates/citadel-ygg",
     "crates/citadel-integration-tests",
 ]
 
