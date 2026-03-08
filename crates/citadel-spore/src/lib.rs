@@ -50,7 +50,9 @@ pub struct U256 {
 
 impl U256 {
     /// Zero value
-    pub const ZERO: U256 = U256 { limbs: [0, 0, 0, 0] };
+    pub const ZERO: U256 = U256 {
+        limbs: [0, 0, 0, 0],
+    };
 
     /// Maximum value (2^256 - 1)
     pub const MAX: U256 = U256 {

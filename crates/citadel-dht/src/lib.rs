@@ -15,14 +15,14 @@
 //! multiple peers, the entry with the highest timestamp wins.
 
 mod entry;
-mod state;
-mod routing;
 pub mod peer;
+mod routing;
+mod state;
 
-pub use entry::{DhtKey, DhtEntry, DhtValue};
-pub use state::DhtState;
+pub use entry::{DhtEntry, DhtKey, DhtValue};
+pub use peer::{KnowledgeMode, NeighborType, PeerId, PeerInfo, PeerKnowledge, PeerSpore};
 pub use routing::{key_to_slot, route_to_key};
-pub use peer::{PeerId, PeerInfo, PeerKnowledge, PeerSpore, KnowledgeMode, NeighborType};
+pub use state::DhtState;
 
 /// Hash a string key to a DHT key using Blake3.
 pub fn hash_key(data: &[u8]) -> DhtKey {

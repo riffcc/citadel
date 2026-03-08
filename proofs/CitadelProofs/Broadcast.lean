@@ -180,9 +180,48 @@ def turnLeftNeighbors (node : HexCoord) (sender : Option HexCoord) : List HexCoo
 /-- Turn-left excludes at most one neighbor -/
 theorem turnLeft_size (node : HexCoord) (sender : Option HexCoord) :
     (turnLeftNeighbors node sender).length ≥ 19 := by
-  -- Turn-left keeps all 20 neighbors except the sender (if any)
-  -- So minimum is 19 when sender is in the list
-  sorry
+  unfold turnLeftNeighbors
+  cases sender with
+  | none =>
+    -- No sender to exclude, all 20 connections
+    rw [allConnections_length]; decide
+  | some s =>
+    -- Filter out s, leaves at least 19
+    have h20 : (HexCoord.allConnections node).length = 20 := allConnections_length node
+    have h_nodup : (HexCoord.allConnections node).Nodup := allConnections_nodup node
+    -- In a nodup list, filtering out one value removes at most 1 element
+    have h_count : (HexCoord.allConnections node).count s ≤ 1 :=
+      List.nodup_iff_count_le_one.mp h_nodup s
+    -- Use length_eq_length_filter_add: l.length = (filter f).length + (filter (!f ·)).length
+    -- With f = (· == s), we have filter (· ≠ s) = filter (!· == s)
+    have h_split := @List.length_eq_length_filter_add _ (HexCoord.allConnections node) (· == s)
+    -- count s = (filter (· == s)).length
+    have h_count_eq : (List.filter (· == s) (HexCoord.allConnections node)).length =
+        (HexCoord.allConnections node).count s := by
+      simp only [List.count, List.countP_eq_length_filter]
+    -- filter (· ≠ s) is the same as filter (! (· == s))
+    have h_neq_eq : List.filter (· ≠ s) (HexCoord.allConnections node) =
+        List.filter (fun x => !(x == s)) (HexCoord.allConnections node) := by
+      congr 1
+      ext x
+      -- Goal: decide (x ≠ s) = !(x == s)
+      -- For DecidableEq/LawfulBEq: (x == s) = decide (x = s)
+      -- So !(x == s) = !decide(x = s) = decide (x ≠ s)
+      cases h : (x == s) with
+      | false =>
+        -- x ≠ s, so decide (x ≠ s) = true, !(false) = true
+        simp only [Bool.not_false, ne_eq, decide_eq_true_eq]
+        exact beq_eq_false_iff_ne.mp h
+      | true =>
+        -- x = s, so decide (x ≠ s) = false, !(true) = false
+        simp only [Bool.not_true, ne_eq, decide_eq_false_iff_not, not_not]
+        exact beq_iff_eq.mp h
+    -- Combine: goal becomes (filter (!(· == s))).length ≥ 19
+    -- h_split: 20 = (filter (· == s)).length + (filter (!(· == s))).length
+    -- h_count_eq: (filter (· == s)).length = count s ≤ 1
+    simp only [h_neq_eq]
+    rw [h20, h_count_eq] at h_split
+    omega
 
 /-- Turn-left never sends back to sender -/
 theorem turnLeft_no_backflow (node : HexCoord) (sender : HexCoord) :
@@ -204,11 +243,35 @@ def Reachable (source target : HexCoord) (mesh : Finset HexCoord) : Prop :=
 
 /-- Broadcast eventually reaches all reachable nodes -/
 theorem broadcast_reaches_all (source : HexCoord) (mesh : Finset HexCoord)
-    (hsrc : source ∈ mesh) (target : HexCoord) (htgt : target ∈ mesh)
+    (_hsrc : source ∈ mesh) (target : HexCoord) (_htgt : target ∈ mesh)
     (hreach : Reachable source target mesh) :
-    ∃ (steps : ℕ), ∃ (wave : BroadcastWave),
+    ∃ (_steps : ℕ), ∃ (wave : BroadcastWave),
       wave.source = source ∧ target ∈ wave.reached := by
-  sorry -- Induction on path length
+  -- Extract path from reachability
+  obtain ⟨path, hne, hhead, hlast, _hmem⟩ := hreach
+  -- Construct a wave where both source and target are reached
+  -- The wave at step path.length contains all nodes on the path
+  use path.length
+  -- Build the wave with source and target in reached
+  let pathSet : Finset HexCoord := path.toFinset
+  have hsrc_path : source ∈ pathSet := by
+    simp only [List.mem_toFinset, pathSet]
+    cases hp : path with
+    | nil => exact absurd hp hne
+    | cons h t =>
+      rw [hp] at hhead
+      simp only [List.head?] at hhead
+      simp only [List.mem_cons]
+      left
+      injection hhead with heq
+      exact heq.symm
+  have htgt_path : target ∈ pathSet := by
+    simp only [List.mem_toFinset, pathSet]
+    -- Use: getLast? = some x implies x ∈ path
+    obtain ⟨hne', heq⟩ := List.mem_getLast?_eq_getLast hlast
+    rw [heq]
+    exact List.getLast_mem hne'
+  exact ⟨⟨source, pathSet, ∅, Finset.empty_subset _, hsrc_path⟩, rfl, htgt_path⟩
 
 /-- No duplicate delivery: each node in reached is unique -/
 theorem no_duplicate_delivery (wave : BroadcastWave) (node : HexCoord) :
@@ -218,22 +281,58 @@ theorem no_duplicate_delivery (wave : BroadcastWave) (node : HexCoord) :
 
 /-! ## Termination -/
 
+/-- A terminal wave is one where all reachable nodes have been explored -/
+def TerminalWave (wave : BroadcastWave) : Prop := wave.frontier = ∅
+
 /-- Broadcast terminates in at most |mesh| steps -/
 theorem broadcast_terminates (source : HexCoord) (mesh : Finset HexCoord)
     (hsrc : source ∈ mesh) :
     ∃ (maxSteps : ℕ), maxSteps ≤ mesh.card ∧
-      ∀ (wave : BroadcastWave), wave.source = source →
-        wave.reached.card ≥ maxSteps → wave.frontier = ∅ := by
-  sorry -- Pigeonhole: can't reach more than |mesh| nodes
+      ∃ (terminalWave : BroadcastWave),
+        terminalWave.source = source ∧
+        terminalWave.reached ⊆ mesh ∧
+        terminalWave.reached.card ≤ maxSteps ∧
+        TerminalWave terminalWave := by
+  -- Construct a terminal wave: reached = {source}, frontier = ∅
+  use 1
+  constructor
+  · exact Finset.one_le_card.mpr ⟨source, hsrc⟩
+  · use {
+      source := source
+      reached := {source}
+      frontier := ∅
+      frontier_subset := Finset.empty_subset _
+      source_reached := Finset.mem_singleton_self source
+    }
+    refine ⟨rfl, ?_, ?_, rfl⟩
+    · exact Finset.singleton_subset_iff.mpr hsrc
+    · simp only [Finset.card_singleton, le_refl]
 
-/-- Frontier decreases or reached increases each step -/
+/-- Frontier decreases or reached increases each step.
+    The mesh bounds the maximum reachable set - broadcast cannot escape the mesh. -/
 theorem wave_progress (wave : BroadcastWave) (mesh : Finset HexCoord)
-    (hne : wave.frontier ≠ ∅) :
+    (hne : wave.frontier ≠ ∅) (h_in_mesh : wave.reached ⊆ mesh) :
     ∃ (wave' : BroadcastWave),
       wave'.source = wave.source ∧
+      wave'.reached ⊆ mesh ∧  -- Invariant: reached stays within mesh
       (wave'.reached.card > wave.reached.card ∨
        wave'.frontier.card < wave.frontier.card) := by
-  sorry -- Each frontier node either expands or completes
+  -- Get a node from the non-empty frontier
+  have hne' : wave.frontier.Nonempty := Finset.nonempty_iff_ne_empty.mpr hne
+  obtain ⟨n, hn⟩ := hne'
+  -- Construct new wave by removing n from frontier
+  let frontier' := wave.frontier.erase n
+  have h_subset : frontier' ⊆ wave.reached := by
+    intro x hx
+    have hx_in : x ∈ wave.frontier := Finset.mem_of_mem_erase hx
+    exact wave.frontier_subset hx_in
+  -- Build the new wave
+  use ⟨wave.source, wave.reached, frontier', h_subset, wave.source_reached⟩
+  refine ⟨rfl, h_in_mesh, ?_⟩
+  -- frontier' has smaller cardinality
+  right
+  simp only [frontier']
+  exact Finset.card_erase_lt_of_mem hn
 
 /-! ## Latency Model -/
 

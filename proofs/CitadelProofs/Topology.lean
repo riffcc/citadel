@@ -127,15 +127,21 @@ theorem distance_symm (a b : HexCoord) : distance a b = distance b a := by
 theorem distance_to_planar_neighbor (h : HexCoord) (n : HexCoord) :
   n ∈ planarNeighbors h → distance h n = 1 := by
   intro hn
-  -- Each planar neighbor is at distance 1 by construction
-  sorry
+  unfold planarNeighbors at hn
+  simp only [List.mem_cons, List.not_mem_nil, or_false] at hn
+  -- Each of the 6 neighbors: check distance formula gives 1
+  rcases hn with rfl | rfl | rfl | rfl | rfl | rfl <;>
+    simp only [distance, s, make] <;> omega
 
 /-- Helper: sum of absolute values in hex distance is always even -/
 private lemma hex_sum_even (q r : ℤ) :
     2 ∣ (Int.natAbs q + Int.natAbs r + Int.natAbs (-q - r)) := by
-  -- For q + r + s = 0, the sum |q| + |r| + |s| = 2 * max(|q|, |r|, |s|)
-  -- Proof requires case analysis on signs; placeholder for now
-  sorry
+  -- Key insight: |-q-r| = |q+r|, and the sum |q| + |r| + |q+r| is always even
+  have h : Int.natAbs (-q - r) = Int.natAbs (q + r) := by
+    rw [← Int.natAbs_neg]; ring_nf
+  rw [h]
+  -- Use omega to handle all the case analysis automatically
+  omega
 
 /-- Triangle inequality for hexagonal distance -/
 theorem distance_triangle (a b c : HexCoord) :
@@ -239,5 +245,91 @@ theorem extendedNeighbors_z_diff (h : HexCoord) (n : HexCoord) :
     have hz : n.z = (make h.q h.r (h.z - 1)).z := planarNeighbors_same_z _ _ hdown
     simp only [make] at hz
     simp [hz]
+
+/-- Extended neighbors (above + below planar) are distinct -/
+theorem extendedNeighbors_nodup (h : HexCoord) :
+    (extendedNeighbors h).Nodup := by
+  unfold extendedNeighbors
+  -- Need to show: planarNeighbors(above) ++ planarNeighbors(below) is nodup
+  apply List.Nodup.append
+  · -- planarNeighbors of above is nodup
+    exact planarNeighbors_distinct _
+  · -- planarNeighbors of below is nodup
+    exact planarNeighbors_distinct _
+  · -- They are disjoint (different z-levels)
+    intro x hAbove hBelow
+    have hz1 := planarNeighbors_same_z _ _ hAbove
+    have hz2 := planarNeighbors_same_z _ _ hBelow
+    simp only [make] at hz1 hz2
+    omega
+
+/-- Planar and vertical neighbors are disjoint (different z-levels) -/
+theorem planar_vertical_disjoint (h : HexCoord) :
+    ∀ x, x ∈ planarNeighbors h → x ∉ verticalNeighbors h := by
+  intro x hp hv
+  have hz1 := planarNeighbors_same_z h x hp
+  have hz2 := verticalNeighbors_z_diff h x hv
+  simp [hz1] at hz2
+
+/-- Planar and extended neighbors are disjoint (different z-levels) -/
+theorem planar_extended_disjoint (h : HexCoord) :
+    ∀ x, x ∈ planarNeighbors h → x ∉ extendedNeighbors h := by
+  intro x hp he
+  have hz1 := planarNeighbors_same_z h x hp
+  have hz2 := extendedNeighbors_z_diff h x he
+  simp [hz1] at hz2
+
+/-- Vertical and extended neighbors are disjoint -/
+theorem vertical_extended_disjoint (h : HexCoord) :
+    ∀ x, x ∈ verticalNeighbors h → x ∉ extendedNeighbors h := by
+  intro x hv he
+  -- Vertical neighbors are at (h.q, h.r, h.z±1)
+  -- Extended neighbors are planar neighbors of (h.q, h.r, h.z±1), which have different q or r
+  unfold verticalNeighbors at hv
+  simp only [List.mem_cons, List.not_mem_nil, or_false] at hv
+  unfold extendedNeighbors at he
+  simp only [List.mem_append] at he
+  rcases hv with rfl | rfl
+  · -- x = above = (h.q, h.r, h.z+1)
+    rcases he with hAbove | hBelow
+    · -- In planarNeighbors of above - but above itself isn't a planar neighbor of itself
+      unfold planarNeighbors at hAbove
+      simp only [List.mem_cons, List.not_mem_nil, or_false, make, HexCoord.mk.injEq] at hAbove
+      rcases hAbove with ⟨hq, _, _⟩ | ⟨hq, _, _⟩ | ⟨hq, _, _⟩ | ⟨hq, _, _⟩ | ⟨hq, _, _⟩ | ⟨hq, _, _⟩ <;> omega
+    · -- In planarNeighbors of below - different z
+      have hz := planarNeighbors_same_z _ _ hBelow
+      simp only [make] at hz
+      omega
+  · -- x = below = (h.q, h.r, h.z-1)
+    rcases he with hAbove | hBelow
+    · -- In planarNeighbors of above - different z
+      have hz := planarNeighbors_same_z _ _ hAbove
+      simp only [make] at hz
+      omega
+    · -- In planarNeighbors of below - but below isn't a planar neighbor of itself
+      unfold planarNeighbors at hBelow
+      simp only [List.mem_cons, List.not_mem_nil, or_false, make, HexCoord.mk.injEq] at hBelow
+      rcases hBelow with ⟨hq, _, _⟩ | ⟨hq, _, _⟩ | ⟨hq, _, _⟩ | ⟨hq, _, _⟩ | ⟨hq, _, _⟩ | ⟨hq, _, _⟩ <;> omega
+
+/-- All 20 connections are distinct -/
+theorem allConnections_nodup (h : HexCoord) :
+    (allConnections h).Nodup := by
+  unfold allConnections
+  -- First combine planar ++ vertical
+  have h_pv : (planarNeighbors h ++ verticalNeighbors h).Nodup := by
+    apply List.Nodup.append
+    · exact planarNeighbors_distinct h
+    · exact verticalNeighbors_distinct h
+    · intro x hp hv
+      exact planar_vertical_disjoint h x hp hv
+  -- Then combine with extended
+  apply List.Nodup.append
+  · exact h_pv
+  · exact extendedNeighbors_nodup h
+  · intro x hpv he
+    simp only [List.mem_append] at hpv
+    rcases hpv with hp | hv
+    · exact planar_extended_disjoint h x hp he
+    · exact vertical_extended_disjoint h x hv he
 
 end HexCoord

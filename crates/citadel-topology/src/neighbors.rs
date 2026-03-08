@@ -7,7 +7,9 @@
 //!
 //! This invariant is proven in Lean: `CitadelProofs.Topology.connection_count`
 
-use crate::{HexCoord, CONNECTIONS_PER_NODE, EXTENDED_CONNECTIONS, PLANAR_CONNECTIONS, VERTICAL_CONNECTIONS};
+use crate::{
+    HexCoord, CONNECTIONS_PER_NODE, EXTENDED_CONNECTIONS, PLANAR_CONNECTIONS, VERTICAL_CONNECTIONS,
+};
 
 /// All 20 neighbor directions for a node.
 #[derive(Debug, Clone, Copy)]

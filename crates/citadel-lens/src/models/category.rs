@@ -53,7 +53,12 @@ impl Category {
     }
 
     /// Create a new category with full options
-    pub fn with_schema(id: String, name: String, featured: bool, schema: Option<serde_json::Value>) -> Self {
+    pub fn with_schema(
+        id: String,
+        name: String,
+        featured: bool,
+        schema: Option<serde_json::Value>,
+    ) -> Self {
         let slug = id.clone();
         Self {
             category_id: Some(id.clone()),

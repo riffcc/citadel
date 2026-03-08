@@ -112,7 +112,7 @@ impl LensConfig {
     /// Create config from environment variables with sensible defaults.
     pub fn from_env() -> Self {
         let data_dir = PathBuf::from(
-            std::env::var("LENS_DATA_DIR").unwrap_or_else(|_| "./lens-data".to_string())
+            std::env::var("LENS_DATA_DIR").unwrap_or_else(|_| "./lens-data".to_string()),
         );
 
         let api_addr = std::env::var("LENS_API_BIND")
@@ -154,7 +154,8 @@ impl LensConfig {
             .map(PathBuf::from)
             .unwrap_or_else(|_| data_dir.join("admin.sock"));
 
-        let admin_public_key = std::env::var("ADMIN_PUBLIC_KEY").ok()
+        let admin_public_key = std::env::var("ADMIN_PUBLIC_KEY")
+            .ok()
             .filter(|s| !s.is_empty());
 
         Self {
@@ -174,8 +175,13 @@ pub struct LensState {
     pub storage: Arc<Storage>,
     pub config: LensConfig,
     pub mesh_state: Option<Arc<RwLock<MeshState>>>,
+    /// Document store for CRDT documents with SPORE sync (featured releases, etc.)
+    /// Uses rich semantic merges (NOT LWW) - proven convergent in Lean.
+    pub doc_store: Option<Arc<tokio::sync::RwLock<citadel_docs::DocumentStore>>>,
     /// Flood sender for SPORE content propagation
     pub flood_tx: Option<tokio::sync::broadcast::Sender<crate::mesh::FloodMessage>>,
+    /// Admin event sender for real-time moderation updates via WebSocket
+    pub admin_event_tx: Option<crate::ws_admin::AdminEventSender>,
 }
 
 /// A Lens node instance.
@@ -212,7 +218,9 @@ impl LensNode {
             storage,
             config: config.clone(),
             mesh_state: None,
+            doc_store: None, // Set when mesh service starts
             flood_tx: None,
+            admin_event_tx: None,
         }));
 
         Ok(Self { state, config })
@@ -246,11 +254,19 @@ impl LensNode {
 
         // Start mesh service first to get flood sender
         let mesh_storage = self.storage().await;
+
+        // Open document store for CRDT documents with SPORE sync
+        // Uses rich semantic merges (NOT LWW) - proven convergent in Lean
+        let doc_store_path = self.config.data_dir.join("docs.redb");
+        let doc_store = citadel_docs::DocumentStore::open(&doc_store_path)
+            .map_err(|e| crate::error::Error::Storage(e.to_string()))?;
+
         let mesh_service = Arc::new(MeshService::new(
             self.config.p2p_addr,
             self.config.announce_addr,
             self.config.bootstrap_peers.clone(),
             mesh_storage,
+            doc_store,
         ));
 
         // Get flood sender for admin socket and API
@@ -259,19 +275,28 @@ impl LensNode {
         // Start admin socket server in background (with flood capability)
         let admin_socket = AdminSocket::new(
             Arc::clone(&storage),
-            self.config.admin_socket.to_str().unwrap_or("./lens-data/admin.sock"),
-        ).with_flood_tx(flood_tx.clone());
+            self.config
+                .admin_socket
+                .to_str()
+                .unwrap_or("./lens-data/admin.sock"),
+        )
+        .with_flood_tx(flood_tx.clone());
         tokio::spawn(async move {
             if let Err(e) = admin_socket.run().await {
                 tracing::error!("Admin socket error: {}", e);
             }
         });
 
-        // Share mesh state and flood_tx with API layer
+        // Create admin event channel for real-time moderation updates
+        let (admin_event_tx, _admin_event_rx) = crate::ws_admin::create_admin_channel();
+
+        // Share mesh state, flood_tx, doc_store, and admin_event_tx with API layer
         {
             let mut state = self.state.write().await;
             state.mesh_state = Some(mesh_service.mesh_state());
+            state.doc_store = Some(mesh_service.doc_store());
             state.flood_tx = Some(flood_tx);
+            state.admin_event_tx = Some(admin_event_tx);
         }
 
         let mesh_clone = Arc::clone(&mesh_service);

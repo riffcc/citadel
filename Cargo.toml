@@ -5,6 +5,9 @@ members = [
     "crates/citadel-spore",
     "crates/citadel-dht",
     "crates/citadel-crdt",
+    "crates/citadel-docs",
+    "crates/citadel-gossip",
+    "crates/citadel-ping",
     "crates/citadel-consensus",
     "crates/citadel-protocols",
     "crates/citadel-transfer",
@@ -41,7 +44,7 @@ rustls = "0.23"
 
 # Crypto
 blake3 = "1"
-ed25519-dalek = "2"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
 hex = "0.4"
 
 # WASM
@@ -54,6 +57,9 @@ citadel-topology = { path = "crates/citadel-topology" }
 citadel-spore = { path = "crates/citadel-spore" }
 citadel-dht = { path = "crates/citadel-dht" }
 citadel-crdt = { path = "crates/citadel-crdt" }
+citadel-docs = { path = "crates/citadel-docs" }
+citadel-gossip = { path = "crates/citadel-gossip" }
+citadel-ping = { path = "crates/citadel-ping" }
 citadel-consensus = { path = "crates/citadel-consensus" }
 citadel-protocols = { path = "crates/citadel-protocols" }
 citadel-utils = { path = "crates/citadel-utils" }

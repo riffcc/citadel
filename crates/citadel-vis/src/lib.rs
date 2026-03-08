@@ -19,15 +19,15 @@
 //! server.serve(3000).await;
 //! ```
 
-mod simulation;
+mod events;
 mod playback;
 mod server;
-mod events;
+mod simulation;
 
-pub use simulation::{Simulation, SimulationConfig};
-pub use playback::{Playback, PlaybackState, PlaybackSpeed};
+pub use events::{ConnectionState as ConnState, MeshEvent, NodeState};
+pub use playback::{Playback, PlaybackSpeed, PlaybackState};
 pub use server::VisServer;
-pub use events::{MeshEvent, NodeState, ConnectionState as ConnState};
+pub use simulation::{Simulation, SimulationConfig};
 
 #[cfg(test)]
 mod tests {

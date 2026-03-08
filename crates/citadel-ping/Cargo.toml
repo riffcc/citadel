@@ -1,0 +1,23 @@
+[package]
+name = "citadel-ping"
+version.workspace = true
+edition = "2021"
+description = "Health and presence announcements for Citadel nodes"
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+# Citadel crates
+citadel-spore = { path = "../citadel-spore" }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+bincode = "1.3"
+
+# Logging
+tracing = "0.1"
+
+# Error handling
+thiserror = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "time", "macros"] }

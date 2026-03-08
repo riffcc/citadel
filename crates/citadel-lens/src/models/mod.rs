@@ -37,4 +37,4 @@ pub use metadata::{
     DataCiteCreator, DataCiteResourceType, DataCiteTitle, MetadataContainer, NameIdentifier,
     StandardMetadata,
 };
-pub use release::Release;
+pub use release::{Release, ReleaseStatus};

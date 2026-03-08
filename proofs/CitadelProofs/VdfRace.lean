@@ -360,20 +360,112 @@ theorem merge_takes_longer (a b : VdfChain) :
 
 /-! ## Bootstrap Termination -/
 
+/-- Helper: find the claim with minimum priority in a nonempty list -/
+private noncomputable def findMinClaim : (claims : List AnchoredClaim) → claims ≠ [] → AnchoredClaim
+  | [c], _ => c
+  | c :: c' :: cs, _ =>
+    let minRest := findMinClaim (c' :: cs) (by simp)
+    if claimHasPriority c minRest then c else minRest
+
+/-- The minimum claim is in the list -/
+private theorem findMinClaim_mem (claims : List AnchoredClaim) (h : claims ≠ []) :
+    findMinClaim claims h ∈ claims := by
+  match claims with
+  | [] => exact absurd rfl h
+  | [c] => simp [findMinClaim]
+  | c :: c' :: cs =>
+    simp only [findMinClaim]
+    split_ifs with hprio
+    · simp
+    · have : findMinClaim (c' :: cs) (by simp) ∈ c' :: cs := findMinClaim_mem (c' :: cs) (by simp)
+      simp [this]
+
+/-- The minimum claim beats or equals all others -/
+private theorem findMinClaim_minimal (claims : List AnchoredClaim) (h : claims ≠ [])
+    (c : AnchoredClaim) (hc : c ∈ claims) :
+    c = findMinClaim claims h ∨ claimHasPriority (findMinClaim claims h) c := by
+  match claims, hc with
+  | [], hc => simp at hc
+  | [x], hc =>
+    simp [findMinClaim]
+    simp at hc
+    left; exact hc
+  | x :: x' :: xs, hc =>
+    simp only [findMinClaim]
+    simp only [List.mem_cons] at hc
+    rcases hc with rfl | hc_rest
+    · -- c = x (the head)
+      split_ifs with hprio
+      · left; rfl
+      · -- c doesn't beat minRest: either c = minRest or minRest beats c
+        by_cases h_eq : c = findMinClaim (x' :: xs) (by simp)
+        · left; exact h_eq
+        · right
+          have h_total := priority_total (findMinClaim (x' :: xs) (by simp)) c (Ne.symm h_eq)
+          rcases h_total with hmin | hc_wins
+          · exact hmin
+          · exact absurd hc_wins hprio
+    · -- c ∈ x' :: xs
+      have hc_mem : c ∈ x' :: xs := by simp [hc_rest]
+      have h_rec := findMinClaim_minimal (x' :: xs) (by simp) c hc_mem
+      split_ifs with hprio
+      · -- x beats minRest
+        rcases h_rec with heq | hbeats
+        · right; rw [heq]; exact hprio
+        · right; exact priority_transitive x (findMinClaim (x' :: xs) (by simp)) c hprio hbeats
+      · -- minRest is the min
+        exact h_rec
+termination_by claims.length
+
 /-- After VDF race with n nodes, we have n unique slot assignments -/
 theorem bootstrap_produces_unique_slots
     (n : ℕ) (claims : List AnchoredClaim)
-    (h_n_claims : claims.length = n)
-    (h_unique_claimers : claims.map (·.claimer) |>.Nodup)
-    (h_slots_available : ∀ c ∈ claims, c.slot < n) :
-    -- Each slot 0..n-1 has exactly one winner
-    ∀ slot < n, ∃! winner, winner ∈ claims ∧
+    (_h_n_claims : claims.length = n)
+    (_h_unique_claimers : claims.map (·.claimer) |>.Nodup)
+    (_h_slots_available : ∀ c ∈ claims, c.slot < n)
+    (h_each_slot_claimed : ∀ slot < n, ∃ c ∈ claims, c.slot = slot) :
+    -- Each slot 0..n-1 has exactly one winner (who claims that slot)
+    ∀ slot < n, ∃! winner, winner ∈ claims ∧ winner.slot = slot ∧
       ∀ c ∈ claims, c.slot = slot → c = winner ∨ claimHasPriority winner c := by
   intro slot h_slot
-  -- This follows from priority being total and transitive
-  -- For each slot, collect claims, find minimum by priority
-  -- That minimum is unique winner
-  sorry -- Full proof requires more list manipulation lemmas
+  -- Get claims for this slot
+  let slot_claims := claims.filter (fun c => c.slot = slot)
+  -- slot_claims is nonempty
+  obtain ⟨c₀, hc₀_mem, hc₀_slot⟩ := h_each_slot_claimed slot h_slot
+  have h_nonempty : slot_claims ≠ [] := by
+    simp only [slot_claims]
+    intro h_empty
+    have h_c₀_in : c₀ ∈ claims.filter (fun c => c.slot = slot) := by
+      simp only [List.mem_filter, decide_eq_true_eq]
+      exact ⟨hc₀_mem, hc₀_slot⟩
+    rw [h_empty] at h_c₀_in
+    simp at h_c₀_in
+  -- Find minimum claim for this slot
+  let winner := findMinClaim slot_claims h_nonempty
+  have h_win_in_slot := findMinClaim_mem slot_claims h_nonempty
+  simp only [List.mem_filter, slot_claims, decide_eq_true_eq] at h_win_in_slot
+  use winner
+  constructor
+  · exact ⟨h_win_in_slot.1, h_win_in_slot.2, fun c hc_mem hc_slot =>
+      findMinClaim_minimal slot_claims h_nonempty c (by
+        simp only [slot_claims, List.mem_filter, decide_eq_true_eq]
+        exact ⟨hc_mem, hc_slot⟩)⟩
+  · -- Uniqueness
+    intro winner' ⟨hw_mem, hw_slot, hw_prop⟩
+    -- winner' claims this slot, so it's in slot_claims
+    have h_w'_in_slot : winner' ∈ slot_claims := by
+      simp only [slot_claims, List.mem_filter, decide_eq_true_eq]
+      exact ⟨hw_mem, hw_slot⟩
+    -- Both directions of priority comparison
+    have h1 := hw_prop winner h_win_in_slot.1 h_win_in_slot.2
+    have h2 := findMinClaim_minimal slot_claims h_nonempty winner' h_w'_in_slot
+    rcases h1 with heq1 | hbeat1
+    · exact heq1.symm
+    · rcases h2 with heq2 | hbeat2
+      · exact heq2
+      · -- hbeat1: winner' beats winner, hbeat2: winner beats winner'
+        -- This is a contradiction by asymmetry
+        exact absurd hbeat2 (priority_asymmetric winner' winner hbeat1)
 
 end VdfRace
 

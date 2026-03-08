@@ -223,8 +223,8 @@ impl From<&Playback> for PlaybackStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use citadel_topology::{HexCoord, SpiralIndex};
     use crate::events::NodeId;
+    use citadel_topology::{HexCoord, SpiralIndex};
 
     fn make_events(count: usize) -> Vec<MeshEvent> {
         (0..count)
