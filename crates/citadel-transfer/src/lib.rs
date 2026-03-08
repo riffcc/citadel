@@ -34,4 +34,6 @@ pub mod types;
 // Re-export main types at crate root
 pub use streaming::{ContinuousStreamer, PacketReceiver, TgpConfig, TgpHandle};
 pub use transport::{TransportConfig, TransportHandle};
-pub use types::{Epoch, MsgKind, NodeId, Packet, PacketHeader, SeqNo, StreamId, DEFAULT_PAYLOAD_MTU};
+pub use types::{
+    Epoch, MsgKind, NodeId, Packet, PacketHeader, SeqNo, StreamId, DEFAULT_PAYLOAD_MTU,
+};

@@ -118,7 +118,12 @@ mod tests {
 
     #[test]
     fn test_header_roundtrip() {
-        let header = TgpPacketHeader::new(packet_types::UBTS_BLOCK, 0x1234567890abcdef, 0xfedcba0987654321, 256);
+        let header = TgpPacketHeader::new(
+            packet_types::UBTS_BLOCK,
+            0x1234567890abcdef,
+            0xfedcba0987654321,
+            256,
+        );
         let bytes = header.to_bytes();
 
         assert_eq!(bytes.len(), TgpPacketHeader::SIZE);

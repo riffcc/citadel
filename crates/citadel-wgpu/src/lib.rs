@@ -16,7 +16,7 @@ pub mod traffic;
 pub use camera::FlyCamera;
 pub use mesh_data::MeshData;
 pub use renderer::Renderer;
-pub use traffic::{TrafficSimulation, TrafficStats, LineVertex};
+pub use traffic::{LineVertex, TrafficSimulation, TrafficStats};
 
 use citadel_topology::HexCoord;
 

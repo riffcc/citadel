@@ -205,22 +205,22 @@ pub fn spiral_to_coord(index: SpiralIndex) -> HexCoord {
 
     // Edge directions (counter-clockwise from east corner)
     let corners = [
-        HexCoord::planar(ring as i64, 0),                      // East corner
-        HexCoord::planar(0, ring as i64),                      // Northwest corner (after NW edge)
-        HexCoord::planar(-(ring as i64), ring as i64),         // West corner
-        HexCoord::planar(-(ring as i64), 0),                   // Southwest corner
-        HexCoord::planar(0, -(ring as i64)),                   // Southeast corner
-        HexCoord::planar(ring as i64, -(ring as i64)),         // East-southeast
+        HexCoord::planar(ring as i64, 0),              // East corner
+        HexCoord::planar(0, ring as i64),              // Northwest corner (after NW edge)
+        HexCoord::planar(-(ring as i64), ring as i64), // West corner
+        HexCoord::planar(-(ring as i64), 0),           // Southwest corner
+        HexCoord::planar(0, -(ring as i64)),           // Southeast corner
+        HexCoord::planar(ring as i64, -(ring as i64)), // East-southeast
     ];
 
     // Direction along each edge
     let directions = [
-        HexCoord::planar(-1, 1),   // Edge 0: East -> NW
-        HexCoord::planar(-1, 0),   // Edge 1: NW -> W
-        HexCoord::planar(0, -1),   // Edge 2: W -> SW
-        HexCoord::planar(1, -1),   // Edge 3: SW -> SE
-        HexCoord::planar(1, 0),    // Edge 4: SE -> E
-        HexCoord::planar(0, 1),    // Edge 5: E -> back to start
+        HexCoord::planar(-1, 1), // Edge 0: East -> NW
+        HexCoord::planar(-1, 0), // Edge 1: NW -> W
+        HexCoord::planar(0, -1), // Edge 2: W -> SW
+        HexCoord::planar(1, -1), // Edge 3: SW -> SE
+        HexCoord::planar(1, 0),  // Edge 4: SE -> E
+        HexCoord::planar(0, 1),  // Edge 5: E -> back to start
     ];
 
     let corner = corners[edge as usize];
@@ -237,7 +237,10 @@ pub fn spiral_to_coord(index: SpiralIndex) -> HexCoord {
 /// Inverse of `spiral_to_coord`.
 pub fn coord_to_spiral(coord: HexCoord) -> SpiralIndex {
     // Only handle z=0 for now (planar spiral)
-    assert_eq!(coord.z, 0, "Only planar coordinates supported for spiral index");
+    assert_eq!(
+        coord.z, 0,
+        "Only planar coordinates supported for spiral index"
+    );
 
     if coord == HexCoord::ORIGIN {
         return SpiralIndex::ORIGIN;
@@ -248,22 +251,15 @@ pub fn coord_to_spiral(coord: HexCoord) -> SpiralIndex {
     // Determine which edge and position on edge
     // Corners of ring n
     let corners = [
-        (ring as i64, 0i64),                 // Edge 0 start
-        (0, ring as i64),                    // Edge 1 start
-        (-(ring as i64), ring as i64),      // Edge 2 start
-        (-(ring as i64), 0),                // Edge 3 start
-        (0, -(ring as i64)),                // Edge 4 start
-        (ring as i64, -(ring as i64)),      // Edge 5 start
+        (ring as i64, 0i64),           // Edge 0 start
+        (0, ring as i64),              // Edge 1 start
+        (-(ring as i64), ring as i64), // Edge 2 start
+        (-(ring as i64), 0),           // Edge 3 start
+        (0, -(ring as i64)),           // Edge 4 start
+        (ring as i64, -(ring as i64)), // Edge 5 start
     ];
 
-    let directions = [
-        (-1i64, 1i64),
-        (-1, 0),
-        (0, -1),
-        (1, -1),
-        (1, 0),
-        (0, 1),
-    ];
+    let directions = [(-1i64, 1i64), (-1, 0), (0, -1), (1, -1), (1, 0), (0, 1)];
 
     // Find which edge this coordinate is on
     for edge in 0..6 {
@@ -302,9 +298,9 @@ mod tests {
     fn total_slots_formula() {
         // 1 + 3n(n+1)
         assert_eq!(total_slots_through(0), 1);
-        assert_eq!(total_slots_through(1), 7);   // 1 + 6
-        assert_eq!(total_slots_through(2), 19);  // 1 + 6 + 12
-        assert_eq!(total_slots_through(3), 37);  // 1 + 6 + 12 + 18
+        assert_eq!(total_slots_through(1), 7); // 1 + 6
+        assert_eq!(total_slots_through(2), 19); // 1 + 6 + 12
+        assert_eq!(total_slots_through(3), 37); // 1 + 6 + 12 + 18
         assert_eq!(total_slots_through(10), 331);
     }
 
@@ -356,7 +352,11 @@ mod tests {
         for i in 0..total_slots_through(3) {
             let coord = spiral_to_coord(SpiralIndex(i));
             let back = coord_to_spiral(coord);
-            assert_eq!(back.0, i, "Round-trip failed for index {}: coord {:?}", i, coord);
+            assert_eq!(
+                back.0, i,
+                "Round-trip failed for index {}: coord {:?}",
+                i, coord
+            );
         }
     }
 

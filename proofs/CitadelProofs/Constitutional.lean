@@ -136,7 +136,7 @@ theorem constitutional_requires_all (state : ConstitutionalState)
 
 /-- **Theorem 4**: Controlling one dimension is insufficient -/
 theorem one_branch_insufficient (state : ConstitutionalState)
-    (h_exec : state.executiveControl > attackThreshold)
+    (_h_exec : state.executiveControl > attackThreshold)
     (h_jud_low : state.judicialControl ≤ attackThreshold) :
     ¬attackSucceeds state := by
   intro h_attack
@@ -144,9 +144,9 @@ theorem one_branch_insufficient (state : ConstitutionalState)
 
 /-- **Theorem 5**: Controlling three dimensions is insufficient -/
 theorem three_branches_insufficient (state : ConstitutionalState)
-    (h_exec : state.executiveControl > attackThreshold)
-    (h_jud : state.judicialControl > attackThreshold)
-    (h_leg : state.legislativeControl > attackThreshold)
+    (_h_exec : state.executiveControl > attackThreshold)
+    (_h_jud : state.judicialControl > attackThreshold)
+    (_h_leg : state.legislativeControl > attackThreshold)
     (h_diff_low : state.diffusionControl ≤ attackThreshold) :
     ¬attackSucceeds state := by
   intro h_attack
@@ -182,7 +182,7 @@ def networkValue (k : ℚ) (integrity : ℚ) : ℚ :=
 theorem value_increases_with_integrity (k : ℚ) (i1 i2 : ℚ)
     (h_k_pos : k > 0)
     (h_i1_pos : i1 ≥ 0)
-    (h_i2_pos : i2 ≥ 0)
+    (_h_i2_pos : i2 ≥ 0)
     (h_lt : i1 < i2) :
     networkValue k i1 < networkValue k i2 := by
   unfold networkValue
@@ -211,8 +211,8 @@ theorem integrity_halving_effect (k : ℚ) (i : ℚ)
 -- If attack degrades integrity to i', and attack cost is C,
 -- then attack is unprofitable when C > V(1) - V(i')
 theorem attack_unprofitable (k : ℚ) (attackCost : ℚ) (degradedIntegrity : ℚ)
-    (h_k_pos : k > 0)
-    (h_di_bound : 0 ≤ degradedIntegrity ∧ degradedIntegrity ≤ 1)
+    (_h_k_pos : k > 0)
+    (_h_di_bound : 0 ≤ degradedIntegrity ∧ degradedIntegrity ≤ 1)
     (h_cost_high : attackCost > networkValue k 1 - networkValue k degradedIntegrity) :
     attackCost > networkValue k 1 - networkValue k degradedIntegrity := h_cost_high
 
@@ -305,9 +305,46 @@ theorem constitutional_security (state : ConstitutionalState) :
 theorem value_collapse_before_attack (k : ℚ) (state : ConstitutionalState)
     (h_k_pos : k > 0)
     (h_attack : attackSucceeds state) :
-    -- The integrity required to achieve attack > threshold in all dimensions
-    -- is already < 50%, so value has dropped to < 25% of original
-    True := by trivial -- This is a meta-theorem about the dynamics
+    -- If attack succeeds, all branches are > threshold (0.51)
+    -- So integrity = 1 - max(branches) < 0.49 for each
+    -- Network value = k * integrity < k * 0.49 < k
+    networkValue k (1 - state.executiveControl) < k := by
+  -- attack succeeding means executiveControl > threshold
+  have h_exec := h_attack.1
+  have h_thresh : attackThreshold = 51/100 := rfl
+  have h_exec_high : state.executiveControl > 51/100 := by rw [← h_thresh]; exact h_exec
+  have h_integ_low : 1 - state.executiveControl < 49/100 := by linarith
+  unfold networkValue
+  -- networkValue k i = k * i * i, so we need k * (1 - exec)^2 < k
+  -- Since k > 0, this is equivalent to (1 - exec)^2 < 1
+  -- From bounds: 0 ≤ exec ≤ 1, so 0 ≤ 1 - exec ≤ 1
+  -- From h_exec_high: exec > 51/100, so 1 - exec < 49/100 < 1
+  -- Therefore (1 - exec)^2 ≤ (1 - exec) < 1 when exec > 0
+  -- And even if exec = 1, we get 0 < k, which is what we need
+  have h_integ_nonneg : 0 ≤ 1 - state.executiveControl := by
+    have := state.h_exec_bound.2
+    linarith
+  have h_integ_lt_one : 1 - state.executiveControl < 1 := by
+    have := state.h_exec_bound.1
+    linarith
+  -- (1-exec)^2 ≤ 1-exec when 0 ≤ 1-exec ≤ 1, with strict < when 0 < 1-exec < 1
+  have h_sq_le_one : (1 - state.executiveControl) * (1 - state.executiveControl) ≤ 1 := by
+    calc (1 - state.executiveControl) * (1 - state.executiveControl)
+        ≤ 1 * 1 := by nlinarith
+      _ = 1 := by ring
+  have h_sq_lt_one : (1 - state.executiveControl) * (1 - state.executiveControl) < 1 := by
+    -- If 1 - exec = 1, then exec = 0, but exec > 51/100, contradiction
+    -- If 1 - exec < 1 and ≥ 0, then (1-exec)^2 < 1
+    by_cases h : 1 - state.executiveControl = 1
+    · exfalso
+      have : state.executiveControl = 0 := by linarith
+      linarith
+    · have h_strict : 1 - state.executiveControl < 1 := h_integ_lt_one
+      have h_bound2 : 1 - state.executiveControl ≤ 1 := le_of_lt h_strict
+      nlinarith [sq_nonneg (1 - state.executiveControl)]
+  calc k * (1 - state.executiveControl) * (1 - state.executiveControl)
+      < k * 1 := by nlinarith
+    _ = k := mul_one k
 
 /-! ## Proof of Diffusion -/
 
@@ -341,11 +378,12 @@ theorem concentration_is_capped (compute : ℚ) (diversity : ℚ) (maxCap : ℚ)
   exact min_lt_of_right_lt h_cap_lt_compute
 
 /-- **Theorem 16**: Distributed users contribute optimally -/
-theorem distributed_optimal (compute : ℚ) (maxCap : ℚ)
+theorem distributed_optimal (compute : ℚ) (diversity : ℚ) (maxCap : ℚ)
     (h_moderate_compute : compute ≤ maxCap)
-    (h_full_diversity : True) : -- diversity = 1 for real distributed user
-    effectiveContribution compute 1 maxCap = compute := by
+    (h_full_diversity : diversity = 1) :
+    effectiveContribution compute diversity maxCap = compute := by
   unfold effectiveContribution diffusionCap
+  rw [h_full_diversity]
   simp only [one_mul]
   exact min_eq_left h_moderate_compute
 
@@ -438,15 +476,37 @@ def totalEffectiveness (compute : ℚ) (pos : TopologicalPosition) (maxCap : ℚ
 theorem nash_equilibrium_is_honest (compute : ℚ) (maxCap : ℚ)
     (h_compute_pos : compute > 0)
     (h_maxCap_pos : maxCap > 0) :
-    -- Sweet spot (pos = 1/2) has maximum connections
-    -- concentrated (pos = 1/4) has fewer connections
-    connectionCount (1/2) > connectionCount (1/4) := by
+    -- Sweet spot (pos = 1/2) has maximum connections and thus max effectiveness
+    -- compared to concentrated (pos = 1/4) position
+    totalEffectiveness compute (1/2) maxCap > totalEffectiveness compute (1/4) maxCap := by
+  unfold totalEffectiveness effectiveInfluence
+  -- At pos = 1/2: diversity = 1/2, diffusionCap = 1/2 * maxCap
+  -- At pos = 1/4: diversity = 1/4, diffusionCap = 1/4 * maxCap
   have h_conn_half : connectionCount (1/2) = 1 := sweet_spot_max_connections
   have h_conn_quarter : connectionCount (1/4) = (3/4 : ℚ) := by
-    unfold connectionCount
-    norm_num
+    unfold connectionCount; norm_num
+  have h_eff_half : effectiveContribution compute (1/2) maxCap = min compute (1/2 * maxCap) := by
+    unfold effectiveContribution diffusionCap; rfl
+  have h_eff_quarter : effectiveContribution compute (1/4) maxCap = min compute (1/4 * maxCap) := by
+    unfold effectiveContribution diffusionCap; rfl
   rw [h_conn_half, h_conn_quarter]
-  norm_num
+  -- contribution(1/2) * 1 vs contribution(1/4) * (3/4)
+  -- Even if contributions are equal, 1 > 3/4 gives us the win
+  have h_cap_half : 1/2 * maxCap ≤ maxCap := by linarith
+  have h_cap_quarter : 1/4 * maxCap < 1/2 * maxCap := by nlinarith
+  -- min(compute, 1/2 * maxCap) ≥ min(compute, 1/4 * maxCap)
+  have h_contrib_ge : effectiveContribution compute (1/2) maxCap ≥
+                      effectiveContribution compute (1/4) maxCap := by
+    unfold effectiveContribution diffusionCap
+    apply min_le_min_left
+    linarith
+  have h_contrib_pos : effectiveContribution compute (1/4) maxCap > 0 := by
+    unfold effectiveContribution diffusionCap
+    have h1 : 1/4 * maxCap > 0 := by nlinarith
+    exact lt_min h_compute_pos h1
+  calc effectiveContribution compute (1/2) maxCap * 1
+      ≥ effectiveContribution compute (1/4) maxCap * 1 := by nlinarith
+    _ > effectiveContribution compute (1/4) maxCap * (3/4) := by nlinarith
 
 /-- **Theorem 23**: Malice is geometrically inefficient
     The attack surface doesn't just shrink - it inverts -/

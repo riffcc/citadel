@@ -1,22 +1,43 @@
-//! Persistent storage using RocksDB.
+//! Persistent storage using ReDB.
 
 use crate::error::Result;
-use crate::models::{Category, ContentItem, FeaturedRelease, Release};
+use crate::models::{Category, ContentItem, FeaturedRelease, Release, ReleaseStatus};
 use ed25519_dalek::SigningKey;
-use rocksdb::{Options, DB};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use std::collections::HashMap;
 use std::path::Path;
+
+// Table definitions
+const RELEASES: TableDefinition<&str, &[u8]> = TableDefinition::new("releases");
+const CONTENT: TableDefinition<&str, &[u8]> = TableDefinition::new("content");
+const CATEGORIES: TableDefinition<&str, &[u8]> = TableDefinition::new("categories");
+const FEATURED: TableDefinition<&str, &[u8]> = TableDefinition::new("featured");
+const ADMINS: TableDefinition<&str, &[u8]> = TableDefinition::new("admins");
+const PERMISSIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("permissions");
+const NODE_META: TableDefinition<&str, &[u8]> = TableDefinition::new("node_meta");
 
 /// Storage backend for Lens data.
 pub struct Storage {
-    db: DB,
+    db: Database,
 }
 
 impl Storage {
     /// Open or create storage at the given path.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let mut opts = Options::default();
-        opts.create_if_missing(true);
-        let db = DB::open(&opts, path)?;
+        // Ensure parent directory exists
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        // ReDB uses a file, not a directory like RocksDB
+        let db_path = if path.is_dir() {
+            path.join("lens.redb")
+        } else {
+            path.to_path_buf()
+        };
+
+        let db = Database::create(&db_path)?;
         Ok(Self { db })
     }
 
@@ -24,83 +45,173 @@ impl Storage {
 
     /// Store a release.
     pub fn put_release(&self, release: &Release) -> Result<()> {
-        let key = format!("release:{}", release.id);
         let value = serde_json::to_vec(release)?;
-        self.db.put(key.as_bytes(), value)?;
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(RELEASES)?;
+            table.insert(release.id.as_str(), value.as_slice())?;
+        }
+        write_txn.commit()?;
         Ok(())
     }
 
     /// Get a release by ID.
     pub fn get_release(&self, id: &str) -> Result<Option<Release>> {
-        let key = format!("release:{}", id);
-        match self.db.get(key.as_bytes())? {
-            Some(data) => Ok(Some(serde_json::from_slice(&data)?)),
+        let read_txn = self.db.begin_read()?;
+        let table = match read_txn.open_table(RELEASES) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+
+        match table.get(id)? {
+            Some(guard) => {
+                let bytes: &[u8] = guard.value();
+                Ok(Some(serde_json::from_slice(bytes)?))
+            }
             None => Ok(None),
         }
     }
 
     /// Delete a release.
     pub fn delete_release(&self, id: &str) -> Result<()> {
-        let key = format!("release:{}", id);
-        self.db.delete(key.as_bytes())?;
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(RELEASES)?;
+            table.remove(id)?;
+        }
+        write_txn.commit()?;
         Ok(())
     }
 
     /// Delete ALL releases (use with caution!).
     pub fn delete_all_releases(&self) -> Result<usize> {
-        let prefix = b"release:";
-        let mut count = 0;
+        let write_txn = self.db.begin_write()?;
+        let count = {
+            let mut table = write_txn.open_table(RELEASES)?;
 
-        // Collect keys first to avoid iterator invalidation
-        let keys: Vec<Vec<u8>> = self.db.prefix_iterator(prefix)
-            .take_while(|item| {
-                item.as_ref().map(|(k, _)| k.starts_with(prefix)).unwrap_or(false)
-            })
-            .filter_map(|item| item.ok().map(|(k, _)| k.to_vec()))
-            .collect();
+            // Collect keys first
+            let keys: Vec<String> = table
+                .iter()?
+                .filter_map(|item| item.ok().map(|(k, _)| k.value().to_string()))
+                .collect();
 
-        for key in keys {
-            self.db.delete(&key)?;
-            count += 1;
-        }
-
+            let count = keys.len();
+            for key in keys {
+                table.remove(key.as_str())?;
+            }
+            count
+        };
+        write_txn.commit()?;
         Ok(count)
     }
 
     /// List all releases.
     pub fn list_releases(&self) -> Result<Vec<Release>> {
-        let prefix = b"release:";
-        let mut releases = Vec::new();
+        let read_txn = self.db.begin_read()?;
+        let table = match read_txn.open_table(RELEASES) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
 
-        let iter = self.db.prefix_iterator(prefix);
-        for item in iter {
-            let (key, value) = item?;
-            if key.starts_with(prefix) {
-                let release: Release = serde_json::from_slice(&value)?;
-                releases.push(release);
-            } else {
-                break;
-            }
+        let mut releases = Vec::new();
+        for item in table.iter()? {
+            let (_, value) = item?;
+            let bytes: &[u8] = value.value();
+            let release: Release = serde_json::from_slice(bytes)?;
+            releases.push(release);
         }
 
         Ok(releases)
+    }
+
+    /// List releases filtered by status.
+    pub fn list_releases_by_status(&self, status: ReleaseStatus) -> Result<Vec<Release>> {
+        let all = self.list_releases()?;
+        Ok(all.into_iter().filter(|r| r.status == status).collect())
+    }
+
+    /// List only pending releases (for moderation queue).
+    pub fn list_pending_releases(&self) -> Result<Vec<Release>> {
+        self.list_releases_by_status(ReleaseStatus::Pending)
+    }
+
+    /// List only approved releases (public catalog).
+    pub fn list_public_releases(&self) -> Result<Vec<Release>> {
+        self.list_releases_by_status(ReleaseStatus::Approved)
+    }
+
+    /// Count releases grouped by status.
+    pub fn count_releases_by_status(&self) -> Result<HashMap<String, usize>> {
+        let releases = self.list_releases()?;
+        let mut counts = HashMap::new();
+
+        for release in releases {
+            let status_str = release.status.to_string();
+            *counts.entry(status_str).or_insert(0) += 1;
+        }
+
+        Ok(counts)
+    }
+
+    /// Approve a release by ID.
+    /// Returns the updated release, or None if not found.
+    pub fn approve_release(&self, id: &str, moderator_pubkey: &str) -> Result<Option<Release>> {
+        if let Some(mut release) = self.get_release(id)? {
+            release.approve(moderator_pubkey);
+            self.put_release(&release)?;
+            Ok(Some(release))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Reject a release by ID.
+    /// Returns the updated release, or None if not found.
+    pub fn reject_release(
+        &self,
+        id: &str,
+        moderator_pubkey: &str,
+        reason: Option<String>,
+    ) -> Result<Option<Release>> {
+        if let Some(mut release) = self.get_release(id)? {
+            release.reject(moderator_pubkey, reason);
+            self.put_release(&release)?;
+            Ok(Some(release))
+        } else {
+            Ok(None)
+        }
     }
 
     // --- Content Items ---
 
     /// Store a content item.
     pub fn put_content_item(&self, item: &ContentItem) -> Result<()> {
-        let key = format!("content:{}", item.id);
         let value = serde_json::to_vec(item)?;
-        self.db.put(key.as_bytes(), value)?;
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(CONTENT)?;
+            table.insert(item.id.as_str(), value.as_slice())?;
+        }
+        write_txn.commit()?;
         Ok(())
     }
 
     /// Get a content item by ID.
     pub fn get_content_item(&self, id: &str) -> Result<Option<ContentItem>> {
-        let key = format!("content:{}", id);
-        match self.db.get(key.as_bytes())? {
-            Some(data) => Ok(Some(serde_json::from_slice(&data)?)),
+        let read_txn = self.db.begin_read()?;
+        let table = match read_txn.open_table(CONTENT) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+
+        match table.get(id)? {
+            Some(guard) => {
+                let bytes: &[u8] = guard.value();
+                Ok(Some(serde_json::from_slice(bytes)?))
+            }
             None => Ok(None),
         }
     }
@@ -109,17 +220,30 @@ impl Storage {
 
     /// Store a category.
     pub fn put_category(&self, category: &Category) -> Result<()> {
-        let key = format!("category:{}", category.id);
         let value = serde_json::to_vec(category)?;
-        self.db.put(key.as_bytes(), value)?;
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(CATEGORIES)?;
+            table.insert(category.id.as_str(), value.as_slice())?;
+        }
+        write_txn.commit()?;
         Ok(())
     }
 
     /// Get a category by ID.
     pub fn get_category(&self, id: &str) -> Result<Option<Category>> {
-        let key = format!("category:{}", id);
-        match self.db.get(key.as_bytes())? {
-            Some(data) => Ok(Some(serde_json::from_slice(&data)?)),
+        let read_txn = self.db.begin_read()?;
+        let table = match read_txn.open_table(CATEGORIES) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+
+        match table.get(id)? {
+            Some(guard) => {
+                let bytes: &[u8] = guard.value();
+                Ok(Some(serde_json::from_slice(bytes)?))
+            }
             None => Ok(None),
         }
     }
@@ -131,8 +255,12 @@ impl Storage {
 
     /// Delete a category by ID.
     pub fn delete_category(&self, id: &str) -> Result<()> {
-        let key = format!("category:{}", id);
-        self.db.delete(key.as_bytes())?;
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(CATEGORIES)?;
+            table.remove(id)?;
+        }
+        write_txn.commit()?;
         Ok(())
     }
 
@@ -148,18 +276,19 @@ impl Storage {
 
     /// List all categories.
     pub fn list_categories(&self) -> Result<Vec<Category>> {
-        let prefix = b"category:";
-        let mut categories = Vec::new();
+        let read_txn = self.db.begin_read()?;
+        let table = match read_txn.open_table(CATEGORIES) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
 
-        let iter = self.db.prefix_iterator(prefix);
-        for item in iter {
-            let (key, value) = item?;
-            if key.starts_with(prefix) {
-                let category: Category = serde_json::from_slice(&value)?;
-                categories.push(category);
-            } else {
-                break;
-            }
+        let mut categories = Vec::new();
+        for item in table.iter()? {
+            let (_, value) = item?;
+            let bytes: &[u8] = value.value();
+            let category: Category = serde_json::from_slice(bytes)?;
+            categories.push(category);
         }
 
         Ok(categories)
@@ -169,58 +298,83 @@ impl Storage {
 
     /// Check if a public key is an admin.
     pub fn is_admin(&self, public_key: &str) -> Result<bool> {
-        let key = format!("admin:{}", public_key);
-        Ok(self.db.get(key.as_bytes())?.is_some())
+        let read_txn = self.db.begin_read()?;
+        let table = match read_txn.open_table(ADMINS) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
+            Err(e) => return Err(e.into()),
+        };
+
+        let result: Option<redb::AccessGuard<&[u8]>> = table.get(public_key)?;
+        Ok(result.is_some())
     }
 
     /// Set a public key as admin.
     pub fn set_admin(&self, public_key: &str, is_admin: bool) -> Result<()> {
-        let key = format!("admin:{}", public_key);
-        if is_admin {
-            self.db.put(key.as_bytes(), b"1")?;
-        } else {
-            self.db.delete(key.as_bytes())?;
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(ADMINS)?;
+            if is_admin {
+                table.insert(public_key, &[1u8][..])?;
+            } else {
+                table.remove(public_key)?;
+            }
         }
+        write_txn.commit()?;
         Ok(())
     }
 
     /// Check if a public key has a specific permission.
     pub fn has_permission(&self, public_key: &str, permission: &str) -> Result<bool> {
-        let key = format!("perm:{}:{}", public_key, permission);
-        Ok(self.db.get(key.as_bytes())?.is_some())
+        let key = format!("{}:{}", public_key, permission);
+        let read_txn = self.db.begin_read()?;
+        let table = match read_txn.open_table(PERMISSIONS) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
+            Err(e) => return Err(e.into()),
+        };
+
+        let result: Option<redb::AccessGuard<&[u8]>> = table.get(key.as_str())?;
+        Ok(result.is_some())
     }
 
     /// Grant a permission to a public key.
     pub fn grant_permission(&self, public_key: &str, permission: &str) -> Result<()> {
-        let key = format!("perm:{}:{}", public_key, permission);
-        self.db.put(key.as_bytes(), b"1")?;
+        let key = format!("{}:{}", public_key, permission);
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(PERMISSIONS)?;
+            table.insert(key.as_str(), &[1u8][..])?;
+        }
+        write_txn.commit()?;
         Ok(())
     }
 
     /// Revoke a permission from a public key.
     pub fn revoke_permission(&self, public_key: &str, permission: &str) -> Result<()> {
-        let key = format!("perm:{}:{}", public_key, permission);
-        self.db.delete(key.as_bytes())?;
+        let key = format!("{}:{}", public_key, permission);
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(PERMISSIONS)?;
+            table.remove(key.as_str())?;
+        }
+        write_txn.commit()?;
         Ok(())
     }
 
     /// List all admin public keys.
     pub fn list_admins(&self) -> Result<Vec<String>> {
-        let prefix = b"admin:";
-        let mut admins = Vec::new();
+        let read_txn = self.db.begin_read()?;
+        let table = match read_txn.open_table(ADMINS) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
 
-        let iter = self.db.prefix_iterator(prefix);
-        for item in iter {
+        let mut admins = Vec::new();
+        for item in table.iter()? {
             let (key, _) = item?;
-            if key.starts_with(prefix) {
-                // Extract public key from "admin:{key}"
-                let key_str = String::from_utf8_lossy(&key);
-                if let Some(pk) = key_str.strip_prefix("admin:") {
-                    admins.push(pk.to_string());
-                }
-            } else {
-                break;
-            }
+            admins.push(key.value().to_string());
         }
 
         Ok(admins)
@@ -230,62 +384,92 @@ impl Storage {
 
     /// Get or create the node's signing key (persistent identity).
     pub fn get_or_create_node_key(&self) -> Result<SigningKey> {
-        let key = b"node:signing_key";
+        let read_txn = self.db.begin_read()?;
 
-        if let Some(data) = self.db.get(key)? {
-            // Load existing key
-            let bytes: [u8; 32] = data.as_slice().try_into()
-                .map_err(|_| crate::error::Error::Storage("Invalid stored key".into()))?;
-            Ok(SigningKey::from_bytes(&bytes))
-        } else {
-            // Generate new key and persist it
-            let mut rng = rand::thread_rng();
-            let signing_key = SigningKey::generate(&mut rng);
-            self.db.put(key, signing_key.as_bytes())?;
-            Ok(signing_key)
+        // Try to read existing key
+        if let Ok(table) = read_txn.open_table(NODE_META) {
+            if let Some(guard) = table.get("signing_key")? {
+                let bytes: &[u8] = guard.value();
+                let key_bytes: [u8; 32] = bytes
+                    .try_into()
+                    .map_err(|_| crate::error::Error::Storage("Invalid stored key".into()))?;
+                return Ok(SigningKey::from_bytes(&key_bytes));
+            }
         }
+        drop(read_txn);
+
+        // Generate new key and persist it
+        let mut rng = rand::thread_rng();
+        let signing_key = SigningKey::generate(&mut rng);
+
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(NODE_META)?;
+            table.insert("signing_key", signing_key.as_bytes().as_slice())?;
+        }
+        write_txn.commit()?;
+
+        Ok(signing_key)
     }
 
     // --- Featured Releases ---
 
     /// Store a featured release.
     pub fn put_featured_release(&self, featured: &FeaturedRelease) -> Result<()> {
-        let key = format!("featured:{}", featured.id);
         let value = serde_json::to_vec(featured)?;
-        self.db.put(key.as_bytes(), value)?;
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(FEATURED)?;
+            table.insert(featured.id.as_str(), value.as_slice())?;
+        }
+        write_txn.commit()?;
         Ok(())
     }
 
     /// Get a featured release by ID.
     pub fn get_featured_release(&self, id: &str) -> Result<Option<FeaturedRelease>> {
-        let key = format!("featured:{}", id);
-        match self.db.get(key.as_bytes())? {
-            Some(data) => Ok(Some(serde_json::from_slice(&data)?)),
+        let read_txn = self.db.begin_read()?;
+        let table = match read_txn.open_table(FEATURED) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+
+        match table.get(id)? {
+            Some(guard) => {
+                let bytes: &[u8] = guard.value();
+                Ok(Some(serde_json::from_slice(bytes)?))
+            }
             None => Ok(None),
         }
     }
 
     /// Delete a featured release.
     pub fn delete_featured_release(&self, id: &str) -> Result<()> {
-        let key = format!("featured:{}", id);
-        self.db.delete(key.as_bytes())?;
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(FEATURED)?;
+            table.remove(id)?;
+        }
+        write_txn.commit()?;
         Ok(())
     }
 
     /// List all featured releases.
     pub fn list_featured_releases(&self) -> Result<Vec<FeaturedRelease>> {
-        let prefix = b"featured:";
-        let mut featured = Vec::new();
+        let read_txn = self.db.begin_read()?;
+        let table = match read_txn.open_table(FEATURED) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
 
-        let iter = self.db.prefix_iterator(prefix);
-        for item in iter {
-            let (key, value) = item?;
-            if key.starts_with(prefix) {
-                let fr: FeaturedRelease = serde_json::from_slice(&value)?;
-                featured.push(fr);
-            } else {
-                break;
-            }
+        let mut featured = Vec::new();
+        for item in table.iter()? {
+            let (_, value) = item?;
+            let bytes: &[u8] = value.value();
+            let fr: FeaturedRelease = serde_json::from_slice(bytes)?;
+            featured.push(fr);
         }
 
         Ok(featured)
@@ -306,7 +490,7 @@ mod tests {
     #[test]
     fn storage_roundtrip() {
         let dir = tempdir().unwrap();
-        let storage = Storage::open(dir.path()).unwrap();
+        let storage = Storage::open(dir.path().join("test.redb")).unwrap();
 
         let release = Release::new(
             "test123".to_string(),
@@ -322,7 +506,7 @@ mod tests {
     #[test]
     fn list_releases() {
         let dir = tempdir().unwrap();
-        let storage = Storage::open(dir.path()).unwrap();
+        let storage = Storage::open(dir.path().join("test.redb")).unwrap();
 
         storage
             .put_release(&Release::new("a".into(), "A".into(), "music".into()))
@@ -338,7 +522,7 @@ mod tests {
     #[test]
     fn default_categories() {
         let dir = tempdir().unwrap();
-        let storage = Storage::open(dir.path()).unwrap();
+        let storage = Storage::open(dir.path().join("test.redb")).unwrap();
 
         storage.init_default_categories().unwrap();
 

@@ -179,10 +179,65 @@ The key insight is changing the question:
 ```
 
 FLP didn't break. It just ran out of relevance.
+
+## Bilateral CRDTs (CRDT)
+
+The breakthrough: The CRDT itself is the "other general" in TGP.
+
+### The Insight
+
+Traditional TGP requires network round-trips between parties.
+But for pure, total merge functions, all four TGP levels collapse:
+
+```
+Traditional TGP:     Alice ←── network ──→ Bob
+                     C → D → T → Q (4 phases, latency)
+
+Bilateral CRDT:      You ←── local ──→ CRDT
+                     C=D=T=Q (1 computation, instant)
+```
+
+### Why It Works
+
+* **C (Commitment)**: You propose an operation (local)
+* **D (Double)**: Merge function "accepts" (automatic - total function)
+* **T (Triple)**: You know merge accepted (you ran it)
+* **Q (Quaternary)**: Bilateral fixpoint (determinism - pure functions can't disagree)
+
+### Key Theorems
+
+* `crdt_bilateral` - All CRDT merges have the bilateral property
+* `merge_cannot_disagree` - Pure functions cannot disagree with themselves
+* `tgp_collapse_instant` - TGP collapse requires no network
+* `crdt_produces_collapsed_tgp` - Any CRDT operation produces a collapsed TGP
+* `full_sync_convergence` - Full sync = convergence
+* `partition_tolerant` - No network partition can prevent local operations
+
+### The Guarantee
+
+Traditional CRDTs: "Eventually consistent" (hope for convergence)
+Bilateral CRDTs: "Immediately consistent" (math guarantees convergence)
+
+Same operations + same merge = same result.
+This is not eventual. This is not probabilistic.
+This is MATHEMATICAL CERTAINTY.
+
+### Comparison
+
+| Property | Traditional CRDT | Bilateral CRDT |
+|----------|-----------------|----------------|
+| Network required | For sync | Never (offline-first) |
+| Merge can fail | Possible | Impossible (total function) |
+| Conflict resolution | LWW or custom | Rich semantic merge |
+| Proof of operation | None | Self-certifying |
+| TGP counterparty | Other peer | The CRDT itself |
+| Coordination | Eventual | Immediate (local) |
+
+**The CRDT IS the other general. The merge function IS its signature.**
 -/
 
 import CitadelProofs.Topology
-import CitadelProofs.Spiral
+import CitadelProofs.Spiral3D
 import CitadelProofs.Convergence
 import CitadelProofs.Broadcast
 import CitadelProofs.Spore
@@ -190,3 +245,10 @@ import CitadelProofs.TwoHopKnowledge
 import CitadelProofs.EmergentOmniscience
 import CitadelProofs.FailureDetectorElimination
 import CitadelProofs.FLPBypass
+import CitadelProofs.Constitutional
+import CitadelProofs.CVDF
+import CitadelProofs.VdfRace
+import CitadelProofs.ProofOfLatency
+import CitadelProofs.Transfer
+import CitadelProofs.MeshProtocol
+import CitadelProofs.CRDT

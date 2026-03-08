@@ -3,8 +3,7 @@
 
 FROM rust:latest AS builder
 
-# Install build dependencies for rocksdb
-RUN apt-get update --fix-missing && apt-get install -y --no-install-recommends clang libclang-dev && rm -rf /var/lib/apt/lists/*
+# No external C dependencies needed - ReDB is pure Rust
 
 WORKDIR /build
 
@@ -15,7 +14,7 @@ COPY citadel/Cargo.lock ./
 RUN cat > Cargo.toml << 'EOF'
 [workspace]
 resolver = "2"
-members = ["crates/citadel-lens", "crates/citadel-topology", "crates/citadel-dht", "crates/citadel-protocols", "crates/citadel-spore"]
+members = ["crates/citadel-lens", "crates/citadel-topology", "crates/citadel-dht", "crates/citadel-protocols", "crates/citadel-spore", "crates/citadel-docs", "crates/citadel-crdt"]
 
 [workspace.package]
 version = "0.1.0"
@@ -46,6 +45,8 @@ COPY citadel/crates/citadel-topology ./crates/citadel-topology
 COPY citadel/crates/citadel-dht ./crates/citadel-dht
 COPY citadel/crates/citadel-protocols ./crates/citadel-protocols
 COPY citadel/crates/citadel-spore ./crates/citadel-spore
+COPY citadel/crates/citadel-docs ./crates/citadel-docs
+COPY citadel/crates/citadel-crdt ./crates/citadel-crdt
 
 # Fix two-generals paths for Docker build structure
 RUN sed -i 's|path = "../../../two-generals/rust"|path = "../../two-generals/rust"|' crates/citadel-protocols/Cargo.toml && \
@@ -61,6 +62,8 @@ RUN apt-get update && apt-get install -y \
     ca-certificates \
     libssl3 \
     curl \
+    wget \
+    iproute2 \
     && rm -rf /var/lib/apt/lists/*
 
 # Create non-root user

@@ -539,8 +539,16 @@ impl PoLManager {
         match response.decision {
             SwapDecision::Attack => {
                 // Both agree - transition to swapping
-                if let SlotState::HalfLock { target_slot, target_node, .. } = self.state {
-                    self.state = SlotState::Swapping { target_slot, target_node };
+                if let SlotState::HalfLock {
+                    target_slot,
+                    target_node,
+                    ..
+                } = self.state
+                {
+                    self.state = SlotState::Swapping {
+                        target_slot,
+                        target_node,
+                    };
                     SwapDecision::Attack
                 } else {
                     SwapDecision::Retreat
@@ -557,8 +565,16 @@ impl PoLManager {
 
     /// Commit to ATTACK (finalize swap)
     pub fn commit_attack(&mut self) -> bool {
-        if let SlotState::HalfLock { target_slot, target_node, .. } = self.state {
-            self.state = SlotState::Swapping { target_slot, target_node };
+        if let SlotState::HalfLock {
+            target_slot,
+            target_node,
+            ..
+        } = self.state
+        {
+            self.state = SlotState::Swapping {
+                target_slot,
+                target_node,
+            };
             true
         } else {
             false
@@ -567,7 +583,9 @@ impl PoLManager {
 
     /// RETREAT (abort swap)
     pub fn retreat(&mut self) {
-        if let SlotState::HalfLock { target_node, .. } | SlotState::Swapping { target_node, .. } = self.state {
+        if let SlotState::HalfLock { target_node, .. } | SlotState::Swapping { target_node, .. } =
+            self.state
+        {
             self.pending_proposals.remove(&target_node);
         }
         self.state = SlotState::Active;
@@ -682,26 +700,30 @@ mod tests {
 
         // Current position: 10ms average
         let current_proofs: Vec<LatencyProof> = (0..5)
-            .map(|i| LatencyProof::new(
-                key.verifying_key().to_bytes(),
-                [i as u8; 32],
-                10000, // 10ms
-                100,
-                [42u8; 32],
-                &key,
-            ))
+            .map(|i| {
+                LatencyProof::new(
+                    key.verifying_key().to_bytes(),
+                    [i as u8; 32],
+                    10000, // 10ms
+                    100,
+                    [42u8; 32],
+                    &key,
+                )
+            })
             .collect();
 
         // Target position: 5ms average (improvement!)
         let target_proofs: Vec<LatencyProof> = (0..5)
-            .map(|i| LatencyProof::new(
-                key.verifying_key().to_bytes(),
-                [i as u8 + 10; 32],
-                5000, // 5ms
-                100,
-                [42u8; 32],
-                &key,
-            ))
+            .map(|i| {
+                LatencyProof::new(
+                    key.verifying_key().to_bytes(),
+                    [i as u8 + 10; 32],
+                    5000, // 5ms
+                    100,
+                    [42u8; 32],
+                    &key,
+                )
+            })
             .collect();
 
         let proposal = SwapProposal::new(
@@ -726,26 +748,30 @@ mod tests {
 
         // Current position: 5ms average
         let current_proofs: Vec<LatencyProof> = (0..5)
-            .map(|i| LatencyProof::new(
-                key.verifying_key().to_bytes(),
-                [i as u8; 32],
-                5000, // 5ms
-                100,
-                [42u8; 32],
-                &key,
-            ))
+            .map(|i| {
+                LatencyProof::new(
+                    key.verifying_key().to_bytes(),
+                    [i as u8; 32],
+                    5000, // 5ms
+                    100,
+                    [42u8; 32],
+                    &key,
+                )
+            })
             .collect();
 
         // Target position: 10ms average (WORSE!)
         let target_proofs: Vec<LatencyProof> = (0..5)
-            .map(|i| LatencyProof::new(
-                key.verifying_key().to_bytes(),
-                [i as u8 + 10; 32],
-                10000, // 10ms
-                100,
-                [42u8; 32],
-                &key,
-            ))
+            .map(|i| {
+                LatencyProof::new(
+                    key.verifying_key().to_bytes(),
+                    [i as u8 + 10; 32],
+                    10000, // 10ms
+                    100,
+                    [42u8; 32],
+                    &key,
+                )
+            })
             .collect();
 
         let proposal = SwapProposal::new(

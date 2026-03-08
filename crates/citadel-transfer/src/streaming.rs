@@ -18,7 +18,9 @@ use bytes::Bytes;
 use tokio::sync::{mpsc, Mutex};
 
 use crate::transport::TransportHandle;
-use crate::types::{Epoch, NodeId, Packet, PacketHeader, SeqNo, StreamId, MsgKind, DEFAULT_PAYLOAD_MTU};
+use crate::types::{
+    Epoch, MsgKind, NodeId, Packet, PacketHeader, SeqNo, StreamId, DEFAULT_PAYLOAD_MTU,
+};
 
 /// Configuration for TGP streaming
 #[derive(Debug, Clone)]

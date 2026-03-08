@@ -164,10 +164,11 @@ impl FlyCamera {
 
         // Apply movement in world space
         if move_input.length_squared() > 0.0 {
-            let velocity = (forward_dir * move_input.z + right_dir * move_input.x + up_dir * move_input.y)
-                .normalize_or_zero()
-                * self.speed
-                * dt;
+            let velocity =
+                (forward_dir * move_input.z + right_dir * move_input.x + up_dir * move_input.y)
+                    .normalize_or_zero()
+                    * self.speed
+                    * dt;
             self.position += velocity;
         }
     }

@@ -198,11 +198,11 @@ impl PeerInfo {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum NeighborType {
     /// 6 planar neighbors (same layer).
-    Planar(u8),  // 0-5
+    Planar(u8), // 0-5
     /// 2 vertical neighbors (directly above/below).
-    Vertical(bool),  // true = above, false = below
+    Vertical(bool), // true = above, false = below
     /// 12 extended neighbors (6 above + 6 below diagonally).
-    Extended(bool, u8),  // (above?, direction 0-5)
+    Extended(bool, u8), // (above?, direction 0-5)
 }
 
 /// The three knowledge modes for routing.
@@ -391,9 +391,7 @@ impl PeerKnowledge {
 
     /// Find the neighbor closest to a target in hash space.
     pub fn closest_neighbor_to(&self, target: &PeerId) -> Option<&PeerId> {
-        self.neighbors
-            .iter()
-            .min_by_key(|n| n.xor_distance(target))
+        self.neighbors.iter().min_by_key(|n| n.xor_distance(target))
     }
 
     /// Find k closest peers to a target (for DHT queries).
@@ -434,7 +432,8 @@ impl PeerKnowledge {
     /// Expire peers not seen within a duration.
     pub fn expire_stale(&mut self, max_age: Duration) -> Vec<PeerId> {
         let now = Instant::now();
-        let expired: Vec<_> = self.last_seen
+        let expired: Vec<_> = self
+            .last_seen
             .iter()
             .filter(|(_, seen)| now.duration_since(**seen) > max_age)
             .map(|(id, _)| *id)
@@ -461,19 +460,22 @@ impl PeerKnowledge {
     pub fn to_spore_have_list(&self) -> Vec<([u8; 32], [u8; 32])> {
         // For now, represent each peer as a point range [id, id+1)
         // In production, adjacent IDs would be merged into ranges
-        self.peers.keys().map(|id| {
-            let mut end = id.0;
-            // Increment by 1 (with overflow handling)
-            for i in (0..32).rev() {
-                if end[i] == 255 {
-                    end[i] = 0;
-                } else {
-                    end[i] += 1;
-                    break;
+        self.peers
+            .keys()
+            .map(|id| {
+                let mut end = id.0;
+                // Increment by 1 (with overflow handling)
+                for i in (0..32).rev() {
+                    if end[i] == 255 {
+                        end[i] = 0;
+                    } else {
+                        end[i] += 1;
+                        break;
+                    }
                 }
-            }
-            (id.0, end)
-        }).collect()
+                (id.0, end)
+            })
+            .collect()
     }
 
     /// Get statistics about peer knowledge.
@@ -503,7 +505,11 @@ impl std::fmt::Display for PeerKnowledgeStats {
             "PeerKnowledge: {} total, {} neighbors ({}), {} 2-hop",
             self.total_peers,
             self.direct_neighbors,
-            if self.has_full_neighbors { "full" } else { "partial" },
+            if self.has_full_neighbors {
+                "full"
+            } else {
+                "partial"
+            },
             self.two_hop_reachable
         )
     }
@@ -530,7 +536,7 @@ impl PeerSpore {
     pub fn new() -> Self {
         Self {
             have_ranges: Vec::new(),
-            want_ranges: vec![([0u8; 32], [0xff; 32])],  // Want entire space
+            want_ranges: vec![([0u8; 32], [0xff; 32])], // Want entire space
         }
     }
 

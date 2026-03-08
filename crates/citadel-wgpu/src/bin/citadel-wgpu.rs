@@ -159,61 +159,74 @@ impl App {
 
         // Process gamepad events
         while let Some(GilrsEvent { id, event, .. }) = gilrs.next_event() {
-            if let gilrs::EventType::ButtonPressed(btn, _) = event { match btn {
-                Button::South | Button::Start => {
-                    self.playing = !self.playing;
-                    tracing::info!(
-                        "Playback: {}",
-                        if self.playing { "playing" } else { "paused" }
-                    );
-                }
-                Button::East | Button::Select => {
-                    self.playback_frame = 0.0;
-                    if let Some(mesh) = &mut renderer.mesh_data {
-                        mesh.set_visible(0);
+            match event {
+                gilrs::EventType::ButtonPressed(btn, _) => match btn {
+                    Button::South | Button::Start => {
+                        self.playing = !self.playing;
+                        tracing::info!(
+                            "Playback: {}",
+                            if self.playing { "playing" } else { "paused" }
+                        );
                     }
-                    if let Some(traffic) = &mut self.traffic {
-                        traffic.clear();
+                    Button::East | Button::Select => {
+                        self.playback_frame = 0.0;
+                        if let Some(mesh) = &mut renderer.mesh_data {
+                            mesh.set_visible(0);
+                        }
+                        if let Some(traffic) = &mut self.traffic {
+                            traffic.clear();
+                        }
+                        tracing::info!("Playback reset");
                     }
-                    tracing::info!("Playback reset");
-                }
-                Button::LeftTrigger => {
-                    self.playback_speed = (self.playback_speed / 1.5).max(100.0);
-                    tracing::info!("Playback speed: {:.0} nodes/s", self.playback_speed);
-                }
-                Button::RightTrigger => {
-                    self.playback_speed = (self.playback_speed * 1.5).min(100000.0);
-                    tracing::info!("Playback speed: {:.0} nodes/s", self.playback_speed);
-                }
-                Button::North => {
-                    renderer.camera.reset();
-                    tracing::info!("Camera reset");
-                }
-                Button::DPadUp => {
-                    renderer.camera.speed *= 1.5;
-                    tracing::info!("Speed: {:.0}", renderer.camera.speed);
-                }
-                Button::DPadDown => {
-                    renderer.camera.speed /= 1.5;
-                    tracing::info!("Speed: {:.0}", renderer.camera.speed);
-                }
-                // L4/R4 - try multiple button mappings
-                // 8BitDo might map back paddles as C, Z, Mode, or other buttons
-                Button::C | Button::Z | Button::Mode => {
-                    // Toggle based on which one - C/Mode for broadcast, Z for unicast
-                    if btn == Button::C || btn == Button::Mode {
-                        self.continuous_broadcast = !self.continuous_broadcast;
-                        tracing::info!("Continuous broadcast: {}", if self.continuous_broadcast { "ON" } else { "OFF" });
-                    } else {
-                        self.continuous_unicast = !self.continuous_unicast;
-                        tracing::info!("Continuous unicast: {}", if self.continuous_unicast { "ON" } else { "OFF" });
+                    Button::LeftTrigger => {
+                        self.playback_speed = (self.playback_speed / 1.5).max(100.0);
+                        tracing::info!("Playback speed: {:.0} nodes/s", self.playback_speed);
                     }
-                }
-                Button::Unknown => {
-                    tracing::info!("Unknown button pressed - might be L4/R4");
-                }
+                    Button::RightTrigger => {
+                        self.playback_speed = (self.playback_speed * 1.5).min(100000.0);
+                        tracing::info!("Playback speed: {:.0} nodes/s", self.playback_speed);
+                    }
+                    Button::North => {
+                        renderer.camera.reset();
+                        tracing::info!("Camera reset");
+                    }
+                    Button::DPadUp => {
+                        renderer.camera.speed *= 1.5;
+                        tracing::info!("Speed: {:.0}", renderer.camera.speed);
+                    }
+                    Button::DPadDown => {
+                        renderer.camera.speed /= 1.5;
+                        tracing::info!("Speed: {:.0}", renderer.camera.speed);
+                    }
+                    // L4/R4 - try multiple button mappings
+                    // 8BitDo might map back paddles as C, Z, Mode, or other buttons
+                    Button::C | Button::Z | Button::Mode => {
+                        // Toggle based on which one - C/Mode for broadcast, Z for unicast
+                        if btn == Button::C || btn == Button::Mode {
+                            self.continuous_broadcast = !self.continuous_broadcast;
+                            tracing::info!(
+                                "Continuous broadcast: {}",
+                                if self.continuous_broadcast {
+                                    "ON"
+                                } else {
+                                    "OFF"
+                                }
+                            );
+                        } else {
+                            self.continuous_unicast = !self.continuous_unicast;
+                            tracing::info!(
+                                "Continuous unicast: {}",
+                                if self.continuous_unicast { "ON" } else { "OFF" }
+                            );
+                        }
+                    }
+                    Button::Unknown => {
+                        tracing::info!("Unknown button pressed - might be L4/R4");
+                    }
+                    _ => {}
+                },
                 _ => {}
-            } }
+            }
             tracing::debug!("Gamepad {:?} event: {:?}", id, event);
         }
 
@@ -235,10 +248,12 @@ impl App {
 
             // LT for unicast traffic, RT for broadcast traffic
             // Triggers are reported as buttons with analog values (0.0 to 1.0)
-            let lt = gamepad.button_data(Button::LeftTrigger2)
+            let lt = gamepad
+                .button_data(Button::LeftTrigger2)
                 .map(|d| d.value())
                 .unwrap_or(0.0);
-            let rt = gamepad.button_data(Button::RightTrigger2)
+            let rt = gamepad
+                .button_data(Button::RightTrigger2)
                 .map(|d| d.value())
                 .unwrap_or(0.0);
 
@@ -490,7 +505,9 @@ impl ApplicationHandler for App {
                     }
 
                     // Get visible node count for traffic bounds
-                    let visible_nodes = renderer.mesh_data.as_ref()
+                    let visible_nodes = renderer
+                        .mesh_data
+                        .as_ref()
                         .map(|m| m.visible_count)
                         .unwrap_or(0);
 
