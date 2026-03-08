@@ -145,14 +145,16 @@ impl TrafficSimulation {
             .collect();
 
         // Calculate mesh bounds for toroidal wrapping
-        let bounds_min = node_coords.iter().fold(
-            (i64::MAX, i64::MAX, i64::MAX),
-            |(mq, mr, mz), c| (mq.min(c.q), mr.min(c.r), mz.min(c.z)),
-        );
-        let bounds_max = node_coords.iter().fold(
-            (i64::MIN, i64::MIN, i64::MIN),
-            |(mq, mr, mz), c| (mq.max(c.q), mr.max(c.r), mz.max(c.z)),
-        );
+        let bounds_min = node_coords
+            .iter()
+            .fold((i64::MAX, i64::MAX, i64::MAX), |(mq, mr, mz), c| {
+                (mq.min(c.q), mr.min(c.r), mz.min(c.z))
+            });
+        let bounds_max = node_coords
+            .iter()
+            .fold((i64::MIN, i64::MIN, i64::MIN), |(mq, mr, mz), c| {
+                (mq.max(c.q), mr.max(c.r), mz.max(c.z))
+            });
 
         Self {
             node_coords,
@@ -164,7 +166,7 @@ impl TrafficSimulation {
             packets: Vec::with_capacity(100000),
             broadcast_waves: Vec::new(),
             unicast_paths: Vec::new(),
-            packet_speed: 33.0,  // ~30ms per hop for packets
+            packet_speed: 33.0, // ~30ms per hop for packets
             stats: TrafficStats::default(),
             rng_state: 12345,
             path_active: false,
@@ -178,7 +180,10 @@ impl TrafficSimulation {
 
     /// Simple random number generator.
     fn rand(&mut self) -> u64 {
-        self.rng_state = self.rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+        self.rng_state = self
+            .rng_state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1);
         self.rng_state
     }
 
@@ -216,7 +221,10 @@ impl TrafficSimulation {
         neighbors
             .iter()
             .filter_map(|&n| {
-                self.coord_to_idx.get(&n).copied().filter(|&idx| idx < self.visible_nodes as usize)
+                self.coord_to_idx
+                    .get(&n)
+                    .copied()
+                    .filter(|&idx| idx < self.visible_nodes as usize)
             })
             .collect()
     }
@@ -389,7 +397,9 @@ impl TrafficSimulation {
 
         let wrap_coord = |coord: HexCoord| -> HexCoord {
             let wrap = |v: i64, min: i64, range: i64| -> i64 {
-                if range <= 0 { return v; }
+                if range <= 0 {
+                    return v;
+                }
                 min + (v - min).rem_euclid(range)
             };
             HexCoord::new(
@@ -414,8 +424,8 @@ impl TrafficSimulation {
 
                     for &neighbor_coord in neighbors.iter() {
                         // Try direct lookup first, then wrap toroidally
-                        let neighbor_idx = self.coord_to_idx.get(&neighbor_coord).copied()
-                            .or_else(|| {
+                        let neighbor_idx =
+                            self.coord_to_idx.get(&neighbor_coord).copied().or_else(|| {
                                 let wrapped = wrap_coord(neighbor_coord);
                                 self.coord_to_idx.get(&wrapped).copied()
                             });
@@ -434,11 +444,15 @@ impl TrafficSimulation {
 
                             wave.reached.insert(neighbor_idx);
                             // Random latency for this hop: 95% = 30ms, 5% = 30-150ms
-                            let hop_latency = if (self.rng_state.wrapping_mul(2685821657736338717) >> 56) < 243 {
-                                0.03
-                            } else {
-                                0.03 + ((self.rng_state.wrapping_mul(1103515245) >> 40) & 0xFFFF) as f32 / 0xFFFF as f32 * 0.12
-                            };
+                            let hop_latency =
+                                if (self.rng_state.wrapping_mul(2685821657736338717) >> 56) < 243 {
+                                    0.03
+                                } else {
+                                    0.03 + ((self.rng_state.wrapping_mul(1103515245) >> 40)
+                                        & 0xFFFF) as f32
+                                        / 0xFFFF as f32
+                                        * 0.12
+                                };
                             self.rng_state = self.rng_state.wrapping_add(1);
                             new_hops.push((node_idx, neighbor_idx, hop_latency));
                         }
@@ -456,7 +470,9 @@ impl TrafficSimulation {
         // Apply the wave updates (add new frontier nodes)
         for (wave_idx, hops) in wave_updates {
             for (from, to, delay) in hops {
-                self.broadcast_waves[wave_idx].frontier.push((to, Some(from), delay));
+                self.broadcast_waves[wave_idx]
+                    .frontier
+                    .push((to, Some(from), delay));
             }
         }
 
@@ -488,7 +504,8 @@ impl TrafficSimulation {
         }
 
         // Remove completed paths (keep for a bit after completion)
-        self.unicast_paths.retain(|p| p.progress < (p.path.len() as f32 + 2.0));
+        self.unicast_paths
+            .retain(|p| p.progress < (p.path.len() as f32 + 2.0));
 
         // Update path_active state
         self.path_active = !self.unicast_paths.is_empty();
@@ -537,7 +554,7 @@ impl TrafficSimulation {
         for path in &self.unicast_paths {
             if path.path.len() > 1 {
                 let path_color = 0xFFFFFF00; // Yellow (ABGR)
-                let dim_color = 0x8080FF00;  // Dimmer yellow
+                let dim_color = 0x8080FF00; // Dimmer yellow
 
                 for i in 0..(path.path.len() - 1) {
                     let src_pos = self.node_positions[path.path[i]];

@@ -4,7 +4,10 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use axum::{
-    extract::{State, ws::{WebSocket, WebSocketUpgrade, Message}},
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        State,
+    },
     response::{Html, IntoResponse},
     routing::{get, post},
     Json, Router,
@@ -161,17 +164,18 @@ async fn step_handler(
 ) -> Json<PlaybackStatus> {
     let mut playback = state.playback.write().await;
     match req.direction.as_str() {
-        "forward" => { playback.step_forward(); }
-        "backward" => { playback.step_backward(); }
+        "forward" => {
+            playback.step_forward();
+        }
+        "backward" => {
+            playback.step_backward();
+        }
         _ => {}
     }
     Json(PlaybackStatus::from(&*playback))
 }
 
-async fn ws_handler(
-    ws: WebSocketUpgrade,
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
+async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_ws(socket, state))
 }
 

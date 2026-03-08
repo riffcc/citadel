@@ -64,7 +64,10 @@ impl P2pClient {
         let peer_id = format!("browser-{}", js_sys::Math::random());
         let peer_hex = peer_id_to_hex(&peer_id);
 
-        console_log!("🌐 Creating Citadel WebRTC P2P client with peer_id: {}", peer_id);
+        console_log!(
+            "🌐 Creating Citadel WebRTC P2P client with peer_id: {}",
+            peer_id
+        );
         console_log!("🔷 Peer hex coordinate: {:016x}", peer_hex);
 
         P2pClient {

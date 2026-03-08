@@ -13,13 +13,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Parse command line args
     let args: Vec<String> = env::args().collect();
 
-    let node_count: usize = args.get(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(100);
+    let node_count: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(100);
 
-    let port: u16 = args.get(2)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(3000);
+    let port: u16 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(3000);
 
     println!("Citadel Mesh Visualizer");
     println!("=======================");

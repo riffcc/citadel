@@ -4,10 +4,10 @@
 
 use std::collections::HashMap;
 
-use citadel_topology::{HexCoord, Spiral3DIndex, spiral3d_to_coord, Neighbors};
 use citadel_consensus::validation_threshold;
+use citadel_topology::{spiral3d_to_coord, HexCoord, Neighbors, Spiral3DIndex};
 
-use crate::events::{MeshEvent, NodeId, NodeState, ConnectionState, MeshSnapshot};
+use crate::events::{ConnectionState, MeshEvent, MeshSnapshot, NodeId, NodeState};
 
 /// Configuration for the simulation.
 #[derive(Debug, Clone)]
@@ -171,7 +171,9 @@ impl Simulation {
     /// Get a snapshot of the mesh at the current state.
     pub fn snapshot(&self) -> MeshSnapshot {
         let nodes: Vec<_> = self.nodes.values().cloned().collect();
-        let connections: Vec<_> = self.nodes.values()
+        let connections: Vec<_> = self
+            .nodes
+            .values()
             .flat_map(|n| {
                 n.connections.iter().map(move |&to| ConnectionState {
                     from: n.id,
@@ -269,7 +271,9 @@ mod tests {
         sim.run_assembly(5);
 
         // Should have at least 5 NodeJoined events
-        let join_events = sim.events().iter()
+        let join_events = sim
+            .events()
+            .iter()
             .filter(|e| matches!(e, MeshEvent::NodeJoined { .. }))
             .count();
 

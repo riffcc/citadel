@@ -204,10 +204,20 @@ impl App {
                         // Toggle based on which one - C/Mode for broadcast, Z for unicast
                         if btn == Button::C || btn == Button::Mode {
                             self.continuous_broadcast = !self.continuous_broadcast;
-                            tracing::info!("Continuous broadcast: {}", if self.continuous_broadcast { "ON" } else { "OFF" });
+                            tracing::info!(
+                                "Continuous broadcast: {}",
+                                if self.continuous_broadcast {
+                                    "ON"
+                                } else {
+                                    "OFF"
+                                }
+                            );
                         } else {
                             self.continuous_unicast = !self.continuous_unicast;
-                            tracing::info!("Continuous unicast: {}", if self.continuous_unicast { "ON" } else { "OFF" });
+                            tracing::info!(
+                                "Continuous unicast: {}",
+                                if self.continuous_unicast { "ON" } else { "OFF" }
+                            );
                         }
                     }
                     Button::Unknown => {
@@ -238,10 +248,12 @@ impl App {
 
             // LT for unicast traffic, RT for broadcast traffic
             // Triggers are reported as buttons with analog values (0.0 to 1.0)
-            let lt = gamepad.button_data(Button::LeftTrigger2)
+            let lt = gamepad
+                .button_data(Button::LeftTrigger2)
                 .map(|d| d.value())
                 .unwrap_or(0.0);
-            let rt = gamepad.button_data(Button::RightTrigger2)
+            let rt = gamepad
+                .button_data(Button::RightTrigger2)
                 .map(|d| d.value())
                 .unwrap_or(0.0);
 
@@ -493,7 +505,9 @@ impl ApplicationHandler for App {
                     }
 
                     // Get visible node count for traffic bounds
-                    let visible_nodes = renderer.mesh_data.as_ref()
+                    let visible_nodes = renderer
+                        .mesh_data
+                        .as_ref()
                         .map(|m| m.visible_count)
                         .unwrap_or(0);
 

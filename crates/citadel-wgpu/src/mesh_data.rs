@@ -34,11 +34,7 @@ impl MeshData {
             .collect();
 
         let gen_time = start.elapsed();
-        tracing::info!(
-            "Generated {} instances in {:?}",
-            instances.len(),
-            gen_time
-        );
+        tracing::info!("Generated {} instances in {:?}", instances.len(), gen_time);
 
         // Create GPU buffer
         let instance_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {

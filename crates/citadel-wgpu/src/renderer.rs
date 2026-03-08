@@ -265,49 +265,50 @@ impl Renderer {
         });
 
         // Create traffic point pipeline (same as point shader but using LineVertex layout)
-        let traffic_point_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Traffic Point Pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &point_shader,
-                entry_point: Some("vs_main"),
-                buffers: &[LineVertex::buffer_layout()],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &point_shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: config.format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::PointList,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: None,
-                polygon_mode: wgpu::PolygonMode::Fill,
-                unclipped_depth: false,
-                conservative: false,
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: false, // Traffic points render on top
-                depth_compare: wgpu::CompareFunction::Always,
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: wgpu::MultisampleState {
-                count: 1,
-                mask: !0,
-                alpha_to_coverage_enabled: false,
-            },
-            multiview: None,
-            cache: None,
-        });
+        let traffic_point_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("Traffic Point Pipeline"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &point_shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[LineVertex::buffer_layout()],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &point_shader,
+                    entry_point: Some("fs_main"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: config.format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::PointList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled: false, // Traffic points render on top
+                    depth_compare: wgpu::CompareFunction::Always,
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState {
+                    count: 1,
+                    mask: !0,
+                    alpha_to_coverage_enabled: false,
+                },
+                multiview: None,
+                cache: None,
+            });
 
         Self {
             surface,
@@ -380,7 +381,10 @@ impl Renderer {
 
         // Create or recreate buffer if needed
         let buffer_size = (vertices.len() * std::mem::size_of::<LineVertex>()) as u64;
-        let needs_new_buffer = self.line_buffer.as_ref().map_or(true, |b| b.size() < buffer_size);
+        let needs_new_buffer = self
+            .line_buffer
+            .as_ref()
+            .map_or(true, |b| b.size() < buffer_size);
 
         if needs_new_buffer {
             self.line_buffer = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -392,7 +396,8 @@ impl Renderer {
         }
 
         if let Some(buffer) = &self.line_buffer {
-            self.queue.write_buffer(buffer, 0, bytemuck::cast_slice(vertices));
+            self.queue
+                .write_buffer(buffer, 0, bytemuck::cast_slice(vertices));
         }
         self.line_vertex_count = vertices.len() as u32;
     }
@@ -406,7 +411,10 @@ impl Renderer {
         }
 
         let buffer_size = (vertices.len() * std::mem::size_of::<LineVertex>()) as u64;
-        let needs_new_buffer = self.traffic_point_buffer.as_ref().map_or(true, |b| b.size() < buffer_size);
+        let needs_new_buffer = self
+            .traffic_point_buffer
+            .as_ref()
+            .map_or(true, |b| b.size() < buffer_size);
 
         if needs_new_buffer {
             self.traffic_point_buffer = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -418,7 +426,8 @@ impl Renderer {
         }
 
         if let Some(buffer) = &self.traffic_point_buffer {
-            self.queue.write_buffer(buffer, 0, bytemuck::cast_slice(vertices));
+            self.queue
+                .write_buffer(buffer, 0, bytemuck::cast_slice(vertices));
         }
         self.traffic_point_count = vertices.len() as u32;
     }
@@ -439,8 +448,11 @@ impl Renderer {
             mesh_alpha: self.mesh_alpha,
             _padding: [0.0; 2],
         };
-        self.queue
-            .write_buffer(&self.camera_buffer, 0, bytemuck::cast_slice(&[camera_uniform]));
+        self.queue.write_buffer(
+            &self.camera_buffer,
+            0,
+            bytemuck::cast_slice(&[camera_uniform]),
+        );
 
         let mut encoder = self
             .device

@@ -123,18 +123,31 @@ impl MeshSnapshot {
 
         for event in events.iter().take(up_to_event) {
             match event {
-                MeshEvent::NodeJoined { node, slot, coord, frame: f } => {
+                MeshEvent::NodeJoined {
+                    node,
+                    slot,
+                    coord,
+                    frame: f,
+                } => {
                     frame = *f;
-                    nodes.insert(*node, NodeState {
-                        id: *node,
-                        slot: *slot,
-                        coord: *coord,
-                        connections: Vec::new(),
-                        is_valid: false,
-                    });
+                    nodes.insert(
+                        *node,
+                        NodeState {
+                            id: *node,
+                            slot: *slot,
+                            coord: *coord,
+                            connections: Vec::new(),
+                            is_valid: false,
+                        },
+                    );
                     frontier_ring = frontier_ring.max(slot.ring());
                 }
-                MeshEvent::ConnectionEstablished { from, to, direction, frame: f } => {
+                MeshEvent::ConnectionEstablished {
+                    from,
+                    to,
+                    direction,
+                    frame: f,
+                } => {
                     frame = *f;
                     connections.push(ConnectionState {
                         from: *from,
@@ -158,8 +171,9 @@ impl MeshSnapshot {
                     frame = *f;
                     // Mark connection as bidirectional
                     for conn in &mut connections {
-                        if (conn.from == *from && conn.to == *to) ||
-                           (conn.from == *to && conn.to == *from) {
+                        if (conn.from == *from && conn.to == *to)
+                            || (conn.from == *to && conn.to == *from)
+                        {
                             conn.is_bidirectional = true;
                         }
                     }
@@ -175,7 +189,12 @@ impl MeshSnapshot {
                     nodes.remove(node);
                     connections.retain(|c| c.from != *node && c.to != *node);
                 }
-                MeshEvent::NodeNudged { node, to_slot, frame: f, .. } => {
+                MeshEvent::NodeNudged {
+                    node,
+                    to_slot,
+                    frame: f,
+                    ..
+                } => {
                     frame = *f;
                     if let Some(n) = nodes.get_mut(node) {
                         n.slot = *to_slot;
