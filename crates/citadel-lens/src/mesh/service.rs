@@ -14,7 +14,7 @@ use crate::liveness::{LivenessManager, MeshVouch, PropagationDecision};
 use crate::models::FeaturedRelease;
 use crate::storage::Storage;
 use crate::vdf_race::{claim_has_priority, AnchoredSlotClaim, VdfLink, VdfRace};
-use citadel_ygg::{find_peer_by_remote_ip, query_peers, YggMetricsStore};
+use citadel_ygg::{find_peer_by_remote_ip, query_peers, query_self_sync, YggMetricsStore};
 use citadel_docs::DocumentStore;
 use citadel_protocols::{
     CoordinatorConfig, FloodRateConfig, KeyPair, Message as TgpMessage, MessagePayload,
@@ -106,6 +106,38 @@ impl MeshService {
         }
 
         None
+    }
+
+    async fn prime_ygg_public_addr(&self) {
+        if self.announce_addr.is_some() {
+            return;
+        }
+
+        let Some(socket_path) = self.ygg_admin_socket.clone() else {
+            return;
+        };
+
+        let listen_port = self.listen_addr.port();
+        let ygg_addr = match tokio::task::spawn_blocking(move || query_self_sync(&socket_path)).await
+        {
+            Ok(Ok(Some(addr))) => addr,
+            Ok(Ok(None)) => return,
+            Ok(Err(err)) => {
+                debug!("ygg self query failed: {}", err);
+                return;
+            }
+            Err(err) => {
+                debug!("ygg self query join failure: {}", err);
+                return;
+            }
+        };
+
+        let public_addr = SocketAddr::new(std::net::IpAddr::V6(ygg_addr), listen_port);
+        let mut state = self.state.write().await;
+        if state.observed_public_addr.is_none() {
+            state.observed_public_addr = Some(public_addr);
+            info!("Advertising Ygg public address {}", public_addr);
+        }
     }
 
     /// Create a new mesh service
@@ -2027,6 +2059,7 @@ impl MeshService {
         if let Some(announce) = self.announce_addr {
             info!("Announcing as {} (public address)", announce);
         }
+        self.prime_ygg_public_addr().await;
 
         // Start TCP listener for incoming connections
         let listener = TcpListener::bind(self.listen_addr).await?;
