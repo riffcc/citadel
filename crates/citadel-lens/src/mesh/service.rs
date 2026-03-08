@@ -37,7 +37,7 @@ use super::peer::{
 };
 use super::slot::{consensus_threshold, SlotClaim};
 use super::spore::{build_spore_havelist, release_id_to_u256};
-use super::state::MeshState;
+use super::state::{MeshState, PendingSlotClaim};
 use super::tgp::TgpSession;
 
 /// Citadel Mesh Service
@@ -73,6 +73,15 @@ pub struct MeshService {
 }
 
 impl MeshService {
+    fn scaled_slot_claim_threshold(mesh_size: usize, validator_count: usize) -> usize {
+        let threshold = consensus_threshold(mesh_size);
+        if validator_count >= 20 {
+            threshold
+        } else {
+            std::cmp::max(1, (validator_count * threshold + 19) / 20)
+        }
+    }
+
     /// Create a new mesh service
     pub fn new(
         listen_addr: SocketAddr,
@@ -268,8 +277,16 @@ impl MeshService {
             return;
         }
 
+        let mesh_size = state.claimed_slots.len();
+        let validator_count = peers_to_tgp.len();
+        let scaled_threshold = Self::scaled_slot_claim_threshold(mesh_size, validator_count);
+
         // Set pending claim ONLY if we have peers to TGP with
-        state.pending_slot_claim = Some(target_slot);
+        state.pending_slot_claim = Some(PendingSlotClaim::new(
+            target_slot,
+            validator_count,
+            scaled_threshold,
+        ));
         let target_coord = spiral3d_to_coord(Spiral3DIndex::new(target_slot));
         let commitment_msg = format!(
             "mesh_slot:{}:{}:{}",
@@ -280,9 +297,8 @@ impl MeshService {
         drop(state);
 
         info!(
-            "Starting TGP for slot {} with {} peers",
-            target_slot,
-            peers_to_tgp.len()
+            "Starting TGP for slot {} with {} peers (need {} completions)",
+            target_slot, validator_count, scaled_threshold
         );
 
         // Create TGP sessions and send first messages
@@ -465,8 +481,8 @@ impl MeshService {
 
         // If claim won, also update claimed_slots for REST API / WebSocket visibility
         if wins {
-            // Convert claimer public key to peer_id format: "b3b3/<pubkey_hex>"
-            let peer_id = format!("b3b3/{}", hex::encode(claimer_pubkey));
+            // Canonicalize peer IDs from pubkeys so VDF/TGP/TCP all agree.
+            let peer_id = compute_peer_id_from_bytes(&claimer_pubkey);
 
             // Remove old slot if this peer claimed a different one
             let old_slot = state
@@ -1239,12 +1255,7 @@ impl MeshService {
 
         // Calculate scaled threshold based on existing neighbors
         // If only 6 neighbors exist, we need ceil(6 * threshold / 20)
-        let scaled_threshold = if validator_count >= 20 {
-            threshold
-        } else {
-            // Scale proportionally but require at least 1
-            std::cmp::max(1, (validator_count * threshold + 19) / 20)
-        };
+        let scaled_threshold = Self::scaled_slot_claim_threshold(mesh_size, validator_count);
 
         info!(
             "Scaled threshold: {} of {} existing neighbors (full threshold: {} of 20)",
@@ -1688,9 +1699,8 @@ impl MeshService {
                     (id.clone(), keypair, counterparty)
                 }
                 None => {
-                    // Unknown peer - create peer_id from their public key (TCP-free TGP!)
-                    // Format: "b3b3/<pubkey_hex>" - consistent with how we generate our own ID
-                    let peer_id = format!("b3b3/{}", hex::encode(&sender_pubkey));
+                    // Unknown peer - create canonical peer_id from their public key.
+                    let peer_id = compute_peer_id_from_bytes(&sender_pubkey);
                     let Ok(counterparty) = PublicKey::from_bytes(&sender_pubkey) else {
                         warn!("Invalid public key from unknown peer at {}", src_addr);
                         return None;
@@ -1860,32 +1870,44 @@ impl MeshService {
                 state.authorized_peers.len()
             );
 
-            // EVENT-DRIVEN SLOT CLAIM: One QuadProof = claim the slot
-            if let Some(target_slot) = state.pending_slot_claim.take() {
-                // Double-check slot is still available
-                if !state.claimed_slots.contains_key(&target_slot) {
+            // EVENT-DRIVEN SLOT CLAIM: accumulate distinct QuadProof completions
+            // until the pending claim reaches its scaled validator threshold.
+            if let Some(ref mut pending_claim) = state.pending_slot_claim {
+                let target_slot = pending_claim.slot;
+                let ready = pending_claim.record_coordination(peer_id.clone());
+                let completion_count = pending_claim.coordinated_peers.len();
+                let needed = pending_claim.scaled_threshold;
+                let validator_count = pending_claim.validator_count;
+
+                if state.claimed_slots.contains_key(&target_slot) {
+                    info!(
+                        "Slot {} was claimed by someone else during TGP, clearing pending claim and retrying",
+                        target_slot
+                    );
+                    state.pending_slot_claim = None;
+                    drop(state);
+                    self.start_slot_claim_tgp().await;
+                } else if ready {
+                    state.pending_slot_claim = None;
                     drop(state);
                     // Use VDF-anchored claim (signed, with VDF height for ordering)
                     if let Some(claim) = self.claim_slot_with_vdf(target_slot).await {
                         info!(
-                            "SLOT CLAIMED: {} via QuadProof with {} (VDF height {})",
-                            target_slot, peer_id, claim.vdf_height
+                            "SLOT CLAIMED: {} after {}/{} TGP completions (VDF height {}, finalized by {})",
+                            target_slot, completion_count, validator_count, claim.vdf_height, peer_id
                         );
                     } else {
                         warn!(
-                            "Failed to create VDF-anchored claim for slot {}",
+                            "Failed to create VDF-anchored claim for slot {} after threshold completion",
                             target_slot
                         );
                         self.start_slot_claim_tgp().await;
                     }
                 } else {
-                    info!(
-                        "Slot {} was claimed by someone else during TGP, will retry",
-                        target_slot
+                    debug!(
+                        "Pending slot {} has {}/{} TGP completions",
+                        target_slot, completion_count, needed
                     );
-                    drop(state);
-                    // Trigger retry for next available slot
-                    self.start_slot_claim_tgp().await;
                 }
             } else {
                 // TGP completed but pending_slot_claim was None (sniped during coordination)

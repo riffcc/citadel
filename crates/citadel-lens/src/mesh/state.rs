@@ -92,6 +92,7 @@ impl TrafficStats {
 
 /// Mesh service state
 pub struct MeshState {
+
     /// Our node ID (PeerID)
     pub self_id: String,
     /// Our signing key for authentication
@@ -110,7 +111,7 @@ pub struct MeshState {
     /// Our claimed slot in the mesh
     pub self_slot: Option<SlotClaim>,
     /// Slot we're currently trying to claim via TGP (event-driven, no waiting)
-    pub pending_slot_claim: Option<u64>,
+    pub pending_slot_claim: Option<PendingSlotClaim>,
     /// Known peers in the mesh (by PeerID)
     pub peers: HashMap<String, MeshPeer>,
     /// Claimed slots (by SPIRAL index)
@@ -190,6 +191,44 @@ pub struct MeshState {
     /// Handles 2-hop vouches: Origin → Judged → Witness → STOP
     /// Event-driven: zero traffic at steady state
     pub liveness: Option<LivenessManager>,
+}
+
+/// In-flight slot claim state.
+///
+/// A slot is only finalized once enough distinct validators complete TGP
+/// to cross the scaled threshold for the current mesh view.
+#[derive(Debug, Clone)]
+pub struct PendingSlotClaim {
+    /// Slot index being claimed.
+    pub slot: u64,
+    /// Number of validators available when this claim started.
+    pub validator_count: usize,
+    /// Threshold required to finalize the claim.
+    pub scaled_threshold: usize,
+    /// Distinct peers that have completed TGP for this claim.
+    pub coordinated_peers: HashSet<String>,
+}
+
+impl PendingSlotClaim {
+    pub fn new(slot: u64, validator_count: usize, scaled_threshold: usize) -> Self {
+        Self {
+            slot,
+            validator_count,
+            scaled_threshold,
+            coordinated_peers: HashSet::new(),
+        }
+    }
+
+    /// Record a completed coordination. Returns true when the claim is ready.
+    pub fn record_coordination(&mut self, peer_id: impl Into<String>) -> bool {
+        self.coordinated_peers.insert(peer_id.into());
+        self.is_ready()
+    }
+
+    pub fn is_ready(&self) -> bool {
+        !self.coordinated_peers.is_empty()
+            && self.coordinated_peers.len() >= self.scaled_threshold
+    }
 }
 
 impl MeshState {
@@ -495,5 +534,20 @@ impl MeshState {
     /// Check if all peers have confirmed erasure (for GC eligibility).
     pub fn all_erasures_confirmed(&self) -> bool {
         !self.erasure_synced.is_empty() && self.erasure_synced.values().all(|&synced| synced)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PendingSlotClaim;
+
+    #[test]
+    fn pending_slot_claim_requires_threshold_distinct_peers() {
+        let mut pending = PendingSlotClaim::new(7, 3, 2);
+
+        assert!(!pending.record_coordination("peer-a"));
+        assert!(!pending.record_coordination("peer-a"));
+        assert!(pending.record_coordination("peer-b"));
+        assert_eq!(pending.coordinated_peers.len(), 2);
     }
 }
