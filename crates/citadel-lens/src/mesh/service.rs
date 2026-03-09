@@ -14,7 +14,7 @@ use crate::liveness::{LivenessManager, MeshVouch, PropagationDecision};
 use crate::models::FeaturedRelease;
 use crate::storage::Storage;
 use crate::vdf_race::{claim_has_priority, AnchoredSlotClaim, VdfLink, VdfRace};
-use citadel_ygg::{find_peer_by_remote_ip, query_peers, query_self_sync, YggMetricsStore};
+use citadel_ygg::{query_self_sync, YggMetricsStore};
 use citadel_docs::DocumentStore;
 use citadel_protocols::{
     CoordinatorConfig, FloodRateConfig, KeyPair, Message as TgpMessage, MessagePayload,
@@ -113,14 +113,6 @@ impl MeshService {
         false
     }
 
-    async fn resolve_ygg_dial_addr(&self, peer_hint: SocketAddr) -> Option<SocketAddr> {
-        if peer_hint.ip().is_ipv6() {
-            return Some(peer_hint);
-        }
-
-        self.query_ygg_overlay_target(&[peer_hint]).await
-    }
-
     fn scaled_slot_claim_threshold(mesh_size: usize, validator_count: usize) -> usize {
         let threshold = consensus_threshold(mesh_size);
         if validator_count >= 20 {
@@ -128,27 +120,6 @@ impl MeshService {
         } else {
             std::cmp::max(1, (validator_count * threshold + 19) / 20)
         }
-    }
-
-    async fn query_ygg_overlay_target(&self, resolved_addrs: &[SocketAddr]) -> Option<SocketAddr> {
-        let socket_path = self.ygg_admin_socket.as_deref()?;
-        let peers = match query_peers(socket_path).await {
-            Ok(peers) => peers,
-            Err(err) => {
-                debug!("ygg query failed for {}: {}", socket_path, err);
-                return None;
-            }
-        };
-
-        self.ygg_metrics.write().await.update(peers.clone());
-
-        for resolved_addr in resolved_addrs {
-            if let Some(ygg_addr) = find_peer_by_remote_ip(&peers, &resolved_addr.ip()) {
-                return Some(SocketAddr::new(std::net::IpAddr::V6(ygg_addr), resolved_addr.port()));
-            }
-        }
-
-        None
     }
 
     async fn prime_ygg_public_addr(&self) {
@@ -2251,7 +2222,23 @@ impl MeshService {
                 Some((discovered_id, addr_hint)) = pending_rx.recv() => {
                     let self_clone = Arc::clone(&self);
                     tokio::spawn(async move {
-                        let Some(addr) = self_clone.resolve_ygg_dial_addr(addr_hint).await else {
+                        let known_peer = {
+                            self_clone.state.read().await.peers.get(&discovered_id).cloned()
+                        };
+                        let addr = if let Some(peer) = known_peer.as_ref() {
+                            super::transport::resolve_peer_dial_target(
+                                peer,
+                                self_clone.ygg_admin_socket.as_deref(),
+                            )
+                            .await
+                        } else {
+                            super::transport::resolve_socket_hint_target(
+                                addr_hint,
+                                self_clone.ygg_admin_socket.as_deref(),
+                            )
+                            .await
+                        };
+                        let Some(addr) = addr else {
                             debug!(
                                 "Skipping discovered peer {}: no Ygg dial path for hint {}",
                                 discovered_id, addr_hint
@@ -2287,26 +2274,13 @@ impl MeshService {
         for peer_addr in &self.entry_peers {
             info!("Connecting to peer: {}", peer_addr);
 
-            // Resolve DNS explicitly for better error messages
-            // Supports both "hostname:port" and "ip:port" formats
-            let resolved_addrs: Vec<SocketAddr> = match tokio::net::lookup_host(peer_addr).await {
-                Ok(addrs) => addrs.collect(),
-                Err(e) => {
-                    warn!("DNS resolution failed for {}: {}", peer_addr, e);
-                    continue;
-                }
-            };
-
-            if resolved_addrs.is_empty() {
-                warn!("No addresses found for {}", peer_addr);
-                continue;
-            }
-
-            let Some(ygg_addr) = self.query_ygg_overlay_target(&resolved_addrs).await else {
-                warn!(
-                    "No Ygg dial path found for entry peer {} from hints {:?}",
-                    peer_addr, resolved_addrs
-                );
+            let Some(ygg_addr) = super::transport::resolve_entry_peer_target(
+                peer_addr,
+                self.ygg_admin_socket.as_deref(),
+            )
+            .await
+            else {
+                warn!("No Ygg dial path found for entry peer {}", peer_addr);
                 continue;
             };
 
