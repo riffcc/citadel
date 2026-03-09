@@ -23,6 +23,7 @@ use std::sync::Arc;
 use tokio::net::UdpSocket;
 
 use super::peer::{AuthorizedPeer, MeshPeer};
+use super::peer_addr_store::PeerAddrStore;
 use super::slot::{LatencyHistory, SlotClaim};
 
 /// Traffic statistics for aggregate logging (instead of per-packet spam)
@@ -114,6 +115,8 @@ pub struct MeshState {
     pub pending_slot_claim: Option<PendingSlotClaim>,
     /// Known peers in the mesh (by PeerID)
     pub peers: HashMap<String, MeshPeer>,
+    /// SPORE-indexed address metadata for peers.
+    pub peer_addr_store: PeerAddrStore,
     /// Claimed slots (by SPIRAL index)
     pub claimed_slots: HashMap<u64, SlotClaim>,
     /// Coordinates with claimed slots (for neighbor lookup)

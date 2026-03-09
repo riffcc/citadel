@@ -39,7 +39,9 @@
 
 pub mod flood;
 pub mod peer;
+pub mod peer_addr_store;
 pub mod service;
+pub mod transport;
 pub mod slot;
 pub mod spore;
 pub mod state;
@@ -51,6 +53,8 @@ pub use peer::{
     compute_peer_id, compute_peer_id_from_bytes, double_hash_id, matches_tombstone, AuthorizedPeer,
     MeshPeer,
 };
+pub use peer_addr_store::{PeerAddrRecord, PeerAddrStore};
+pub use transport::{extract_host_from_uri, resolve_entry_peer_target, resolve_peer_dial_target};
 pub use service::MeshService;
 pub use slot::{consensus_threshold, LatencyHistory, LatencySample, SlotClaim};
 pub use spore::{build_spore_havelist, build_spore_wantlist, release_id_to_u256};
