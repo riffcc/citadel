@@ -3034,14 +3034,14 @@ impl MeshService {
                         .and_then(|p| p.as_str())
                         .and_then(|hex_str| hex::decode(hex_str).ok());
 
-                    // Extract listening port from hello (for TGP UDP)
-                    // We keep the IP from the TCP connection (routable) but use their listening port
-                    let listen_port = msg
+                    // Prefer the peer's explicitly advertised address. This lets overlay-aware
+                    // transports like Yggdrasil become the canonical reachability surface.
+                    // Fall back to the transport socket IP plus advertised port if needed.
+                    let advertised_addr = msg
                         .get("addr")
                         .and_then(|a| a.as_str())
-                        .and_then(|addr_str| addr_str.parse::<SocketAddr>().ok())
-                        .map(|addr| addr.port())
-                        .unwrap_or(9000); // Default to 9000 if not provided
+                        .and_then(|addr_str| addr_str.parse::<SocketAddr>().ok());
+                    let advertised_port = advertised_addr.map(|addr| addr.port());
 
                     // Learn our public IP from what the peer sees us as (STUN-like)
                     let their_view_of_us = msg
@@ -3067,9 +3067,9 @@ impl MeshService {
                         if node_id != state.self_id && !state.peers.contains_key(node_id) {
                             peer.id = node_id.to_string();
                             peer.public_key = public_key;
-                            // Keep peer's IP but use their listening port (not ephemeral TCP source port)
-                            // TCP and UDP share the same port for both mesh and TGP
-                            peer.addr = SocketAddr::new(peer.addr.ip(), listen_port);
+                            peer.addr = advertised_addr.unwrap_or_else(|| {
+                                SocketAddr::new(peer.addr.ip(), advertised_port.unwrap_or(peer.addr.port()))
+                            });
                             peer.last_seen = std::time::Instant::now();
                             let peer_addr = peer.addr;
                             state.peers.insert(node_id.to_string(), peer);
