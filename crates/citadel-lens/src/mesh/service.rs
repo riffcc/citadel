@@ -78,6 +78,28 @@ pub struct MeshService {
 }
 
 impl MeshService {
+    fn should_upgrade_peer_addr(current: SocketAddr, candidate: SocketAddr) -> bool {
+        if current == candidate {
+            return false;
+        }
+
+        if current.ip() == candidate.ip() && current.port() != candidate.port() {
+            return true;
+        }
+
+        if candidate.ip().is_ipv6() && !current.ip().is_ipv6() {
+            return true;
+        }
+
+        if (current.ip().is_loopback() || current.ip().is_unspecified())
+            && !(candidate.ip().is_loopback() || candidate.ip().is_unspecified())
+        {
+            return true;
+        }
+
+        false
+    }
+
     fn scaled_slot_claim_threshold(mesh_size: usize, validator_count: usize) -> usize {
         let threshold = consensus_threshold(mesh_size);
         if validator_count >= 20 {
@@ -3157,8 +3179,27 @@ impl MeshService {
                 if !parsed_peers.is_empty() {
                     let mut state = self.state.write().await;
                     for (id, addr_str, addr, slot_index, public_key) in parsed_peers {
-                        // Don't add ourselves or peers we already know
-                        if id != state.self_id && !state.peers.contains_key(&id) {
+                        // Don't add ourselves. Known peers may still need an address upgrade if
+                        // the flooded address is more useful than the one we learned earlier.
+                        if id == state.self_id {
+                            continue;
+                        }
+
+                        if let Some(existing_peer) = state.peers.get_mut(&id) {
+                            if Self::should_upgrade_peer_addr(existing_peer.addr, addr) {
+                                debug!(
+                                    "Upgrading peer {} address via flood: {} -> {}",
+                                    id, existing_peer.addr, addr
+                                );
+                                existing_peer.addr = addr;
+                            }
+                            if existing_peer.public_key.is_none() && public_key.is_some() {
+                                existing_peer.public_key = public_key.clone();
+                            }
+                            continue;
+                        }
+
+                        {
                             let slot = slot_index.map(|idx| {
                                 SlotClaim::with_public_key(idx, id.clone(), public_key.clone())
                             });
@@ -4238,8 +4279,27 @@ impl MeshService {
 mod tests {
     use super::*;
     use citadel_protocols::{CoordinatorConfig, FloodRateConfig, PeerCoordinator};
+    use std::net::SocketAddr;
     use std::thread::sleep;
     use std::time::Duration;
+
+    #[test]
+    fn test_should_upgrade_peer_addr_prefers_ipv6_overlay() {
+        let current: SocketAddr = "10.0.0.5:9000".parse().unwrap();
+        let candidate: SocketAddr = "[200:1111:2222:3333:4444:5555:6666:7777]:9000"
+            .parse()
+            .unwrap();
+
+        assert!(MeshService::should_upgrade_peer_addr(current, candidate));
+    }
+
+    #[test]
+    fn test_should_upgrade_peer_addr_keeps_same_family_churn_down() {
+        let current: SocketAddr = "10.0.0.5:9000".parse().unwrap();
+        let candidate: SocketAddr = "10.0.0.6:9000".parse().unwrap();
+
+        assert!(!MeshService::should_upgrade_peer_addr(current, candidate));
+    }
 
     /// Helper to create a keypair from a deterministic seed
     fn keypair_from_seed(seed: u8) -> citadel_protocols::KeyPair {
