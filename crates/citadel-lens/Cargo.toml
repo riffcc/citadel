@@ -30,6 +30,7 @@ server = [
     "dep:citadel-protocols",
     "dep:citadel-crdt",
     "dep:citadel-docs",
+    "dep:citadel-ygg",
 ]
 
 [dependencies]
@@ -42,6 +43,7 @@ citadel-dht = { path = "../citadel-dht", optional = true }
 citadel-protocols = { path = "../citadel-protocols", optional = true }
 citadel-crdt = { path = "../citadel-crdt", optional = true }
 citadel-docs = { path = "../citadel-docs", optional = true }
+citadel-ygg = { path = "../citadel-ygg", optional = true }
 
 # Async runtime
 tokio = { workspace = true }

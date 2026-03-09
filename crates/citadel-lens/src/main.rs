@@ -35,6 +35,10 @@ struct Cli {
     #[arg(long, env = "LENS_ADMIN_SOCKET")]
     admin_socket: Option<String>,
 
+    /// Yggdrasil admin socket path or tcp://host:port
+    #[arg(long, env = "YGGDRASIL_ADMIN_SOCKET")]
+    ygg_admin_socket: Option<String>,
+
     /// Initial admin public key(s) (comma-separated hex-encoded ed25519 keys)
     #[arg(long, env = "ADMIN_PUBLIC_KEY")]
     admin_key: Option<String>,
@@ -64,6 +68,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cli.announce_addr,
         cli.peers,
         cli.admin_socket,
+        cli.ygg_admin_socket,
         cli.admin_key,
     );
 
