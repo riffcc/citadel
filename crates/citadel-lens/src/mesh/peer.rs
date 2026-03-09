@@ -52,6 +52,9 @@ pub fn matches_tombstone(id: &str, tombstone: &[u8; 32]) -> bool {
 pub struct MeshPeer {
     pub id: String,
     pub addr: SocketAddr,
+    pub yggdrasil_addr: Option<String>,
+    pub underlay_uri: Option<String>,
+    pub ygg_peer_uri: Option<String>,
     pub public_key: Option<Vec<u8>>,
     pub last_seen: std::time::Instant,
     pub coordinated: bool,

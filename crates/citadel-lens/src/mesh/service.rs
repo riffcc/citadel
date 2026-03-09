@@ -52,6 +52,10 @@ pub struct MeshService {
     entry_peers: Vec<String>,
     /// Optional Yggdrasil admin socket for overlay-aware entry-peer routing.
     ygg_admin_socket: Option<String>,
+    /// Cached local Yggdrasil overlay address.
+    local_yggdrasil_addr: Option<String>,
+    /// Cached local underlay URI used for Ygg peering.
+    local_underlay_uri: Option<String>,
     /// Shared storage for replication
     storage: Arc<Storage>,
     /// Document store for CRDT documents with SPORE sync (featured releases, etc.)
@@ -176,6 +180,8 @@ impl MeshService {
         announce_addr: Option<SocketAddr>,
         entry_peers: Vec<String>,
         ygg_admin_socket: Option<String>,
+        local_yggdrasil_addr: Option<String>,
+        local_underlay_uri: Option<String>,
         storage: Arc<Storage>,
         doc_store: DocumentStore,
     ) -> Self {
@@ -217,6 +223,8 @@ impl MeshService {
             announce_addr,
             entry_peers,
             ygg_admin_socket,
+            local_yggdrasil_addr,
+            local_underlay_uri,
             storage,
             doc_store: Arc::new(tokio::sync::RwLock::new(doc_store)),
             state: Arc::new(RwLock::new(MeshState {
@@ -2362,6 +2370,9 @@ impl MeshService {
                 MeshPeer {
                     id: peer_id.clone(),
                     addr,
+                    yggdrasil_addr: None,
+                    underlay_uri: None,
+                    ygg_peer_uri: None,
                     public_key: None,
                     last_seen: std::time::Instant::now(),
                     coordinated: false,
@@ -2398,6 +2409,9 @@ impl MeshService {
             "node_id": self_id,
             "addr": our_addr.to_string(),
             "public_key": pubkey_hex,
+            "yggdrasil_addr": self.local_yggdrasil_addr,
+            "underlay_uri": self.local_underlay_uri,
+            "ygg_peer_uri": self.local_underlay_uri,
             // Tell peer what IP we see them as (STUN-like)
             "your_addr": addr.to_string(),
         });
@@ -2436,6 +2450,9 @@ impl MeshService {
                 "addr": our_addr_for_flood.to_string(),
                 "slot": self_slot,
                 "public_key": self_pubkey,
+                "yggdrasil_addr": self.local_yggdrasil_addr,
+                "underlay_uri": self.local_underlay_uri,
+                "ygg_peer_uri": self.local_underlay_uri,
             })];
             for peer in state.peers.values() {
                 // Only flood peers with real IDs (b3b3/...), skip temp IDs
@@ -2447,6 +2464,9 @@ impl MeshService {
                     "addr": peer.addr.to_string(),
                     "slot": peer.slot.as_ref().map(|s| s.index),
                     "public_key": peer.public_key.as_ref().map(hex::encode),
+                    "yggdrasil_addr": peer.yggdrasil_addr,
+                    "underlay_uri": peer.underlay_uri,
+                    "ygg_peer_uri": peer.ygg_peer_uri,
                 }));
             }
 
@@ -3088,6 +3108,18 @@ impl MeshService {
                         .get("your_addr")
                         .and_then(|a| a.as_str())
                         .and_then(|addr_str| addr_str.parse::<SocketAddr>().ok());
+                    let yggdrasil_addr = msg
+                        .get("yggdrasil_addr")
+                        .and_then(|v| v.as_str())
+                        .map(ToOwned::to_owned);
+                    let underlay_uri = msg
+                        .get("underlay_uri")
+                        .and_then(|v| v.as_str())
+                        .map(ToOwned::to_owned);
+                    let ygg_peer_uri = msg
+                        .get("ygg_peer_uri")
+                        .and_then(|v| v.as_str())
+                        .map(ToOwned::to_owned);
 
                     let mut state = self.state.write().await;
 
@@ -3106,6 +3138,9 @@ impl MeshService {
                         // Only add if we don't already have this peer (avoid duplicates)
                         if node_id != state.self_id && !state.peers.contains_key(node_id) {
                             peer.id = node_id.to_string();
+                            peer.yggdrasil_addr = yggdrasil_addr;
+                            peer.underlay_uri = underlay_uri;
+                            peer.ygg_peer_uri = ygg_peer_uri;
                             peer.public_key = public_key;
                             peer.addr = advertised_addr.unwrap_or_else(|| {
                                 SocketAddr::new(peer.addr.ip(), advertised_port.unwrap_or(peer.addr.port()))
@@ -3179,6 +3214,18 @@ impl MeshService {
                                     .get("public_key")
                                     .and_then(|p| p.as_str())
                                     .and_then(|hex_str| hex::decode(hex_str).ok());
+                                let yggdrasil_addr = peer_info
+                                    .get("yggdrasil_addr")
+                                    .and_then(|v| v.as_str())
+                                    .map(ToOwned::to_owned);
+                                let underlay_uri = peer_info
+                                    .get("underlay_uri")
+                                    .and_then(|v| v.as_str())
+                                    .map(ToOwned::to_owned);
+                                let ygg_peer_uri = peer_info
+                                    .get("ygg_peer_uri")
+                                    .and_then(|v| v.as_str())
+                                    .map(ToOwned::to_owned);
                                 let addr: SocketAddr = addr_str.parse().ok()?;
                                 Some((
                                     id.to_string(),
@@ -3186,6 +3233,9 @@ impl MeshService {
                                     addr,
                                     slot_index,
                                     public_key,
+                                    yggdrasil_addr,
+                                    underlay_uri,
+                                    ygg_peer_uri,
                                 ))
                             })
                             .collect()
@@ -3196,7 +3246,7 @@ impl MeshService {
                 let mut new_peers = Vec::new();
                 if !parsed_peers.is_empty() {
                     let mut state = self.state.write().await;
-                    for (id, addr_str, addr, slot_index, public_key) in parsed_peers {
+                    for (id, addr_str, addr, slot_index, public_key, yggdrasil_addr, underlay_uri, ygg_peer_uri) in parsed_peers {
                         // Don't add ourselves. Known peers may still need a refreshed underlay
                         // hint if the peer has told the mesh about a better clue for Ygg routing.
                         if id == state.self_id {
@@ -3210,6 +3260,15 @@ impl MeshService {
                                     id, existing_peer.addr, addr
                                 );
                                 existing_peer.addr = addr;
+                            }
+                            if existing_peer.yggdrasil_addr.is_none() && yggdrasil_addr.is_some() {
+                                existing_peer.yggdrasil_addr = yggdrasil_addr.clone();
+                            }
+                            if existing_peer.underlay_uri.is_none() && underlay_uri.is_some() {
+                                existing_peer.underlay_uri = underlay_uri.clone();
+                            }
+                            if existing_peer.ygg_peer_uri.is_none() && ygg_peer_uri.is_some() {
+                                existing_peer.ygg_peer_uri = ygg_peer_uri.clone();
                             }
                             if existing_peer.public_key.is_none() && public_key.is_some() {
                                 existing_peer.public_key = public_key.clone();
@@ -3240,6 +3299,9 @@ impl MeshService {
                                 MeshPeer {
                                     id: id.clone(),
                                     addr,
+                                    yggdrasil_addr: yggdrasil_addr.clone(),
+                                    underlay_uri: underlay_uri.clone(),
+                                    ygg_peer_uri: ygg_peer_uri.clone(),
                                     public_key: public_key.clone(),
                                     last_seen: std::time::Instant::now(),
                                     coordinated: false,

@@ -306,6 +306,179 @@ pub fn detect_admin_socket() -> Option<String> {
     Some(tcp_addr.to_string())
 }
 
+pub fn is_yggdrasil_ipv6(addr: &std::net::Ipv6Addr) -> bool {
+    let first_byte = addr.octets()[0];
+    first_byte == 0x02 || first_byte == 0x03
+}
+
+pub fn detect_yggdrasil_addr() -> Option<std::net::Ipv6Addr> {
+    if let Ok(content) = std::fs::read_to_string("/proc/net/if_inet6") {
+        for line in content.lines() {
+            let hex = line.split_whitespace().next().unwrap_or("");
+            if hex.len() == 32 && hex.starts_with("02") {
+                let groups: Vec<&str> = (0..8).map(|i| &hex[i * 4..(i + 1) * 4]).collect();
+                let addr_str = groups.join(":");
+                if let Ok(addr) = addr_str.parse::<std::net::Ipv6Addr>() {
+                    return Some(addr);
+                }
+            }
+        }
+    }
+
+    if let Ok(output) = std::process::Command::new("ip")
+        .args(["-6", "addr", "show", "scope", "global"])
+        .output()
+    {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            let line = line.trim();
+            if let Some(rest) = line.strip_prefix("inet6 ") {
+                if let Some(addr_str) = rest.split('/').next() {
+                    if let Ok(addr) = addr_str.parse::<std::net::Ipv6Addr>() {
+                        if is_yggdrasil_ipv6(&addr) {
+                            return Some(addr);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn parse_cidr(s: &str) -> Option<(std::net::IpAddr, u8)> {
+    let (addr_part, len_part) = s.split_once('/')?;
+    let addr = addr_part.parse().ok()?;
+    let prefix_len = len_part.parse().ok()?;
+    Some((addr, prefix_len))
+}
+
+fn addr_in_cidr(addr: std::net::IpAddr, net_addr: std::net::IpAddr, prefix_len: u8) -> bool {
+    match (addr, net_addr) {
+        (std::net::IpAddr::V4(a), std::net::IpAddr::V4(n)) => {
+            let mask = u32::MAX.checked_shl(32 - prefix_len as u32).unwrap_or(0);
+            (u32::from(a) & mask) == (u32::from(n) & mask)
+        }
+        (std::net::IpAddr::V6(a), std::net::IpAddr::V6(n)) => {
+            let mask = u128::MAX.checked_shl(128 - prefix_len as u32).unwrap_or(0);
+            (u128::from(a) & mask) == (u128::from(n) & mask)
+        }
+        _ => false,
+    }
+}
+
+pub fn detect_underlay_addr() -> Option<std::net::IpAddr> {
+    if let Ok(val) = std::env::var("CITADEL_UNDERLAY_ADDR")
+        .or_else(|_| std::env::var("LAGOON_UNDERLAY_ADDR"))
+    {
+        if let Ok(addr) = val.parse::<std::net::IpAddr>() {
+            info!(%addr, "underlay: using explicit override");
+            return Some(addr);
+        }
+        debug!(value = %val, "underlay: invalid explicit override, falling back");
+    }
+
+    let exclude_cidr = std::env::var("CITADEL_UNDERLAY_EXCLUDE")
+        .or_else(|_| std::env::var("LAGOON_UNDERLAY_EXCLUDE"))
+        .ok()
+        .and_then(|val| parse_cidr(&val));
+    let include_cidr = std::env::var("CITADEL_UNDERLAY_INCLUDE")
+        .or_else(|_| std::env::var("LAGOON_UNDERLAY_INCLUDE"))
+        .ok()
+        .and_then(|val| parse_cidr(&val));
+
+    let mut candidates: Vec<std::net::IpAddr> = Vec::new();
+
+    if let Ok(output) = std::process::Command::new("hostname").args(["-I"]).output() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for token in stdout.split_whitespace() {
+            if let Ok(ip) = token.parse::<std::net::IpAddr>() {
+                if !ip.is_loopback() {
+                    candidates.push(ip);
+                }
+            }
+        }
+    }
+
+    if let Ok(content) = std::fs::read_to_string("/proc/net/if_inet6") {
+        for line in content.lines() {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            let hex = fields.first().copied().unwrap_or("");
+            let dev = fields.get(5).copied().unwrap_or("");
+            if hex.len() != 32 {
+                continue;
+            }
+            if dev.starts_with("br-")
+                || dev.starts_with("docker")
+                || dev.starts_with("veth")
+                || dev.starts_with("virbr")
+                || dev.starts_with("tun")
+                || dev.starts_with("tap")
+                || dev.starts_with("wg")
+            {
+                continue;
+            }
+            if hex.starts_with("02") || hex.starts_with("03") {
+                continue;
+            }
+            if hex == "00000000000000000000000000000001" || hex.starts_with("fe80") {
+                continue;
+            }
+            let groups: Vec<&str> = (0..8).map(|i| &hex[i * 4..(i + 1) * 4]).collect();
+            let addr_str = groups.join(":");
+            if let Ok(addr) = addr_str.parse::<std::net::Ipv6Addr>() {
+                candidates.push(std::net::IpAddr::V6(addr));
+            }
+        }
+    }
+
+    if let Some((net_addr, prefix_len)) = exclude_cidr {
+        candidates.retain(|c| !addr_in_cidr(*c, net_addr, prefix_len));
+    }
+    if let Some((net_addr, prefix_len)) = include_cidr {
+        candidates.retain(|c| addr_in_cidr(*c, net_addr, prefix_len));
+    }
+
+    let mut private_ipv4: Option<std::net::IpAddr> = None;
+    let mut ula_v6: Option<std::net::IpAddr> = None;
+    let mut global_v6: Option<std::net::IpAddr> = None;
+    let mut any_addr: Option<std::net::IpAddr> = None;
+
+    for candidate in &candidates {
+        match candidate {
+            std::net::IpAddr::V4(v4) => {
+                if private_ipv4.is_none() && (v4.is_private() || v4.is_link_local()) {
+                    private_ipv4 = Some(*candidate);
+                }
+                if any_addr.is_none() {
+                    any_addr = Some(*candidate);
+                }
+            }
+            std::net::IpAddr::V6(v6) => {
+                let first_byte = v6.octets()[0];
+                if (first_byte == 0xfc || first_byte == 0xfd) && ula_v6.is_none() {
+                    ula_v6 = Some(*candidate);
+                } else if global_v6.is_none() && first_byte != 0xfc && first_byte != 0xfd {
+                    global_v6 = Some(*candidate);
+                }
+                if any_addr.is_none() {
+                    any_addr = Some(*candidate);
+                }
+            }
+        }
+    }
+
+    private_ipv4.or(ula_v6).or(global_v6).or(any_addr)
+}
+
+pub fn format_tcp_peer_uri(addr: std::net::IpAddr, port: u16) -> String {
+    match addr {
+        std::net::IpAddr::V6(v6) => format!("tcp://[{v6}]:{port}"),
+        std::net::IpAddr::V4(v4) => format!("tcp://{v4}:{port}"),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct YggPeerMetrics {
     pub address: String,
@@ -388,6 +561,24 @@ mod tests {
             up: false,
             inbound: false,
         }
+    }
+
+    #[test]
+    fn test_is_yggdrasil_ipv6() {
+        assert!(is_yggdrasil_ipv6(&"200:abcd::1".parse().unwrap()));
+        assert!(!is_yggdrasil_ipv6(&"2001:db8::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_format_tcp_peer_uri() {
+        assert_eq!(
+            format_tcp_peer_uri("10.7.1.37".parse().unwrap(), 9443),
+            "tcp://10.7.1.37:9443"
+        );
+        assert_eq!(
+            format_tcp_peer_uri("fdaa::1".parse().unwrap(), 9443),
+            "tcp://[fdaa::1]:9443"
+        );
     }
 
     #[test]

@@ -10,7 +10,9 @@ use crate::api;
 use crate::error::Result;
 use crate::mesh::{MeshService, MeshState};
 use crate::storage::Storage;
-use citadel_ygg::detect_admin_socket;
+use citadel_ygg::{
+    detect_admin_socket, detect_underlay_addr, detect_yggdrasil_addr, format_tcp_peer_uri,
+};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -40,6 +42,12 @@ pub struct LensConfig {
 
     /// Optional Yggdrasil admin socket path or tcp://host:port.
     pub ygg_admin_socket: Option<String>,
+
+    /// Cached local Yggdrasil overlay address.
+    pub yggdrasil_addr: Option<String>,
+
+    /// Cached local underlay URI used for Ygg peering.
+    pub underlay_uri: Option<String>,
 
     /// Initial admin public key (hex-encoded ed25519 public key)
     pub admin_public_key: Option<String>,
@@ -104,6 +112,8 @@ impl LensConfig {
         let ygg_admin_socket = ygg_admin_socket
             .filter(|s| !s.is_empty())
             .or_else(detect_admin_socket);
+        let yggdrasil_addr = detect_yggdrasil_addr().map(|a| a.to_string());
+        let underlay_uri = detect_underlay_addr().map(|addr| format_tcp_peer_uri(addr, 9443));
 
         let admin_public_key = admin_key.filter(|s| !s.is_empty());
 
@@ -115,6 +125,8 @@ impl LensConfig {
             bootstrap_peers,
             admin_socket,
             ygg_admin_socket,
+            yggdrasil_addr,
+            underlay_uri,
             admin_public_key,
         }
     }
@@ -168,6 +180,8 @@ impl LensConfig {
             .ok()
             .filter(|s| !s.is_empty())
             .or_else(detect_admin_socket);
+        let yggdrasil_addr = detect_yggdrasil_addr().map(|a| a.to_string());
+        let underlay_uri = detect_underlay_addr().map(|addr| format_tcp_peer_uri(addr, 9443));
 
         let admin_public_key = std::env::var("ADMIN_PUBLIC_KEY")
             .ok()
@@ -181,6 +195,8 @@ impl LensConfig {
             bootstrap_peers,
             admin_socket,
             ygg_admin_socket,
+            yggdrasil_addr,
+            underlay_uri,
             admin_public_key,
         }
     }
@@ -267,6 +283,12 @@ impl LensNode {
         if let Some(ref ygg_admin_socket) = self.config.ygg_admin_socket {
             tracing::info!("  Ygg admin: {}", ygg_admin_socket);
         }
+        if let Some(ref yggdrasil_addr) = self.config.yggdrasil_addr {
+            tracing::info!("  Ygg addr: {}", yggdrasil_addr);
+        }
+        if let Some(ref underlay_uri) = self.config.underlay_uri {
+            tracing::info!("  Underlay URI: {}", underlay_uri);
+        }
 
         // Get shared storage for services
         let storage = self.storage().await;
@@ -285,6 +307,8 @@ impl LensNode {
             self.config.announce_addr,
             self.config.bootstrap_peers.clone(),
             self.config.ygg_admin_socket.clone(),
+            self.config.yggdrasil_addr.clone(),
+            self.config.underlay_uri.clone(),
             mesh_storage,
             doc_store,
         ));

@@ -790,6 +790,8 @@ async fn create_test_peer(
         Some(listen_addr),
         entry_peers,
         None,
+        None,
+        None,
         storage.clone(),
         doc_store,
     ));
