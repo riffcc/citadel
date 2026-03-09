@@ -1,0 +1,27 @@
+[package]
+name = "yggdrasil-rs"
+description = "Pure Rust Yggdrasil implementation — wire-compatible, no Go FFI"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+# Crypto
+ed25519-dalek = { workspace = true }
+blake2 = "0.10"
+rand = { workspace = true }
+hex = { workspace = true }
+
+# Async
+tokio = { workspace = true }
+
+# Observability
+tracing = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+pretty_assertions = { workspace = true }
