@@ -69,6 +69,8 @@ pub struct MeshPeer {
     /// SPORE: Their HaveList (what they possess) - received via SporeSync
     /// Their WantList = their_have.complement() - derived, not stored
     pub their_have: Option<Spore>,
+    /// Their peer-address HaveList - received via peer_addr_sync.
+    pub their_peer_addr_have: Option<Spore>,
 }
 
 /// A peer authorized via TGP QuadProof.

@@ -483,7 +483,9 @@ pub fn flood_to_event(msg: FloodMessage) -> Option<MeshEvent> {
         FloodMessage::BadBits { .. } => None,
         // SPORE range-based sync - internal protocol
         FloodMessage::SporeSync { .. } => None,
+        FloodMessage::PeerAddrSync { .. } => None,
         FloodMessage::SporeDelta { .. } => None,
+        FloodMessage::PeerAddrDelta { .. } => None,
         // Featured releases sync - internal, admin-curated content
         FloodMessage::FeaturedSync { .. } => None,
     }
