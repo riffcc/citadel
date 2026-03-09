@@ -26,6 +26,7 @@ use ed25519_dalek::SigningKey;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{broadcast, mpsc, oneshot, Notify, RwLock};
@@ -36,6 +37,7 @@ use super::flood::FloodMessage;
 use super::peer::{
     compute_peer_id, compute_peer_id_from_bytes, double_hash_id, AuthorizedPeer, MeshPeer,
 };
+use super::peer_addr_store::PeerAddrRecord;
 use super::slot::{consensus_threshold, SlotClaim};
 use super::spore::{build_spore_havelist, release_id_to_u256};
 use super::state::{MeshState, PendingSlotClaim};
@@ -82,6 +84,13 @@ pub struct MeshService {
 }
 
 impl MeshService {
+    fn now_ms() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0)
+    }
+
     fn should_refresh_peer_hint(current: SocketAddr, candidate: SocketAddr) -> bool {
         if current == candidate {
             return false;
@@ -236,6 +245,7 @@ impl MeshService {
                 self_slot: None,
                 pending_slot_claim: None,
                 peers: HashMap::new(),
+                peer_addr_store: super::peer_addr_store::PeerAddrStore::new(120_000),
                 claimed_slots: HashMap::new(),
                 slot_coords: HashSet::new(),
                 spore_sync: Some(spore_sync),
@@ -2415,6 +2425,18 @@ impl MeshService {
             // Tell peer what IP we see them as (STUN-like)
             "your_addr": addr.to_string(),
         });
+        {
+            let mut state = self.state.write().await;
+            let _ = state.peer_addr_store.insert(PeerAddrRecord::from_local(
+                self_id.clone(),
+                pubkey_hex.clone(),
+                self.listen_addr.port(),
+                self.local_yggdrasil_addr.clone(),
+                self.local_underlay_uri.clone(),
+                self.local_underlay_uri.clone(),
+                Self::now_ms(),
+            ));
+        }
         writer.write_all(hello.to_string().as_bytes()).await?;
         writer.write_all(b"\n").await?;
 
@@ -3148,6 +3170,11 @@ impl MeshService {
                             peer.last_seen = std::time::Instant::now();
                             let peer_addr = peer.addr;
                             state.peers.insert(node_id.to_string(), peer);
+                            if let Some(stored_peer) = state.peers.get(node_id).cloned() {
+                                let _ = state
+                                    .peer_addr_store
+                                    .insert(PeerAddrRecord::from_mesh_peer(&stored_peer, Self::now_ms()));
+                            }
                             info!(
                                 "Peer {} identified as {} at {}",
                                 peer_id, node_id, peer_addr
@@ -3273,6 +3300,10 @@ impl MeshService {
                             if existing_peer.public_key.is_none() && public_key.is_some() {
                                 existing_peer.public_key = public_key.clone();
                             }
+                            let updated_peer = existing_peer.clone();
+                            let _ = state
+                                .peer_addr_store
+                                .insert(PeerAddrRecord::from_mesh_peer(&updated_peer, Self::now_ms()));
                             continue;
                         }
 
@@ -3311,6 +3342,11 @@ impl MeshService {
                                     their_have: None,     // SPORE: received via SporeSync
                                 },
                             );
+                            if let Some(stored_peer) = state.peers.get(&id).cloned() {
+                                let _ = state
+                                    .peer_addr_store
+                                    .insert(PeerAddrRecord::from_mesh_peer(&stored_peer, Self::now_ms()));
+                            }
                             new_peers.push((id.clone(), addr_str, slot_index, public_key));
                             debug!(
                                 "Discovered peer {} (slot {:?}) via flood from {}",
