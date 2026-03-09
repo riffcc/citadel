@@ -78,6 +78,36 @@ pub struct MeshService {
 }
 
 impl MeshService {
+    fn should_refresh_peer_hint(current: SocketAddr, candidate: SocketAddr) -> bool {
+        if current == candidate {
+            return false;
+        }
+
+        if current.ip() == candidate.ip() && current.port() != candidate.port() {
+            return true;
+        }
+
+        if candidate.ip().is_ipv6() && !current.ip().is_ipv6() {
+            return true;
+        }
+
+        if (current.ip().is_loopback() || current.ip().is_unspecified())
+            && !(candidate.ip().is_loopback() || candidate.ip().is_unspecified())
+        {
+            return true;
+        }
+
+        false
+    }
+
+    async fn resolve_ygg_dial_addr(&self, peer_hint: SocketAddr) -> Option<SocketAddr> {
+        if peer_hint.ip().is_ipv6() {
+            return Some(peer_hint);
+        }
+
+        self.query_ygg_overlay_target(&[peer_hint]).await
+    }
+
     fn scaled_slot_claim_threshold(mesh_size: usize, validator_count: usize) -> usize {
         let threshold = consensus_threshold(mesh_size);
         if validator_count >= 20 {
@@ -2200,12 +2230,23 @@ impl MeshService {
                     }
                 }
                 // Handle pending outbound connections (queued by handle_message)
-                Some((discovered_id, addr)) = pending_rx.recv() => {
+                Some((discovered_id, addr_hint)) = pending_rx.recv() => {
                     let self_clone = Arc::clone(&self);
                     tokio::spawn(async move {
+                        let Some(addr) = self_clone.resolve_ygg_dial_addr(addr_hint).await else {
+                            debug!(
+                                "Skipping discovered peer {}: no Ygg dial path for hint {}",
+                                discovered_id, addr_hint
+                            );
+                            return;
+                        };
+
                         match TcpStream::connect(&addr).await {
                             Ok(stream) => {
-                                debug!("Connected to discovered peer {} at {}", discovered_id, addr);
+                                debug!(
+                                    "Connected to discovered peer {} via Ygg {} (hint {})",
+                                    discovered_id, addr, addr_hint
+                                );
                                 // Discovered peers are not entry peers
                                 if let Err(e) = self_clone.handle_connection(stream, addr, false).await {
                                     debug!("Discovered peer {} connection closed: {}", discovered_id, e);
@@ -2243,18 +2284,17 @@ impl MeshService {
                 continue;
             }
 
-            let mut candidate_addrs = resolved_addrs.clone();
-            if let Some(ygg_addr) = self.query_ygg_overlay_target(&resolved_addrs).await {
-                if !candidate_addrs.contains(&ygg_addr) {
-                    info!(
-                        "Entry peer {} has Ygg overlay path {}; preferring overlay dial",
-                        peer_addr, ygg_addr
-                    );
-                    candidate_addrs.insert(0, ygg_addr);
-                }
-            }
+            let Some(ygg_addr) = self.query_ygg_overlay_target(&resolved_addrs).await else {
+                warn!(
+                    "No Ygg dial path found for entry peer {} from hints {:?}",
+                    peer_addr, resolved_addrs
+                );
+                continue;
+            };
 
-            // Try each resolved address (IPv4 preferred) with 5s timeout
+            let candidate_addrs = vec![ygg_addr];
+
+            // Try Ygg-resolved address only
             let mut peer_connected = false;
             let addr_count = candidate_addrs.len();
             let connect_timeout = std::time::Duration::from_secs(5);
@@ -3034,14 +3074,14 @@ impl MeshService {
                         .and_then(|p| p.as_str())
                         .and_then(|hex_str| hex::decode(hex_str).ok());
 
-                    // Extract listening port from hello (for TGP UDP)
-                    // We keep the IP from the TCP connection (routable) but use their listening port
-                    let listen_port = msg
+                    // Treat the peer's advertised address as an underlay hint that can be fed
+                    // back into Ygg peer resolution. We only fall back to the transport socket
+                    // when the peer didn't give us anything usable.
+                    let advertised_addr = msg
                         .get("addr")
                         .and_then(|a| a.as_str())
-                        .and_then(|addr_str| addr_str.parse::<SocketAddr>().ok())
-                        .map(|addr| addr.port())
-                        .unwrap_or(9000); // Default to 9000 if not provided
+                        .and_then(|addr_str| addr_str.parse::<SocketAddr>().ok());
+                    let advertised_port = advertised_addr.map(|addr| addr.port());
 
                     // Learn our public IP from what the peer sees us as (STUN-like)
                     let their_view_of_us = msg
@@ -3067,9 +3107,9 @@ impl MeshService {
                         if node_id != state.self_id && !state.peers.contains_key(node_id) {
                             peer.id = node_id.to_string();
                             peer.public_key = public_key;
-                            // Keep peer's IP but use their listening port (not ephemeral TCP source port)
-                            // TCP and UDP share the same port for both mesh and TGP
-                            peer.addr = SocketAddr::new(peer.addr.ip(), listen_port);
+                            peer.addr = advertised_addr.unwrap_or_else(|| {
+                                SocketAddr::new(peer.addr.ip(), advertised_port.unwrap_or(peer.addr.port()))
+                            });
                             peer.last_seen = std::time::Instant::now();
                             let peer_addr = peer.addr;
                             state.peers.insert(node_id.to_string(), peer);
@@ -3157,8 +3197,27 @@ impl MeshService {
                 if !parsed_peers.is_empty() {
                     let mut state = self.state.write().await;
                     for (id, addr_str, addr, slot_index, public_key) in parsed_peers {
-                        // Don't add ourselves or peers we already know
-                        if id != state.self_id && !state.peers.contains_key(&id) {
+                        // Don't add ourselves. Known peers may still need a refreshed underlay
+                        // hint if the peer has told the mesh about a better clue for Ygg routing.
+                        if id == state.self_id {
+                            continue;
+                        }
+
+                        if let Some(existing_peer) = state.peers.get_mut(&id) {
+                            if Self::should_refresh_peer_hint(existing_peer.addr, addr) {
+                                debug!(
+                                    "Refreshing peer {} route hint via flood: {} -> {}",
+                                    id, existing_peer.addr, addr
+                                );
+                                existing_peer.addr = addr;
+                            }
+                            if existing_peer.public_key.is_none() && public_key.is_some() {
+                                existing_peer.public_key = public_key.clone();
+                            }
+                            continue;
+                        }
+
+                        {
                             let slot = slot_index.map(|idx| {
                                 SlotClaim::with_public_key(idx, id.clone(), public_key.clone())
                             });
@@ -4238,8 +4297,27 @@ impl MeshService {
 mod tests {
     use super::*;
     use citadel_protocols::{CoordinatorConfig, FloodRateConfig, PeerCoordinator};
+    use std::net::SocketAddr;
     use std::thread::sleep;
     use std::time::Duration;
+
+    #[test]
+    fn test_should_refresh_peer_hint_prefers_ipv6_overlay() {
+        let current: SocketAddr = "10.0.0.5:9000".parse().unwrap();
+        let candidate: SocketAddr = "[200:1111:2222:3333:4444:5555:6666:7777]:9000"
+            .parse()
+            .unwrap();
+
+        assert!(MeshService::should_refresh_peer_hint(current, candidate));
+    }
+
+    #[test]
+    fn test_should_refresh_peer_hint_keeps_same_family_churn_down() {
+        let current: SocketAddr = "10.0.0.5:9000".parse().unwrap();
+        let candidate: SocketAddr = "10.0.0.6:9000".parse().unwrap();
+
+        assert!(!MeshService::should_refresh_peer_hint(current, candidate));
+    }
 
     /// Helper to create a keypair from a deterministic seed
     fn keypair_from_seed(seed: u8) -> citadel_protocols::KeyPair {
