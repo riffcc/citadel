@@ -59,7 +59,9 @@ pub async fn resolve_peer_dial_target(
     }
 
     for uri in [peer.underlay_uri.as_deref(), peer.ygg_peer_uri.as_deref()] {
-        let Some(uri) = uri else { continue; };
+        let Some(uri) = uri else {
+            continue;
+        };
         let host = extract_host_from_uri(uri);
         if let Ok(ip) = host.parse::<IpAddr>() {
             if let IpAddr::V6(v6) = ip {
@@ -67,7 +69,9 @@ pub async fn resolve_peer_dial_target(
                     return Some(SocketAddr::new(IpAddr::V6(v6), peer.addr.port()));
                 }
             }
-            if let Some(addr) = resolve_remote_ip_via_ygg(ygg_admin_socket, ip, peer.addr.port()).await {
+            if let Some(addr) =
+                resolve_remote_ip_via_ygg(ygg_admin_socket, ip, peer.addr.port()).await
+            {
                 return Some(addr);
             }
         }
@@ -93,7 +97,10 @@ pub async fn resolve_entry_peer_target(
                 return Some(*resolved_addr);
             }
         }
-        if let Some(addr) = resolve_remote_ip_via_ygg(ygg_admin_socket, resolved_addr.ip(), resolved_addr.port()).await {
+        if let Some(addr) =
+            resolve_remote_ip_via_ygg(ygg_admin_socket, resolved_addr.ip(), resolved_addr.port())
+                .await
+        {
             return Some(addr);
         }
     }
@@ -129,6 +136,7 @@ mod tests {
             is_entry_peer: false,
             content_synced: false,
             their_have: None,
+            their_peer_addr_have: None,
         };
 
         let addr = resolve_peer_dial_target(&peer, None).await.unwrap();

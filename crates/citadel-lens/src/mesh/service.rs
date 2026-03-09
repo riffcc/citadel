@@ -14,7 +14,6 @@ use crate::liveness::{LivenessManager, MeshVouch, PropagationDecision};
 use crate::models::FeaturedRelease;
 use crate::storage::Storage;
 use crate::vdf_race::{claim_has_priority, AnchoredSlotClaim, VdfLink, VdfRace};
-use citadel_ygg::{query_self_sync, YggMetricsStore};
 use citadel_docs::DocumentStore;
 use citadel_protocols::{
     CoordinatorConfig, FloodRateConfig, KeyPair, Message as TgpMessage, MessagePayload,
@@ -22,6 +21,7 @@ use citadel_protocols::{
 };
 use citadel_spore::{Spore, U256};
 use citadel_topology::{spiral3d_to_coord, Direction, HexCoord, Neighbors, Spiral3DIndex};
+use citadel_ygg::{query_self_sync, YggMetricsStore};
 use ed25519_dalek::SigningKey;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -113,6 +113,106 @@ impl MeshService {
         false
     }
 
+    fn socket_hint_from_peer_addr_record(record: &PeerAddrRecord) -> Option<SocketAddr> {
+        if let Some(yggdrasil_addr) = record.yggdrasil_addr.as_deref() {
+            if let Ok(ipv6) = yggdrasil_addr.parse::<std::net::Ipv6Addr>() {
+                return Some(SocketAddr::new(std::net::IpAddr::V6(ipv6), record.port));
+            }
+        }
+
+        for uri in [
+            record.ygg_peer_uri.as_deref(),
+            record.underlay_uri.as_deref(),
+        ] {
+            let Some(uri) = uri else {
+                continue;
+            };
+            let host = super::transport::extract_host_from_uri(uri);
+            if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+                return Some(SocketAddr::new(ip, record.port));
+            }
+        }
+
+        None
+    }
+
+    async fn merge_peer_addr_records(
+        &self,
+        records: Vec<PeerAddrRecord>,
+    ) -> Vec<(String, SocketAddr)> {
+        let now_ms = Self::now_ms();
+        let mut peers_to_connect = Vec::new();
+        let mut state = self.state.write().await;
+        let self_id = state.self_id.clone();
+        let accepted = state.peer_addr_store.merge(records, now_ms);
+
+        for record in accepted {
+            if record.peer_id == self_id {
+                continue;
+            }
+
+            let public_key = hex::decode(&record.public_key_hex)
+                .ok()
+                .filter(|bytes| !bytes.is_empty());
+            let addr_hint = Self::socket_hint_from_peer_addr_record(&record);
+
+            if let Some(existing_peer) = state.peers.get_mut(&record.peer_id) {
+                if let Some(addr_hint) = addr_hint {
+                    if Self::should_refresh_peer_hint(existing_peer.addr, addr_hint) {
+                        debug!(
+                            "Refreshing peer {} hint via peer-addr sync: {} -> {}",
+                            record.peer_id, existing_peer.addr, addr_hint
+                        );
+                        existing_peer.addr = addr_hint;
+                    }
+                }
+                if existing_peer.yggdrasil_addr.is_none() && record.yggdrasil_addr.is_some() {
+                    existing_peer.yggdrasil_addr = record.yggdrasil_addr.clone();
+                }
+                if existing_peer.underlay_uri.is_none() && record.underlay_uri.is_some() {
+                    existing_peer.underlay_uri = record.underlay_uri.clone();
+                }
+                if existing_peer.ygg_peer_uri.is_none() && record.ygg_peer_uri.is_some() {
+                    existing_peer.ygg_peer_uri = record.ygg_peer_uri.clone();
+                }
+                if existing_peer.public_key.is_none() && public_key.is_some() {
+                    existing_peer.public_key = public_key.clone();
+                }
+                continue;
+            }
+
+            let Some(addr_hint) = addr_hint else {
+                debug!(
+                    "Accepted peer-addr record for {} but it has no dialable hint yet",
+                    record.peer_id
+                );
+                continue;
+            };
+
+            state.peers.insert(
+                record.peer_id.clone(),
+                MeshPeer {
+                    id: record.peer_id.clone(),
+                    addr: addr_hint,
+                    yggdrasil_addr: record.yggdrasil_addr.clone(),
+                    underlay_uri: record.underlay_uri.clone(),
+                    ygg_peer_uri: record.ygg_peer_uri.clone(),
+                    public_key,
+                    last_seen: std::time::Instant::now(),
+                    coordinated: false,
+                    slot: None,
+                    is_entry_peer: false,
+                    content_synced: false,
+                    their_have: None,
+                    their_peer_addr_have: None,
+                },
+            );
+            peers_to_connect.push((record.peer_id.clone(), addr_hint));
+        }
+
+        peers_to_connect
+    }
+
     fn scaled_slot_claim_threshold(mesh_size: usize, validator_count: usize) -> usize {
         let threshold = consensus_threshold(mesh_size);
         if validator_count >= 20 {
@@ -132,19 +232,19 @@ impl MeshService {
         };
 
         let listen_port = self.listen_addr.port();
-        let ygg_addr = match tokio::task::spawn_blocking(move || query_self_sync(&socket_path)).await
-        {
-            Ok(Ok(Some(addr))) => addr,
-            Ok(Ok(None)) => return,
-            Ok(Err(err)) => {
-                debug!("ygg self query failed: {}", err);
-                return;
-            }
-            Err(err) => {
-                debug!("ygg self query join failure: {}", err);
-                return;
-            }
-        };
+        let ygg_addr =
+            match tokio::task::spawn_blocking(move || query_self_sync(&socket_path)).await {
+                Ok(Ok(Some(addr))) => addr,
+                Ok(Ok(None)) => return,
+                Ok(Err(err)) => {
+                    debug!("ygg self query failed: {}", err);
+                    return;
+                }
+                Err(err) => {
+                    debug!("ygg self query join failure: {}", err);
+                    return;
+                }
+            };
 
         let public_addr = SocketAddr::new(std::net::IpAddr::V6(ygg_addr), listen_port);
         let mut state = self.state.write().await;
@@ -1873,7 +1973,9 @@ impl MeshService {
                     MessagePayload::TripleProof(t) => format!("Triple({})", t.party),
                     MessagePayload::QuadProof(q) => format!("Quad({})", q.party),
                     MessagePayload::QuadConfirmation(q) => format!("QuadConf({})", q.party),
-                    MessagePayload::QuadConfirmationFinal(q) => format!("QuadConfFinal({})", q.party),
+                    MessagePayload::QuadConfirmationFinal(q) => {
+                        format!("QuadConfFinal({})", q.party)
+                    }
                 };
                 debug!(
                     "TGP recv: {} msg={} (state: {:?})",
@@ -2364,6 +2466,7 @@ impl MeshService {
                     is_entry_peer,
                     content_synced: false, // Will become true when HaveLists match
                     their_have: None,      // SPORE: received via SporeSync
+                    their_peer_addr_have: None,
                 },
             );
         }
@@ -2521,6 +2624,20 @@ impl MeshService {
                 have_list.range_count(),
                 peer_id
             );
+        }
+
+        // Peer address SPORE: advertise our replicated address plane on connect.
+        {
+            let state = self.state.read().await;
+            let peer_addr_sync = serde_json::json!({
+                "type": "peer_addr_sync",
+                "peer_id": state.self_id,
+                "have_list": state.peer_addr_store.spore().clone(),
+            });
+            writer
+                .write_all(peer_addr_sync.to_string().as_bytes())
+                .await?;
+            writer.write_all(b"\n").await?;
         }
 
         // SPORE: Send featured releases for homepage sync (from DocumentStore)
@@ -3016,11 +3133,28 @@ impl MeshService {
                             let _ = writer.write_all(flood_msg.to_string().as_bytes()).await;
                             let _ = writer.write_all(b"\n").await;
                         }
+                        Ok(FloodMessage::PeerAddrSync { peer_id, have_list }) => {
+                            let flood_msg = serde_json::json!({
+                                "type": "peer_addr_sync",
+                                "peer_id": peer_id,
+                                "have_list": have_list,
+                            });
+                            let _ = writer.write_all(flood_msg.to_string().as_bytes()).await;
+                            let _ = writer.write_all(b"\n").await;
+                        }
                         Ok(FloodMessage::SporeDelta { releases }) => {
                             // SPORE: Delta transfer - only send what they want that we have
                             let flood_msg = serde_json::json!({
                                 "type": "spore_delta",
                                 "releases": releases,
+                            });
+                            let _ = writer.write_all(flood_msg.to_string().as_bytes()).await;
+                            let _ = writer.write_all(b"\n").await;
+                        }
+                        Ok(FloodMessage::PeerAddrDelta { records }) => {
+                            let flood_msg = serde_json::json!({
+                                "type": "peer_addr_delta",
+                                "records": records,
                             });
                             let _ = writer.write_all(flood_msg.to_string().as_bytes()).await;
                             let _ = writer.write_all(b"\n").await;
@@ -3139,15 +3273,18 @@ impl MeshService {
                             peer.ygg_peer_uri = ygg_peer_uri;
                             peer.public_key = public_key;
                             peer.addr = advertised_addr.unwrap_or_else(|| {
-                                SocketAddr::new(peer.addr.ip(), advertised_port.unwrap_or(peer.addr.port()))
+                                SocketAddr::new(
+                                    peer.addr.ip(),
+                                    advertised_port.unwrap_or(peer.addr.port()),
+                                )
                             });
                             peer.last_seen = std::time::Instant::now();
                             let peer_addr = peer.addr;
                             state.peers.insert(node_id.to_string(), peer);
                             if let Some(stored_peer) = state.peers.get(node_id).cloned() {
-                                let _ = state
-                                    .peer_addr_store
-                                    .insert(PeerAddrRecord::from_mesh_peer(&stored_peer, Self::now_ms()));
+                                let _ = state.peer_addr_store.insert(
+                                    PeerAddrRecord::from_mesh_peer(&stored_peer, Self::now_ms()),
+                                );
                             }
                             info!(
                                 "Peer {} identified as {} at {}",
@@ -3247,7 +3384,17 @@ impl MeshService {
                 let mut new_peers = Vec::new();
                 if !parsed_peers.is_empty() {
                     let mut state = self.state.write().await;
-                    for (id, addr_str, addr, slot_index, public_key, yggdrasil_addr, underlay_uri, ygg_peer_uri) in parsed_peers {
+                    for (
+                        id,
+                        addr_str,
+                        addr,
+                        slot_index,
+                        public_key,
+                        yggdrasil_addr,
+                        underlay_uri,
+                        ygg_peer_uri,
+                    ) in parsed_peers
+                    {
                         // Don't add ourselves. Known peers may still need a refreshed underlay
                         // hint if the peer has told the mesh about a better clue for Ygg routing.
                         if id == state.self_id {
@@ -3275,9 +3422,10 @@ impl MeshService {
                                 existing_peer.public_key = public_key.clone();
                             }
                             let updated_peer = existing_peer.clone();
-                            let _ = state
-                                .peer_addr_store
-                                .insert(PeerAddrRecord::from_mesh_peer(&updated_peer, Self::now_ms()));
+                            let _ = state.peer_addr_store.insert(PeerAddrRecord::from_mesh_peer(
+                                &updated_peer,
+                                Self::now_ms(),
+                            ));
                             continue;
                         }
 
@@ -3314,12 +3462,13 @@ impl MeshService {
                                     is_entry_peer: false, // Discovered via flooding, not an entry peer
                                     content_synced: false, // Will become true when HaveLists match
                                     their_have: None,     // SPORE: received via SporeSync
+                                    their_peer_addr_have: None,
                                 },
                             );
                             if let Some(stored_peer) = state.peers.get(&id).cloned() {
-                                let _ = state
-                                    .peer_addr_store
-                                    .insert(PeerAddrRecord::from_mesh_peer(&stored_peer, Self::now_ms()));
+                                let _ = state.peer_addr_store.insert(
+                                    PeerAddrRecord::from_mesh_peer(&stored_peer, Self::now_ms()),
+                                );
                             }
                             new_peers.push((id.clone(), addr_str, slot_index, public_key));
                             debug!(
@@ -4068,6 +4217,50 @@ impl MeshService {
                         }
                         // NOTE: Don't send HaveList back here - we already send on connection
                         // Sending here would create infinite feedback loop
+                    }
+                }
+            }
+            "peer_addr_sync" => {
+                if let Some(have_list_value) = msg.get("have_list") {
+                    if let Ok(their_have) = serde_json::from_value::<Spore>(have_list_value.clone())
+                    {
+                        let records_to_send = {
+                            let mut state = self.state.write().await;
+                            if let Some(peer) = state.peers.get_mut(peer_id) {
+                                peer.their_peer_addr_have = Some(their_have.clone());
+                            }
+                            state.peer_addr_store.diff_for_peer(&their_have)
+                        };
+
+                        if !records_to_send.is_empty() {
+                            info!(
+                                "PEER-ADDR: Sending {} address records to peer {}",
+                                records_to_send.len(),
+                                peer_id
+                            );
+                            self.flood(FloodMessage::PeerAddrDelta {
+                                records: records_to_send,
+                            });
+                        }
+                    }
+                }
+            }
+            "peer_addr_delta" => {
+                if let Some(records_value) = msg.get("records").and_then(|r| r.as_array()) {
+                    let mut records = Vec::new();
+                    for record_value in records_value {
+                        if let Ok(record) =
+                            serde_json::from_value::<PeerAddrRecord>(record_value.clone())
+                        {
+                            records.push(record);
+                        }
+                    }
+
+                    if !records.is_empty() {
+                        let peers_to_connect = self.merge_peer_addr_records(records).await;
+                        if !peers_to_connect.is_empty() {
+                            return Ok((None, peers_to_connect));
+                        }
                     }
                 }
             }

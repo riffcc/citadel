@@ -11,6 +11,8 @@ use crate::liveness::MeshVouch;
 use crate::vdf_race::{AnchoredSlotClaim, VdfLink};
 use citadel_spore::Spore;
 
+use super::peer_addr_store::PeerAddrRecord;
+
 /// Broadcast message for continuous flooding
 #[derive(Clone, Debug)]
 pub enum FloodMessage {
@@ -103,11 +105,15 @@ pub enum FloodMessage {
         /// Full HaveList on first exchange, then XOR diff for updates
         have_list: Spore,
     },
+    /// SPORE-indexed peer address sync.
+    PeerAddrSync { peer_id: String, have_list: Spore },
     /// SPORE: Delta transfer - actual content for the XOR difference
     /// Contains releases that match ranges in the XOR diff
     SporeDelta {
         releases: Vec<String>, // JSON-serialized releases
     },
+    /// Peer address delta transfer.
+    PeerAddrDelta { records: Vec<PeerAddrRecord> },
     /// SPORE: Featured releases sync - separate from regular releases
     /// These control homepage/hero display and have their own sync lifecycle
     FeaturedSync {
