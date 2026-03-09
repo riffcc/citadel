@@ -13,3 +13,4 @@ serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 hex.workspace = true
+yggdrasil-rs = { path = "../yggdrasil-rs" }

@@ -3,13 +3,26 @@
 //! This crate is a direct donor seam from Lagoon's Yggdrasil transport work.
 //! It intentionally starts small: peer parsing, key-to-address derivation,
 //! remote-IP matching, admin-socket discovery/query helpers, and a tiny
-//! metrics cache. Runtime wiring into Citadel transport selection comes later.
+//! metrics cache. The full pure-Rust Ygg node now lives in the workspace too,
+//! and this crate is the bridge layer that can gradually stop duplicating it.
 
 use std::collections::HashMap;
 use std::time::Instant;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, info};
+pub use yggdrasil_rs::{
+    Identity as YggIdentity, PacketType as YggPacketType, PeerInfo as YggPeerInfo,
+    YggError as NodeYggError, YggNode,
+};
+
+pub async fn spawn_ygg_node(
+    private_key: &[u8; 64],
+    peers: &[String],
+    listen_addrs: &[String],
+) -> Result<YggNode, NodeYggError> {
+    YggNode::new(private_key, peers, listen_addrs).await
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum YggError {
@@ -82,44 +95,8 @@ pub fn key_to_address(key_hex: &str) -> Option<std::net::Ipv6Addr> {
     if key_bytes.len() != 32 {
         return None;
     }
-
-    let mut buf = [0u8; 32];
-    for (i, &b) in key_bytes.iter().enumerate() {
-        buf[i] = !b;
-    }
-
-    let mut ones: u8 = 0;
-    let mut done = false;
-    let mut bits: u8 = 0;
-    let mut n_bits = 0;
-    let mut temp = Vec::with_capacity(32);
-
-    for idx in 0..(8 * 32) {
-        let bit = (buf[idx / 8] >> (7 - (idx % 8))) & 1;
-        if !done && bit != 0 {
-            ones = ones.wrapping_add(1);
-            continue;
-        }
-        if !done {
-            done = true;
-            continue;
-        }
-        bits = (bits << 1) | bit;
-        n_bits += 1;
-        if n_bits == 8 {
-            n_bits = 0;
-            temp.push(bits);
-            bits = 0;
-        }
-    }
-
-    let mut addr = [0u8; 16];
-    addr[0] = 0x02;
-    addr[1] = ones;
-    let copy_len = temp.len().min(14);
-    addr[2..2 + copy_len].copy_from_slice(&temp[..copy_len]);
-
-    Some(std::net::Ipv6Addr::from(addr))
+    let pubkey: [u8; 32] = key_bytes.try_into().ok()?;
+    Some(yggdrasil_rs::crypto::address_for_key(&pubkey))
 }
 
 async fn resolve_remote_hostname(remote: &str) -> Option<String> {
@@ -307,8 +284,7 @@ pub fn detect_admin_socket() -> Option<String> {
 }
 
 pub fn is_yggdrasil_ipv6(addr: &std::net::Ipv6Addr) -> bool {
-    let first_byte = addr.octets()[0];
-    first_byte == 0x02 || first_byte == 0x03
+    yggdrasil_rs::crypto::is_yggdrasil_addr(addr)
 }
 
 pub fn detect_yggdrasil_addr() -> Option<std::net::Ipv6Addr> {
