@@ -690,6 +690,7 @@ name = "citadel-lens"
 version = "0.1.0"
 dependencies = [
  "axum 0.7.9",
+ "bincode",
  "blake3",
  "chrono",
  "citadel-crdt",
