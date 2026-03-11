@@ -4,6 +4,7 @@ CLAUDE.local.md
 .claude
 .palace
 .mcp.json
+.playwright-mcp/
 
 # Lean
 **/.lake/**

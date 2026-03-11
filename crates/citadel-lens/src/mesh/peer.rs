@@ -6,7 +6,7 @@
 //! - MeshPeer state tracking
 //! - TGP-authorized peer management
 
-use citadel_protocols::QuadProof;
+use citadel_protocols::TripleProof;
 use citadel_spore::Spore;
 use ed25519_dalek::VerifyingKey;
 use std::net::SocketAddr;
@@ -73,30 +73,30 @@ pub struct MeshPeer {
     pub their_peer_addr_have: Option<Spore>,
 }
 
-/// A peer authorized via TGP QuadProof.
+/// A peer authorized via TGP bilateral triple (6-packet model).
 ///
 /// # TGP-Native Architecture
 ///
 /// In TGP-native mesh, **connection isn't a socket—it's a proof**.
-/// Once two peers complete the TGP handshake (C→D→T→Q), they have
-/// bilateral QuadProofs that serve as permanent authorization.
+/// Once two peers complete the TGP handshake (C→D→T), they have
+/// bilateral TripleProofs that serve as permanent authorization ("The Knot").
 ///
 /// Benefits over TCP connection state:
-/// - **No phantom peers**: A peer exists iff QuadProof exists
+/// - **No phantom peers**: A peer exists iff bilateral triple exists
 /// - **No reconnection logic**: Proofs are permanent, UDP can retry freely
 /// - **No keepalive**: Proof validity doesn't depend on connection liveness
-/// - **No half-open state**: QuadProof is bilateral—both have it or neither does
+/// - **No half-open state**: TripleProof is bilateral—both have it or neither does (The Knot)
 #[derive(Debug, Clone)]
 pub struct AuthorizedPeer {
     /// The peer's unique identifier (b3b3/{double-blake3})
     pub peer_id: String,
     /// The peer's Ed25519 public key (for signature verification)
     pub public_key: [u8; 32],
-    /// Our QuadProof for this peer (proves we completed TGP with them)
-    pub our_quad: QuadProof,
-    /// Their QuadProof for us (proves they completed TGP with us)
-    /// Both proofs must exist—this is the bilateral construction property
-    pub their_quad: QuadProof,
+    /// Our TripleProof for this peer (proves we completed TGP with them)
+    pub our_triple: TripleProof,
+    /// Their TripleProof for us (proves they completed TGP with us)
+    /// Both proofs must exist—this is the bilateral construction property (The Knot)
+    pub their_triple: TripleProof,
     /// Last known UDP address for this peer (can change, doesn't affect authorization)
     pub last_addr: SocketAddr,
     /// The SPIRAL slot this peer has claimed (if known)
@@ -106,21 +106,21 @@ pub struct AuthorizedPeer {
 }
 
 impl AuthorizedPeer {
-    /// Create a new authorized peer from bilateral QuadProofs.
+    /// Create a new authorized peer from bilateral TripleProofs (6-packet model).
     ///
-    /// Both QuadProofs must exist—this is enforced by TGP's bilateral construction property.
+    /// Both TripleProofs must exist—this is enforced by TGP's bilateral construction property.
     pub fn new(
         peer_id: String,
         public_key: [u8; 32],
-        our_quad: QuadProof,
-        their_quad: QuadProof,
+        our_triple: TripleProof,
+        their_triple: TripleProof,
         last_addr: SocketAddr,
     ) -> Self {
         Self {
             peer_id,
             public_key,
-            our_quad,
-            their_quad,
+            our_triple,
+            their_triple,
             last_addr,
             slot: None,
             established: std::time::Instant::now(),

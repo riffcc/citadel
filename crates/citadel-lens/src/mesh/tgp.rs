@@ -1,8 +1,8 @@
 //! TGP (Two Generals Protocol) session management.
 //!
-//! TGP provides bilateral consensus between peer pairs. The key insight:
-//! when two peers complete TGP (C→D→T→Q), they have identical QuadProofs
-//! that serve as permanent authorization.
+//! TGP provides bilateral consensus between peer pairs using the 6-packet model.
+//! When two peers complete TGP (C→D→T), they have bilateral TripleProofs
+//! ("The Knot") that serve as permanent authorization.
 
 use citadel_protocols::PeerCoordinator;
 use std::net::SocketAddr;

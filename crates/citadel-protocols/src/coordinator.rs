@@ -3,6 +3,16 @@
 //! This module provides the [`PeerCoordinator`] abstraction for reliable
 //! bilateral coordination between two peers in the Citadel mesh.
 //!
+//! # 6-Packet Protocol Model
+//!
+//! The coordinator uses the 6-packet TGP model:
+//! - C_A, C_B: Commitments (unilateral)
+//! - D_A, D_B: Double proofs (bilateral at C level)
+//! - T_A, T_B: Triple proofs (bilateral at D level) - THE KNOT
+//!
+//! Coordination is achieved when the **attack key exists** - both parties have
+//! constructed their triple proofs. This is an emergent state, not a decision.
+//!
 //! # Continuous Flooding
 //!
 //! The coordinator uses continuous adaptive flooding rather than single message exchanges.
@@ -20,7 +30,7 @@ use tracing::{debug, trace, warn};
 use two_generals::{
     crypto::{KeyPair, PublicKey},
     types::Party,
-    Message, ProtocolState, QuadProof,
+    Message, ProtocolState, TripleProof,
 };
 
 use crate::error::{Error, Result};
@@ -183,14 +193,15 @@ impl std::fmt::Display for CoordinatorState {
 /// 2. Call [`receive()`](Self::receive) when messages arrive
 /// 3. The flooder automatically adjusts rate based on activity
 ///
-/// # Protocol Phases
+/// # Protocol Phases (6-Packet Model)
 ///
-/// The coordinator wraps TGP's C → D → T → Q proof escalation:
+/// The coordinator wraps TGP's C → D → T proof escalation:
 ///
 /// 1. **Commitment (C)**: Exchange signed intent to coordinate
 /// 2. **Double (D)**: Prove receipt of counterparty's commitment
-/// 3. **Triple (T)**: Prove knowledge of counterparty's double proof
-/// 4. **Quad (Q)**: Achieve epistemic fixpoint - coordination complete
+/// 3. **Triple (T)**: Prove knowledge of counterparty's double proof - THE KNOT
+///
+/// Coordination is achieved when the attack key exists (both T_A and T_B present).
 #[derive(Debug)]
 pub struct PeerCoordinator {
     /// The adaptive TGP protocol instance (includes flood controller).
@@ -467,20 +478,23 @@ impl PeerCoordinator {
             "Received coordination message"
         );
 
-        // Check if we've achieved coordination
-        if self.protocol.is_complete() {
-            debug!("Coordination achieved!");
+        // Check if we've achieved coordination (attack key exists)
+        if self.protocol.attack_key_exists() {
+            debug!("Coordination achieved - attack key exists!");
             self.state = CoordinatorState::Coordinated;
         }
 
         Ok(advanced)
     }
 
-    /// Get the bilateral receipt if coordination is complete.
+    /// Get the bilateral triple proof pair if coordination is complete (6-packet model).
+    ///
+    /// In the 6-packet model, the bilateral receipt is the triple proof pair
+    /// (T_A, T_B) - "The Knot" that proves coordination.
     #[must_use]
-    pub fn get_bilateral_receipt(&self) -> Option<(&QuadProof, &QuadProof)> {
+    pub fn get_bilateral_triple(&self) -> Option<(&TripleProof, &TripleProof)> {
         if self.is_coordinated() {
-            self.protocol.get_bilateral_receipt()
+            self.protocol.get_bilateral_triple()
         } else {
             None
         }
@@ -632,8 +646,8 @@ mod tests {
         assert!(bob.can_proceed());
 
         // Verify bilateral receipts
-        assert!(alice.get_bilateral_receipt().is_some());
-        assert!(bob.get_bilateral_receipt().is_some());
+        assert!(alice.get_bilateral_triple().is_some());
+        assert!(bob.get_bilateral_triple().is_some());
 
         // Verify packets were sent
         assert!(alice.packet_count() > 0);

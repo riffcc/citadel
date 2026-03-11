@@ -197,9 +197,9 @@ def generate_compose(num_nodes: int, docker_rust_build: bool = False) -> dict:
             ],
         }
 
-        # First node gets HTTP port exposed
+        # First node gets HTTP port exposed (use 8081 to avoid conflicts with common services)
         if i == 1:
-            node_config['ports'] = ['8080:8080']
+            node_config['ports'] = ['8081:8080']
 
         services[f'citadel-{i}'] = node_config
 
