@@ -84,8 +84,23 @@ pub struct MeshService {
 }
 
 impl MeshService {
+    const STALE_PEER_SECS: u64 = 120;
+
     fn is_usable_peer_addr(addr: SocketAddr) -> bool {
         !(addr.ip().is_unspecified() || addr.ip().is_loopback())
+    }
+
+    async fn prune_stale_mesh_state(&self) {
+        let now_ms = Self::now_ms();
+        let mut state = self.state.write().await;
+        state.peer_addr_store.prune_stale(now_ms);
+        state.peers.retain(|peer_id, peer| {
+            if peer.last_seen.elapsed().as_secs() <= Self::STALE_PEER_SECS {
+                return true;
+            }
+            debug!("Pruning stale peer {} from mesh state", peer_id);
+            false
+        });
     }
 
     fn now_ms() -> i64 {
@@ -2241,11 +2256,13 @@ impl MeshService {
 
         // Spawn traffic stats logging loop (every 10s)
         let traffic_stats = Arc::clone(&self.traffic_stats);
+        let self_clone = Arc::clone(&self);
         tokio::spawn(async move {
             use tokio::time::{interval, Duration};
             let mut tick = interval(Duration::from_secs(10));
             loop {
                 tick.tick().await;
+                self_clone.prune_stale_mesh_state().await;
                 let (sent, recv, pkt_sent, pkt_recv, tgp_msgs, tgp_done) =
                     traffic_stats.take_snapshot();
                 // Only log if there was any traffic
