@@ -36,6 +36,10 @@ async fn resolve_remote_ip_via_ygg(
     Some(SocketAddr::new(IpAddr::V6(ygg_addr), port))
 }
 
+fn direct_socket_addr(ip: IpAddr, port: u16) -> SocketAddr {
+    SocketAddr::new(ip, port)
+}
+
 pub async fn resolve_socket_hint_target(
     socket_hint: SocketAddr,
     ygg_admin_socket: Option<&str>,
@@ -45,7 +49,9 @@ pub async fn resolve_socket_hint_target(
             return Some(socket_hint);
         }
     }
-    resolve_remote_ip_via_ygg(ygg_admin_socket, socket_hint.ip(), socket_hint.port()).await
+    resolve_remote_ip_via_ygg(ygg_admin_socket, socket_hint.ip(), socket_hint.port())
+        .await
+        .or(Some(socket_hint))
 }
 
 pub async fn resolve_peer_dial_target(
@@ -74,6 +80,7 @@ pub async fn resolve_peer_dial_target(
             {
                 return Some(addr);
             }
+            return Some(direct_socket_addr(ip, peer.addr.port()));
         }
     }
 
@@ -83,28 +90,50 @@ pub async fn resolve_peer_dial_target(
             return Some(peer.addr);
         }
     }
-    resolve_remote_ip_via_ygg(ygg_admin_socket, hint_ip, peer.addr.port()).await
+    resolve_remote_ip_via_ygg(ygg_admin_socket, hint_ip, peer.addr.port())
+        .await
+        .or(Some(peer.addr))
 }
 
 pub async fn resolve_entry_peer_target(
     entry_peer: &str,
     ygg_admin_socket: Option<&str>,
 ) -> Option<SocketAddr> {
-    let resolved_addrs: Vec<SocketAddr> = tokio::net::lookup_host(entry_peer).await.ok()?.collect();
+    resolve_entry_peer_targets(entry_peer, ygg_admin_socket)
+        .await
+        .into_iter()
+        .next()
+}
+
+pub async fn resolve_entry_peer_targets(
+    entry_peer: &str,
+    ygg_admin_socket: Option<&str>,
+) -> Vec<SocketAddr> {
+    let resolved_addrs: Vec<SocketAddr> = match tokio::net::lookup_host(entry_peer).await {
+        Ok(addrs) => addrs.collect(),
+        Err(_) => return Vec::new(),
+    };
+
+    let mut candidates = Vec::new();
     for resolved_addr in &resolved_addrs {
         if let IpAddr::V6(v6) = resolved_addr.ip() {
             if is_yggdrasil_ipv6(&v6) {
-                return Some(*resolved_addr);
+                candidates.push(*resolved_addr);
+                continue;
             }
         }
         if let Some(addr) =
             resolve_remote_ip_via_ygg(ygg_admin_socket, resolved_addr.ip(), resolved_addr.port())
                 .await
         {
-            return Some(addr);
+            candidates.push(addr);
+            continue;
         }
+        candidates.push(*resolved_addr);
     }
-    None
+    candidates.sort();
+    candidates.dedup();
+    candidates
 }
 
 #[cfg(test)]
@@ -141,5 +170,34 @@ mod tests {
 
         let addr = resolve_peer_dial_target(&peer, None).await.unwrap();
         assert_eq!(addr, "[200:abcd::1]:9000".parse().unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_peer_dial_target_falls_back_to_underlay() {
+        let peer = MeshPeer {
+            id: "b3b3/test".into(),
+            addr: "10.7.1.37:9000".parse().unwrap(),
+            yggdrasil_addr: None,
+            underlay_uri: Some("tcp://10.7.1.37:9443".into()),
+            ygg_peer_uri: None,
+            public_key: None,
+            last_seen: std::time::Instant::now(),
+            coordinated: false,
+            slot: None,
+            is_entry_peer: false,
+            content_synced: false,
+            their_have: None,
+            their_peer_addr_have: None,
+        };
+
+        let addr = resolve_peer_dial_target(&peer, None).await.unwrap();
+        assert_eq!(addr, "10.7.1.37:9000".parse().unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_socket_hint_target_falls_back_to_direct() {
+        let hint: SocketAddr = "10.7.1.37:9000".parse().unwrap();
+        let addr = resolve_socket_hint_target(hint, None).await.unwrap();
+        assert_eq!(addr, hint);
     }
 }
