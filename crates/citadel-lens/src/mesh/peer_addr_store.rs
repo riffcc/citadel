@@ -180,6 +180,13 @@ impl PeerAddrStore {
     pub fn prune_stale(&mut self, now_ms: i64) {
         self.records
             .retain(|_, r| now_ms - r.timestamp_ms <= self.ttl_ms);
+        self.spore = self
+            .records
+            .values()
+            .fold(Spore::empty(), |acc, record| {
+                let cid = U256::from_be_bytes(&record.content_id);
+                acc.union(&Spore::from_range(point_range(cid)))
+            });
     }
 
     pub fn get(&self, peer_id: &str) -> Option<&PeerAddrRecord> {

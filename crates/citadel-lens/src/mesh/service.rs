@@ -94,12 +94,30 @@ impl MeshService {
         let now_ms = Self::now_ms();
         let mut state = self.state.write().await;
         state.peer_addr_store.prune_stale(now_ms);
+        let self_id = state.self_id.clone();
+        let stale_peer_ids: HashSet<String> = state
+            .peers
+            .iter()
+            .filter_map(|(peer_id, peer)| {
+                (peer.last_seen.elapsed().as_secs() > Self::STALE_PEER_SECS)
+                    .then(|| peer_id.clone())
+            })
+            .collect();
+
         state.peers.retain(|peer_id, peer| {
             if peer.last_seen.elapsed().as_secs() <= Self::STALE_PEER_SECS {
                 return true;
             }
             debug!("Pruning stale peer {} from mesh state", peer_id);
             false
+        });
+        state.claimed_slots.retain(|_, claim| {
+            claim.peer_id == self_id || !stale_peer_ids.contains(&claim.peer_id)
+        });
+        state.slot_coords = state.claimed_slots.values().map(|claim| claim.coord).collect();
+        state.vdf_claims.retain(|_, claim| {
+            let claim_peer_id = compute_peer_id_from_bytes(&claim.claimer);
+            claim_peer_id == self_id || !stale_peer_ids.contains(&claim_peer_id)
         });
     }
 
@@ -3403,7 +3421,8 @@ impl MeshService {
                     .unwrap_or_default();
 
                 // Now acquire lock briefly to update state
-                let mut new_peers = Vec::new();
+                let mut new_peers: Vec<(String, String, Option<u64>, Option<Vec<u8>>)> =
+                    Vec::new();
                 if !parsed_peers.is_empty() {
                     let mut state = self.state.write().await;
                     for (
@@ -3443,61 +3462,21 @@ impl MeshService {
                             if existing_peer.public_key.is_none() && public_key.is_some() {
                                 existing_peer.public_key = public_key.clone();
                             }
-                            let updated_peer = existing_peer.clone();
-                            let _ = state.peer_addr_store.insert(PeerAddrRecord::from_mesh_peer(
-                                &updated_peer,
-                                Self::now_ms(),
-                            ));
                             continue;
                         }
 
-                        {
-                            let slot = slot_index.map(|idx| {
-                                SlotClaim::with_public_key(idx, id.clone(), public_key.clone())
-                            });
-
-                            // Record slot claim if present (with public key for TGP)
-                            if let Some(idx) = slot_index {
-                                if !state.claimed_slots.contains_key(&idx) {
-                                    let claim = SlotClaim::with_public_key(
-                                        idx,
-                                        id.clone(),
-                                        public_key.clone(),
-                                    );
-                                    state.slot_coords.insert(claim.coord);
-                                    state.claimed_slots.insert(idx, claim);
-                                }
+                        if let Some(idx) = slot_index {
+                            if !state.claimed_slots.contains_key(&idx) {
+                                let claim =
+                                    SlotClaim::with_public_key(idx, id.clone(), public_key.clone());
+                                state.slot_coords.insert(claim.coord);
+                                state.claimed_slots.insert(idx, claim);
                             }
-
-                            state.peers.insert(
-                                id.clone(),
-                                MeshPeer {
-                                    id: id.clone(),
-                                    addr,
-                                    yggdrasil_addr: yggdrasil_addr.clone(),
-                                    underlay_uri: underlay_uri.clone(),
-                                    ygg_peer_uri: ygg_peer_uri.clone(),
-                                    public_key: public_key.clone(),
-                                    last_seen: std::time::Instant::now(),
-                                    coordinated: false,
-                                    slot,
-                                    is_entry_peer: false, // Discovered via flooding, not an entry peer
-                                    content_synced: false, // Will become true when HaveLists match
-                                    their_have: None,     // SPORE: received via SporeSync
-                                    their_peer_addr_have: None,
-                                },
-                            );
-                            if let Some(stored_peer) = state.peers.get(&id).cloned() {
-                                let _ = state.peer_addr_store.insert(
-                                    PeerAddrRecord::from_mesh_peer(&stored_peer, Self::now_ms()),
-                                );
-                            }
-                            new_peers.push((id.clone(), addr_str, slot_index, public_key));
-                            debug!(
-                                "Discovered peer {} (slot {:?}) via flood from {}",
-                                id, slot_index, peer_id
-                            );
                         }
+                        debug!(
+                            "Ignoring indirect flood-only peer {} at {} from {}; peer-addr sync handles dialable peer discovery",
+                            id, addr_str, peer_id
+                        );
                     }
                 }
                 // Re-flood newly discovered peers to propagate through mesh
