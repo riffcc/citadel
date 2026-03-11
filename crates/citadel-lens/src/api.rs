@@ -204,6 +204,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/content-categories/:id", get(get_category))
         .route("/api/v1/content-categories/:id", put(update_category))
         .route("/api/v1/content-categories/:id", delete(delete_category))
+        // Compatibility: Flagship still queries structures even when the current
+        // Citadel deployment has no structure backend enabled yet.
+        .route("/api/v1/structures", get(list_structures))
         // Featured releases (for flagship home page)
         .route("/api/v1/featured-releases", get(list_featured_releases))
         // Admin: Featured releases management
@@ -374,6 +377,10 @@ async fn list_releases(
     Ok(Json(
         filtered.into_iter().map(|r| r.with_defaults()).collect(),
     ))
+}
+
+async fn list_structures() -> Json<Vec<serde_json::Value>> {
+    Json(Vec::new())
 }
 
 /// Request for creating a release.

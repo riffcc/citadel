@@ -278,9 +278,8 @@ pub fn detect_admin_socket() -> Option<String> {
         return Some(unix_path.to_string());
     }
 
-    let tcp_addr = "tcp://localhost:9001";
-    debug!("yggdrasil: no Unix socket found, will try TCP at {tcp_addr}");
-    Some(tcp_addr.to_string())
+    debug!("yggdrasil: no admin socket detected");
+    None
 }
 
 pub fn is_yggdrasil_ipv6(addr: &std::net::Ipv6Addr) -> bool {

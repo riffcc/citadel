@@ -5,6 +5,8 @@
 
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 
+use rand::seq::SliceRandom;
+
 use citadel_ygg::{find_peer_by_remote_ip, is_yggdrasil_ipv6, query_peers};
 
 use super::peer::MeshPeer;
@@ -133,6 +135,9 @@ pub async fn resolve_entry_peer_targets(
     }
     candidates.sort();
     candidates.dedup();
+
+    let mut rng = rand::thread_rng();
+    candidates.shuffle(&mut rng);
     candidates
 }
 

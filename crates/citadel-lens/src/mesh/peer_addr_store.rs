@@ -132,6 +132,9 @@ impl PeerAddrStore {
     }
 
     pub fn insert(&mut self, record: PeerAddrRecord) -> bool {
+        if !record.peer_id.starts_with("b3b3/") {
+            return false;
+        }
         if let Some(existing) = self.records.get(&record.peer_id) {
             if record.timestamp_ms <= existing.timestamp_ms {
                 return false;

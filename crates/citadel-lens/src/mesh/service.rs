@@ -84,6 +84,10 @@ pub struct MeshService {
 }
 
 impl MeshService {
+    fn is_usable_peer_addr(addr: SocketAddr) -> bool {
+        !(addr.ip().is_unspecified() || addr.ip().is_loopback())
+    }
+
     fn now_ms() -> i64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2371,19 +2375,16 @@ impl MeshService {
         for peer_addr in &self.entry_peers {
             info!("Connecting to peer: {}", peer_addr);
 
-            let Some(ygg_addr) = super::transport::resolve_entry_peer_target(
+            let candidate_addrs = super::transport::resolve_entry_peer_targets(
                 peer_addr,
                 self.ygg_admin_socket.as_deref(),
             )
-            .await
-            else {
+            .await;
+            if candidate_addrs.is_empty() {
                 warn!("No Ygg dial path found for entry peer {}", peer_addr);
                 continue;
-            };
+            }
 
-            let candidate_addrs = vec![ygg_addr];
-
-            // Try Ygg-resolved address only
             let mut peer_connected = false;
             let addr_count = candidate_addrs.len();
             let connect_timeout = std::time::Duration::from_secs(5);
@@ -2551,6 +2552,9 @@ impl MeshService {
             for peer in state.peers.values() {
                 // Only flood peers with real IDs (b3b3/...), skip temp IDs
                 if !peer.id.starts_with("b3b3/") {
+                    continue;
+                }
+                if !Self::is_usable_peer_addr(peer.addr) {
                     continue;
                 }
                 all_peers.push(serde_json::json!({
@@ -3226,6 +3230,9 @@ impl MeshService {
                         .get("addr")
                         .and_then(|a| a.as_str())
                         .and_then(|addr_str| addr_str.parse::<SocketAddr>().ok());
+                    let advertised_addr = advertised_addr.filter(|addr| {
+                        !(addr.ip().is_unspecified() || addr.ip().is_loopback())
+                    });
                     let advertised_port = advertised_addr.map(|addr| addr.port());
 
                     // Learn our public IP from what the peer sees us as (STUN-like)
@@ -3360,6 +3367,9 @@ impl MeshService {
                                     .and_then(|v| v.as_str())
                                     .map(ToOwned::to_owned);
                                 let addr: SocketAddr = addr_str.parse().ok()?;
+                                if !Self::is_usable_peer_addr(addr) {
+                                    return None;
+                                }
                                 Some((
                                     id.to_string(),
                                     addr_str.to_string(),
