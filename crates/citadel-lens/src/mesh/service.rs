@@ -17,7 +17,7 @@ use crate::vdf_race::{claim_has_priority, AnchoredSlotClaim, VdfLink, VdfRace};
 use citadel_docs::DocumentStore;
 use citadel_protocols::{
     CoordinatorConfig, FloodRateConfig, KeyPair, Message as TgpMessage, MessagePayload,
-    PeerCoordinator, PublicKey, SporeSyncManager, TripleProof,
+    PeerCoordinator, PublicKey, TripleProof, SporeSyncManager,
 };
 use citadel_spore::{Spore, U256};
 use citadel_topology::{spiral3d_to_coord, Direction, HexCoord, Neighbors, Spiral3DIndex};
@@ -85,7 +85,6 @@ pub struct MeshService {
 
 impl MeshService {
     const STALE_PEER_SECS: u64 = 120;
-    const LIVE_SLOT_WINDOW_SECS: u64 = 60;
 
     fn is_usable_peer_addr(addr: SocketAddr) -> bool {
         !(addr.ip().is_unspecified() || addr.ip().is_loopback())
@@ -115,56 +114,11 @@ impl MeshService {
         state.claimed_slots.retain(|_, claim| {
             claim.peer_id == self_id || !stale_peer_ids.contains(&claim.peer_id)
         });
-        state.slot_coords = state
-            .claimed_slots
-            .values()
-            .map(|claim| claim.coord)
-            .collect();
+        state.slot_coords = state.claimed_slots.values().map(|claim| claim.coord).collect();
         state.vdf_claims.retain(|_, claim| {
             let claim_peer_id = compute_peer_id_from_bytes(&claim.claimer);
             claim_peer_id == self_id || !stale_peer_ids.contains(&claim_peer_id)
         });
-    }
-
-    async fn reconcile_live_slots(&self) {
-        let mut state = self.state.write().await;
-        let self_id = state.self_id.clone();
-        let self_public_key = Some(state.signing_key.verifying_key().as_bytes().to_vec());
-
-        let mut live_nodes: Vec<(String, Option<Vec<u8>>)> = vec![(self_id.clone(), self_public_key)];
-        live_nodes.extend(state.peers.iter().filter_map(|(peer_id, peer)| {
-            (peer.last_seen.elapsed().as_secs() <= Self::LIVE_SLOT_WINDOW_SECS
-                && peer_id.starts_with("b3b3/"))
-            .then(|| (peer_id.clone(), peer.public_key.clone()))
-        }));
-        live_nodes.sort_by(|a, b| a.0.cmp(&b.0));
-        live_nodes.dedup_by(|a, b| a.0 == b.0);
-
-        let mut claimed_slots = HashMap::new();
-        let mut slot_coords = HashSet::new();
-        let mut self_slot = None;
-
-        for (index, (peer_id, public_key)) in live_nodes.iter().enumerate() {
-            let claim = SlotClaim::with_public_key(index as u64, peer_id.clone(), public_key.clone());
-            slot_coords.insert(claim.coord);
-            claimed_slots.insert(index as u64, claim.clone());
-            if peer_id == &self_id {
-                self_slot = Some(claim);
-            }
-        }
-
-        for peer in state.peers.values_mut() {
-            peer.slot = claimed_slots
-                .values()
-                .find(|claim| claim.peer_id == peer.id)
-                .cloned();
-        }
-
-        state.claimed_slots = claimed_slots;
-        state.slot_coords = slot_coords;
-        state.self_slot = self_slot;
-        state.pending_slot_claim = None;
-        state.vdf_claims.clear();
     }
 
     fn now_ms() -> i64 {
@@ -1896,30 +1850,11 @@ impl MeshService {
         match &msg.payload {
             MessagePayload::Commitment(c) => Some(*c.public_key.as_bytes()),
             MessagePayload::DoubleProof(d) => Some(*d.own_commitment.public_key.as_bytes()),
-            MessagePayload::TripleProof(t) => {
-                Some(*t.own_double.own_commitment.public_key.as_bytes())
-            }
-            MessagePayload::QuadProof(q) => {
-                Some(*q.own_triple.own_double.own_commitment.public_key.as_bytes())
-            }
+            MessagePayload::TripleProof(t) => Some(*t.own_double.own_commitment.public_key.as_bytes()),
+            MessagePayload::QuadProof(q) => Some(*q.own_triple.own_double.own_commitment.public_key.as_bytes()),
             // Legacy Full Solve phases - extract from embedded proofs
-            MessagePayload::QuadConfirmation(qc) => Some(
-                *qc.quad_proof
-                    .own_triple
-                    .own_double
-                    .own_commitment
-                    .public_key
-                    .as_bytes(),
-            ),
-            MessagePayload::QuadConfirmationFinal(qcf) => Some(
-                *qcf.own_conf
-                    .quad_proof
-                    .own_triple
-                    .own_double
-                    .own_commitment
-                    .public_key
-                    .as_bytes(),
-            ),
+            MessagePayload::QuadConfirmation(qc) => Some(*qc.quad_proof.own_triple.own_double.own_commitment.public_key.as_bytes()),
+            MessagePayload::QuadConfirmationFinal(qcf) => Some(*qcf.own_conf.quad_proof.own_triple.own_double.own_commitment.public_key.as_bytes()),
         }
     }
 
@@ -2100,21 +2035,12 @@ impl MeshService {
                                 let _ = tx.send(true);
                             }
                             // Extract bilateral triple for AuthorizedPeer storage (6-packet model)
-                            if let Some((our_triple, their_triple)) =
-                                session.coordinator.get_bilateral_triple()
-                            {
+                            if let Some((our_triple, their_triple)) = session.coordinator.get_bilateral_triple() {
                                 // Get peer's public key from message
                                 let pubkey = Self::extract_sender_pubkey(&msg).unwrap_or([0u8; 32]);
-                                Some((
-                                    our_triple.clone(),
-                                    their_triple.clone(),
-                                    pubkey,
-                                    session.peer_tgp_addr,
-                                ))
+                                Some((our_triple.clone(), their_triple.clone(), pubkey, session.peer_tgp_addr))
                             } else {
-                                warn!(
-                                    "TGP coordinated but no bilateral triple - should never happen"
-                                );
+                                warn!("TGP coordinated but no bilateral triple - should never happen");
                                 None
                             }
                         } else {
@@ -2143,8 +2069,13 @@ impl MeshService {
         if let Some((our_triple, their_triple, pubkey, addr)) = completed_auth {
             self.traffic_stats.record_tgp_completion();
             debug!("TGP: Adding {} to authorized_peers", peer_id);
-            let authorized =
-                AuthorizedPeer::new(peer_id.clone(), pubkey, our_triple, their_triple, addr);
+            let authorized = AuthorizedPeer::new(
+                peer_id.clone(),
+                pubkey,
+                our_triple,
+                their_triple,
+                addr,
+            );
 
             let mut state = self.state.write().await;
             state.authorized_peers.insert(peer_id.clone(), authorized);
@@ -2350,7 +2281,6 @@ impl MeshService {
             loop {
                 tick.tick().await;
                 self_clone.prune_stale_mesh_state().await;
-                self_clone.reconcile_live_slots().await;
                 let (sent, recv, pkt_sent, pkt_recv, tgp_msgs, tgp_done) =
                     traffic_stats.take_snapshot();
                 // Only log if there was any traffic
@@ -3335,8 +3265,9 @@ impl MeshService {
                         .get("addr")
                         .and_then(|a| a.as_str())
                         .and_then(|addr_str| addr_str.parse::<SocketAddr>().ok());
-                    let advertised_addr = advertised_addr
-                        .filter(|addr| !(addr.ip().is_unspecified() || addr.ip().is_loopback()));
+                    let advertised_addr = advertised_addr.filter(|addr| {
+                        !(addr.ip().is_unspecified() || addr.ip().is_loopback())
+                    });
                     let advertised_port = advertised_addr.map(|addr| addr.port());
 
                     // Learn our public IP from what the peer sees us as (STUN-like)
@@ -3490,7 +3421,8 @@ impl MeshService {
                     .unwrap_or_default();
 
                 // Now acquire lock briefly to update state
-                let mut new_peers: Vec<(String, String, Option<u64>, Option<Vec<u8>>)> = Vec::new();
+                let mut new_peers: Vec<(String, String, Option<u64>, Option<Vec<u8>>)> =
+                    Vec::new();
                 if !parsed_peers.is_empty() {
                     let mut state = self.state.write().await;
                     for (
@@ -4711,14 +4643,8 @@ mod tests {
 
         assert!(peer_a.is_coordinated(), "Peer A should reach coordination");
         assert!(peer_b.is_coordinated(), "Peer B should reach coordination");
-        assert!(
-            peer_a.get_bilateral_triple().is_some(),
-            "Peer A should have bilateral receipt"
-        );
-        assert!(
-            peer_b.get_bilateral_triple().is_some(),
-            "Peer B should have bilateral receipt"
-        );
+        assert!(peer_a.get_bilateral_triple().is_some(), "Peer A should have bilateral receipt");
+        assert!(peer_b.get_bilateral_triple().is_some(), "Peer B should have bilateral receipt");
     }
 
     /// Test that SPIRAL slot indices produce the correct coordinates
@@ -5616,12 +5542,8 @@ mod tests {
         assert!(peer_b.is_coordinated(), "Peer B should be coordinated");
 
         // Get bilateral receipts
-        let (a_our, a_their) = peer_a
-            .get_bilateral_triple()
-            .expect("Should have bilateral receipt");
-        let (b_our, b_their) = peer_b
-            .get_bilateral_triple()
-            .expect("Should have bilateral receipt");
+        let (a_our, a_their) = peer_a.get_bilateral_triple().expect("Should have bilateral receipt");
+        let (b_our, b_their) = peer_b.get_bilateral_triple().expect("Should have bilateral receipt");
 
         // Create AuthorizedPeer from A's perspective
         let peer_id = compute_peer_id_from_bytes(kp_b.public_key().as_bytes());
@@ -5648,10 +5570,8 @@ mod tests {
         // Verify bilateral construction property:
         // If A has the bilateral triple, B must also have it (and vice versa)
         // This is TGP's core invariant: ∃QA ⇔ ∃QB
-        assert!(
-            peer_b.get_bilateral_triple().is_some(),
-            "Bilateral construction: if A has Q, B must have Q"
-        );
+        assert!(peer_b.get_bilateral_triple().is_some(),
+            "Bilateral construction: if A has Q, B must have Q");
 
         println!("AuthorizedPeer created successfully:");
         println!("  peer_id: {}...", &peer_id[..20]);
@@ -5705,16 +5625,16 @@ mod tests {
                     sleep(Duration::from_micros(100));
                 }
 
-                let (our_q, their_q) = peer_a.get_bilateral_triple().unwrap();
-                let peer_id = compute_peer_id_from_bytes(their_kp.public_key().as_bytes());
-                AuthorizedPeer::new(
-                    peer_id,
-                    *their_kp.public_key().as_bytes(),
-                    our_q.clone(),
-                    their_q.clone(),
-                    "127.0.0.1:9000".parse().unwrap(),
-                )
-            };
+            let (our_q, their_q) = peer_a.get_bilateral_triple().unwrap();
+            let peer_id = compute_peer_id_from_bytes(their_kp.public_key().as_bytes());
+            AuthorizedPeer::new(
+                peer_id,
+                *their_kp.public_key().as_bytes(),
+                our_q.clone(),
+                their_q.clone(),
+                "127.0.0.1:9000".parse().unwrap(),
+            )
+        };
 
         // Create authorized peers
         let auth_b = create_auth_peer(&kp_a, &kp_b);
