@@ -2,7 +2,7 @@
 
 use crate::admin_socket;
 use crate::mesh::{double_hash_id, FloodMessage};
-use crate::models::{Category, FeaturedRelease, Release, ReleaseStatus};
+use crate::models::{Category, FeaturedRelease, Release, ReleaseStatus, SiteManifest};
 use crate::node::LensState;
 use crate::ws::ws_mesh_handler;
 use crate::ws_admin;
@@ -171,6 +171,49 @@ fn node_id_from_public_key(public_key: &str) -> Option<[u8; 8]> {
     Some(node_id)
 }
 
+fn node_public_key(storage: &crate::storage::Storage) -> Result<String, String> {
+    let signing_key = storage
+        .get_or_create_node_key()
+        .map_err(|e| format!("Failed to read node identity: {}", e))?;
+    Ok(format!(
+        "ed25519p/{}",
+        hex::encode(signing_key.verifying_key().as_bytes())
+    ))
+}
+
+fn signed_headers(
+    headers: &HeaderMap,
+) -> Result<(&str, &str, &str), (StatusCode, Json<serde_json::Value>)> {
+    let public_key = headers
+        .get("X-Public-Key")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({ "error": "Missing X-Public-Key header" })),
+            )
+        })?;
+    let signature = headers
+        .get("X-Signature")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({ "error": "Missing X-Signature header" })),
+            )
+        })?;
+    let timestamp = headers
+        .get("X-Timestamp")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({ "error": "Missing X-Timestamp header" })),
+            )
+        })?;
+    Ok((public_key, signature, timestamp))
+}
+
 type AppState = Arc<RwLock<LensState>>;
 
 /// Build the API router.
@@ -204,6 +247,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/content-categories/:id", get(get_category))
         .route("/api/v1/content-categories/:id", put(update_category))
         .route("/api/v1/content-categories/:id", delete(delete_category))
+        // Site manifest
+        .route("/api/v1/site", get(get_site))
+        .route("/api/v1/site", put(update_site))
         // Compatibility: Flagship still queries structures even when the current
         // Citadel deployment has no structure backend enabled yet.
         .route("/api/v1/structures", get(list_structures))
@@ -1940,6 +1986,16 @@ struct AccountStatus {
     permissions: Vec<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateSiteRequest {
+    name: Option<String>,
+    description: Option<String>,
+    logo: Option<String>,
+    url: Option<String>,
+    theme: Option<serde_json::Value>,
+}
+
 async fn get_account(
     State(state): State<AppState>,
     Path(public_key): Path<String>,
@@ -1979,6 +2035,118 @@ async fn get_account(
         roles,
         permissions,
     }))
+}
+
+async fn get_site(State(state): State<AppState>) -> Result<Json<SiteManifest>, StatusCode> {
+    let state = state.read().await;
+    let address = node_public_key(&state.storage).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let manifest = state
+        .storage
+        .ensure_site_manifest(&address)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(manifest))
+}
+
+async fn update_site(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<SiteManifest>, (StatusCode, Json<serde_json::Value>)> {
+    let (public_key, signature, timestamp) = signed_headers(&headers)?;
+
+    {
+        let state = state.read().await;
+        if let Err(e) =
+            require_admin_signature(&state.storage, public_key, signature, timestamp, &body)
+        {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({ "error": e })),
+            ));
+        }
+    }
+
+    let req: UpdateSiteRequest = serde_json::from_slice(&body).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("Invalid request body: {}", e)
+            })),
+        )
+    })?;
+
+    let state = state.read().await;
+    let address = node_public_key(&state.storage).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e })),
+        )
+    })?;
+    let mut manifest = state.storage.ensure_site_manifest(&address).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("Failed to load site manifest: {}", e)
+            })),
+        )
+    })?;
+
+    if let Some(name) = req.name {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "Site name cannot be empty" })),
+            ));
+        }
+        manifest.name = trimmed.to_string();
+    }
+
+    if let Some(description) = req.description {
+        let trimmed = description.trim();
+        manifest.description = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        };
+    }
+
+    if let Some(logo) = req.logo {
+        let trimmed = logo.trim();
+        manifest.logo = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        };
+    }
+
+    if let Some(url) = req.url {
+        let trimmed = url.trim();
+        manifest.url = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        };
+    }
+
+    if let Some(theme) = req.theme {
+        manifest.theme = Some(theme);
+    }
+
+    manifest.address = address.clone();
+    manifest.id = address;
+    manifest.touch();
+
+    state.storage.put_site_manifest(&manifest).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("Failed to save site manifest: {}", e)
+            })),
+        )
+    })?;
+
+    Ok(Json(manifest))
 }
 
 /// Validate upload permission for nginx auth_request.
@@ -2353,12 +2521,15 @@ struct PeerSummary {
     id: String,
     addr: String,
     slot: Option<u64>,
+    connected: bool,
+    transport: &'static str,
     coordinated: bool,
     last_seen_ms: u64,
 }
 
 async fn get_mesh_state(State(state): State<AppState>) -> Json<MeshStateResponse> {
     let state = state.read().await;
+    const LIVE_PEER_WINDOW_MS: u64 = 60_000;
 
     let (self_id, our_slot, peer_count, slot_claims, peers) =
         if let Some(ref mesh_state) = state.mesh_state {
@@ -2391,19 +2562,39 @@ async fn get_mesh_state(State(state): State<AppState>) -> Json<MeshStateResponse
             let peers: Vec<PeerSummary> = mesh
                 .peers
                 .iter()
-                .map(|(id, peer)| PeerSummary {
-                    id: short_peer_id(id),
-                    addr: peer.addr.to_string(),
-                    slot: peer.slot.as_ref().map(|s| s.index),
-                    coordinated: peer.coordinated,
-                    last_seen_ms: peer.last_seen.elapsed().as_millis() as u64,
+                .map(|(id, peer)| {
+                    let last_seen_ms = peer.last_seen.elapsed().as_millis() as u64;
+                    let connected = last_seen_ms <= LIVE_PEER_WINDOW_MS;
+                    let transport = if peer.yggdrasil_addr.is_some()
+                        || peer
+                            .ygg_peer_uri
+                            .as_deref()
+                            .is_some_and(|uri| uri.starts_with("tls://["))
+                    {
+                        "ygg"
+                    } else {
+                        "tcp"
+                    };
+
+                    PeerSummary {
+                        id: short_peer_id(id),
+                        addr: peer.addr.to_string(),
+                        slot: peer.slot.as_ref().map(|s| s.index),
+                        connected,
+                        transport,
+                        // Back-compat for current /p2p UI: treat live mesh presence as connected.
+                        coordinated: connected,
+                        last_seen_ms,
+                    }
                 })
                 .collect();
+
+            let peer_count = peers.iter().filter(|peer| peer.connected).count();
 
             (
                 mesh.self_id.clone(),
                 our_slot,
-                mesh.peers.len(),
+                peer_count,
                 slot_claims,
                 peers,
             )
