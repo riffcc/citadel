@@ -7,9 +7,8 @@ license = "AGPL-3.0-or-later"
 
 [dependencies]
 # Two Generals Protocol - reliable bilateral coordination with continuous flooding
-# Using local path during development
-two-generals = { path = "../../../two-generals/rust" }
-adaptive-flooding = { path = "../../../two-generals/rust-adaptive-flooding" }
+two-generals = { git = "https://github.com/riffcc/two-generals", rev = "b7c7db69c480bb3a096e2a1888de8625a979b0b1" }
+adaptive-flooding = { git = "https://github.com/riffcc/two-generals", rev = "b7c7db69c480bb3a096e2a1888de8625a979b0b1" }
 
 # SPORE - Succinct Proof of Range Exclusions for optimal sync
 citadel-spore = { path = "../citadel-spore" }

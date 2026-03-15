@@ -17,7 +17,7 @@ use crate::vdf_race::{claim_has_priority, AnchoredSlotClaim, VdfLink, VdfRace};
 use citadel_docs::DocumentStore;
 use citadel_protocols::{
     CoordinatorConfig, FloodRateConfig, KeyPair, Message as TgpMessage, MessagePayload,
-    PeerCoordinator, PublicKey, TripleProof, SporeSyncManager,
+    PeerCoordinator, PublicKey, QuadProof, SporeSyncManager,
 };
 use citadel_spore::{Spore, U256};
 use citadel_topology::{spiral3d_to_coord, Direction, HexCoord, Neighbors, Spiral3DIndex};
@@ -1996,7 +1996,7 @@ impl MeshService {
 
         // Process the message (separate lock)
         // If coordination completes, extract receipt for AuthorizedPeer storage
-        let completed_auth: Option<(TripleProof, TripleProof, [u8; 32], SocketAddr)> = {
+        let completed_auth: Option<(QuadProof, QuadProof, [u8; 32], SocketAddr)> = {
             let mut sessions = self.tgp_sessions.write().await;
             if let Some(session) = sessions.get_mut(&peer_id) {
                 let old_state = session.coordinator.tgp_state();
@@ -2030,17 +2030,17 @@ impl MeshService {
                             );
                         }
                         if session.coordinator.is_coordinated() {
-                            info!("TGP with {} complete - attack key exists!", peer_id);
+                            info!("TGP with {} complete - QuadProof achieved!", peer_id);
                             if let Some(tx) = session.result_tx.take() {
                                 let _ = tx.send(true);
                             }
-                            // Extract bilateral triple for AuthorizedPeer storage (6-packet model)
-                            if let Some((our_triple, their_triple)) = session.coordinator.get_bilateral_triple() {
+                            // Extract bilateral receipt for AuthorizedPeer storage
+                            if let Some((our_quad, their_quad)) = session.coordinator.get_bilateral_receipt() {
                                 // Get peer's public key from message
                                 let pubkey = Self::extract_sender_pubkey(&msg).unwrap_or([0u8; 32]);
-                                Some((our_triple.clone(), their_triple.clone(), pubkey, session.peer_tgp_addr))
+                                Some((our_quad.clone(), their_quad.clone(), pubkey, session.peer_tgp_addr))
                             } else {
-                                warn!("TGP coordinated but no bilateral triple - should never happen");
+                                warn!("TGP coordinated but no bilateral receipt - should never happen");
                                 None
                             }
                         } else {
@@ -2066,14 +2066,14 @@ impl MeshService {
         };
 
         // If coordination completed, store in authorized_peers AND claim our slot
-        if let Some((our_triple, their_triple, pubkey, addr)) = completed_auth {
+        if let Some((our_quad, their_quad, pubkey, addr)) = completed_auth {
             self.traffic_stats.record_tgp_completion();
             debug!("TGP: Adding {} to authorized_peers", peer_id);
             let authorized = AuthorizedPeer::new(
                 peer_id.clone(),
                 pubkey,
-                our_triple,
-                their_triple,
+                our_quad,
+                their_quad,
                 addr,
             );
 
@@ -4562,7 +4562,7 @@ impl MeshService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use citadel_protocols::{CoordinatorConfig, FloodRateConfig, PeerCoordinator, TripleProof};
+    use citadel_protocols::{CoordinatorConfig, FloodRateConfig, PeerCoordinator, QuadProof};
     use std::net::SocketAddr;
     use std::thread::sleep;
     use std::time::Duration;
@@ -4643,8 +4643,8 @@ mod tests {
 
         assert!(peer_a.is_coordinated(), "Peer A should reach coordination");
         assert!(peer_b.is_coordinated(), "Peer B should reach coordination");
-        assert!(peer_a.get_bilateral_triple().is_some(), "Peer A should have bilateral receipt");
-        assert!(peer_b.get_bilateral_triple().is_some(), "Peer B should have bilateral receipt");
+        assert!(peer_a.get_bilateral_receipt().is_some(), "Peer A should have bilateral receipt");
+        assert!(peer_b.get_bilateral_receipt().is_some(), "Peer B should have bilateral receipt");
     }
 
     /// Test that SPIRAL slot indices produce the correct coordinates
@@ -5542,8 +5542,8 @@ mod tests {
         assert!(peer_b.is_coordinated(), "Peer B should be coordinated");
 
         // Get bilateral receipts
-        let (a_our, a_their) = peer_a.get_bilateral_triple().expect("Should have bilateral receipt");
-        let (b_our, b_their) = peer_b.get_bilateral_triple().expect("Should have bilateral receipt");
+        let (a_our, a_their) = peer_a.get_bilateral_receipt().expect("Should have bilateral receipt");
+        let (b_our, b_their) = peer_b.get_bilateral_receipt().expect("Should have bilateral receipt");
 
         // Create AuthorizedPeer from A's perspective
         let peer_id = compute_peer_id_from_bytes(kp_b.public_key().as_bytes());
@@ -5570,7 +5570,7 @@ mod tests {
         // Verify bilateral construction property:
         // If A has the bilateral triple, B must also have it (and vice versa)
         // This is TGP's core invariant: ∃QA ⇔ ∃QB
-        assert!(peer_b.get_bilateral_triple().is_some(),
+        assert!(peer_b.get_bilateral_receipt().is_some(),
             "Bilateral construction: if A has Q, B must have Q");
 
         println!("AuthorizedPeer created successfully:");
@@ -5625,7 +5625,7 @@ mod tests {
                     sleep(Duration::from_micros(100));
                 }
 
-            let (our_q, their_q) = peer_a.get_bilateral_triple().unwrap();
+            let (our_q, their_q) = peer_a.get_bilateral_receipt().unwrap();
             let peer_id = compute_peer_id_from_bytes(their_kp.public_key().as_bytes());
             AuthorizedPeer::new(
                 peer_id,

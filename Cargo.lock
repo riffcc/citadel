@@ -21,6 +21,7 @@ checksum = "366ffbaa4442f4684d91e2cd7c5ea7c4ed8add41959a31447066e279e432b618"
 [[package]]
 name = "adaptive-flooding"
 version = "0.1.0"
+source = "git+https://github.com/riffcc/two-generals?rev=b7c7db69c480bb3a096e2a1888de8625a979b0b1#b7c7db69c480bb3a096e2a1888de8625a979b0b1"
 dependencies = [
  "bincode",
  "rayon",
@@ -4238,6 +4239,7 @@ dependencies = [
 [[package]]
 name = "two-generals"
 version = "0.1.0"
+source = "git+https://github.com/riffcc/two-generals?rev=b7c7db69c480bb3a096e2a1888de8625a979b0b1#b7c7db69c480bb3a096e2a1888de8625a979b0b1"
 dependencies = [
  "anyhow",
  "blake3",
