@@ -1,0 +1,88 @@
+name: Continuous Integration
+
+on:
+  push:
+    branches:
+      - dev
+      - staging
+      - main
+      - release
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  workspace_check:
+    name: Workspace Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Restore Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+
+      - name: Cargo Check
+        run: cargo check --workspace --locked
+
+  workspace_test:
+    name: Workspace Tests
+    needs: workspace_check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Restore Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+
+      - name: Cargo Test
+        run: cargo test --workspace --locked
+
+  build_lens:
+    name: Build Lens Release Binary
+    needs: workspace_test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Restore Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+
+      - name: Build Release Binary
+        run: cargo build -p citadel-lens --release --locked
+
+      - name: Upload Lens Binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: citadel-lens-release
+          path: |
+            target/release/lens-node
+            target/release/lens-admin
+          if-no-files-found: error
+          retention-days: 7

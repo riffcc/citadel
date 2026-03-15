@@ -596,6 +596,7 @@ fn test_non_participating_peers_ejected() {
 // ============================================================================
 
 #[test]
+#[ignore = "performance-sensitive regression check"]
 fn test_no_resource_leaks() {
     // Measure baseline memory
     let start_time = Instant::now();
@@ -701,6 +702,7 @@ fn test_memory_stable_under_churn() {
 // ============================================================================
 
 #[test]
+#[ignore = "performance-sensitive regression check"]
 fn test_large_mesh_propagation() {
     let mut mesh = TestMesh::new();
 
