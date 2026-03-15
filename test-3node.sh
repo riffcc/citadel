@@ -3,7 +3,8 @@
 
 set -e
 
-CITADEL_DIR="/mnt/riffcastle/lagun-project/citadel"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CITADEL_DIR="$SCRIPT_DIR"
 BINARY="$CITADEL_DIR/target/release/lens-node"
 
 # Clean up old data
@@ -13,11 +14,10 @@ mkdir -p /tmp/citadel-test-genesis /tmp/citadel-test-node2 /tmp/citadel-test-nod
 # Start genesis node
 echo "Starting genesis node..."
 RUST_LOG=citadel_lens=debug,citadel_protocols=debug \
-LENS_DATA_DIR=/tmp/citadel-test-genesis \
-LENS_API_BIND=127.0.0.1:8080 \
-LENS_P2P_BIND=127.0.0.1:9000 \
-CITADEL_PEERS="" \
-"$BINARY" &
+"$BINARY" \
+    --data-dir /tmp/citadel-test-genesis \
+    --api-bind 127.0.0.1:8080 \
+    --p2p-bind 127.0.0.1:9000 &
 GENESIS_PID=$!
 echo "Genesis PID: $GENESIS_PID"
 
@@ -34,22 +34,22 @@ done
 # Start node 2
 echo "Starting node 2..."
 RUST_LOG=citadel_lens=debug,citadel_protocols=debug \
-LENS_DATA_DIR=/tmp/citadel-test-node2 \
-LENS_API_BIND=127.0.0.1:8081 \
-LENS_P2P_BIND=127.0.0.1:9001 \
-CITADEL_PEERS="127.0.0.1:9000" \
-"$BINARY" &
+"$BINARY" \
+    --data-dir /tmp/citadel-test-node2 \
+    --api-bind 127.0.0.1:8081 \
+    --p2p-bind 127.0.0.1:9001 \
+    --peers 127.0.0.1:9000 &
 NODE2_PID=$!
 echo "Node2 PID: $NODE2_PID"
 
 # Start node 3
 echo "Starting node 3..."
 RUST_LOG=citadel_lens=debug,citadel_protocols=debug \
-LENS_DATA_DIR=/tmp/citadel-test-node3 \
-LENS_API_BIND=127.0.0.1:8082 \
-LENS_P2P_BIND=127.0.0.1:9002 \
-CITADEL_PEERS="127.0.0.1:9000" \
-"$BINARY" &
+"$BINARY" \
+    --data-dir /tmp/citadel-test-node3 \
+    --api-bind 127.0.0.1:8082 \
+    --p2p-bind 127.0.0.1:9002 \
+    --peers 127.0.0.1:9000 &
 NODE3_PID=$!
 echo "Node3 PID: $NODE3_PID"
 

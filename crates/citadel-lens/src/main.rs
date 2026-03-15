@@ -12,19 +12,19 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 #[command(version, about, long_about = None)]
 struct Cli {
     /// Data directory for storage
-    #[arg(short = 'd', long, env = "LENS_DATA_DIR")]
+    #[arg(short = 'd', long)]
     data_dir: Option<String>,
 
     /// HTTP API listen address
-    #[arg(long, env = "LENS_API_BIND")]
+    #[arg(long)]
     api_bind: Option<String>,
 
     /// P2P listen address (for mesh)
-    #[arg(long, env = "LENS_P2P_BIND")]
+    #[arg(long)]
     p2p_bind: Option<String>,
 
     /// P2P announce address (public IP:port for other peers)
-    #[arg(long, env = "LENS_ANNOUNCE_ADDR")]
+    #[arg(long)]
     announce_addr: Option<String>,
 
     /// Bootstrap peers (comma-separated list of host:port or DNS names)
@@ -32,7 +32,7 @@ struct Cli {
     peers: Option<Vec<String>>,
 
     /// Admin socket path (for lens-admin CLI)
-    #[arg(long, env = "LENS_ADMIN_SOCKET")]
+    #[arg(long)]
     admin_socket: Option<String>,
 
     /// Yggdrasil admin socket path or tcp://host:port

@@ -441,6 +441,5 @@ pub fn get_memory_stats() -> serde_json::Value {
 
 /// Default socket path.
 pub fn default_socket_path() -> String {
-    let data_dir = std::env::var("LENS_DATA_DIR").unwrap_or_else(|_| "./lens-data".to_string());
-    format!("{}/admin.sock", data_dir)
+    "./lens-data/admin.sock".to_string()
 }

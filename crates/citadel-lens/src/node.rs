@@ -55,13 +55,12 @@ pub struct LensConfig {
 
 impl Default for LensConfig {
     fn default() -> Self {
-        Self::from_env()
+        Self::from_cli(None, None, None, None, None, None, None, None)
     }
 }
 
 impl LensConfig {
     /// Create config from CLI arguments with defaults.
-    /// CLI arguments take precedence (clap already handles env var fallback).
     pub fn from_cli(
         data_dir: Option<String>,
         api_bind: Option<String>,
@@ -130,76 +129,6 @@ impl LensConfig {
             admin_public_key,
         }
     }
-
-    /// Create config from environment variables with sensible defaults.
-    pub fn from_env() -> Self {
-        let data_dir = PathBuf::from(
-            std::env::var("LENS_DATA_DIR").unwrap_or_else(|_| "./lens-data".to_string()),
-        );
-
-        let api_addr = std::env::var("LENS_API_BIND")
-            .unwrap_or_else(|_| "0.0.0.0:8080".to_string())
-            .parse()
-            .expect("Invalid LENS_API_BIND");
-
-        let p2p_addr = std::env::var("LENS_P2P_BIND")
-            .unwrap_or_else(|_| "0.0.0.0:9000".to_string())
-            .parse()
-            .expect("Invalid LENS_P2P_BIND");
-
-        // Optional announce address - the public IP:port that other peers should use
-        // If not set, we try to use p2p_addr, but that may be 0.0.0.0 which won't work
-        let announce_addr = std::env::var("LENS_ANNOUNCE_ADDR")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .and_then(|s| s.parse().ok());
-
-        // Parse CITADEL_PEERS - accepts DNS names and portless entries (default 9000)
-        let bootstrap_peers = std::env::var("CITADEL_PEERS")
-            .map(|s| {
-                s.split(',')
-                    .map(|p| p.trim().to_string())
-                    .filter(|p| !p.is_empty())
-                    .map(|p| {
-                        // If no port specified, append :9000
-                        if p.contains(':') {
-                            p
-                        } else {
-                            format!("{}:9000", p)
-                        }
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let admin_socket = std::env::var("LENS_ADMIN_SOCKET")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| data_dir.join("admin.sock"));
-
-        let ygg_admin_socket = std::env::var("YGGDRASIL_ADMIN_SOCKET")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .or_else(detect_admin_socket);
-        let yggdrasil_addr = detect_yggdrasil_addr().map(|a| a.to_string());
-        let underlay_uri = detect_underlay_addr().map(|addr| format_tcp_peer_uri(addr, 9443));
-
-        let admin_public_key = std::env::var("ADMIN_PUBLIC_KEY")
-            .ok()
-            .filter(|s| !s.is_empty());
-
-        Self {
-            data_dir,
-            api_addr,
-            p2p_addr,
-            announce_addr,
-            bootstrap_peers,
-            admin_socket,
-            ygg_admin_socket,
-            yggdrasil_addr,
-            underlay_uri,
-            admin_public_key,
-        }
-    }
 }
 
 /// Shared state for the Lens node - single storage instance shared by all components.
@@ -234,7 +163,7 @@ impl LensNode {
         // Initialize default categories
         storage.init_default_categories()?;
 
-        // Set initial admin public key(s) if provided via env var
+        // Set initial admin public key(s) if provided via CLI or environment fallback
         // Supports comma-separated list, keeps ed25519p/ prefix as part of key
         if let Some(ref admin_keys) = config.admin_public_key {
             for key in admin_keys.split(',') {

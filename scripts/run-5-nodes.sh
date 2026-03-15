@@ -23,21 +23,30 @@ case "${1:-start}" in
             API_PORT=$((8079 + i))  # 8080, 8081, 8082, 8083, 8084
             P2P_PORT=$((9000 + i))  # 9001, 9002, 9003, 9004, 9005
 
-            # Calculate bootstrap peers (ring topology)
-            PREV=$((i == 1 ? 5 : i - 1))
-            NEXT=$((i == 5 ? 1 : i + 1))
-            BOOTSTRAP="127.0.0.1:$((9000 + PREV)),127.0.0.1:$((9000 + NEXT))"
+            if [[ $i -eq 1 ]]; then
+                BOOTSTRAP=""
+            else
+                BOOTSTRAP="127.0.0.1:9001"
+            fi
 
             echo "  Node $i: API=:$API_PORT P2P=:$P2P_PORT"
 
             mkdir -p "$DATA_DIR"
 
-            LENS_DATA_DIR="$DATA_DIR" \
-            LENS_API_ADDR="0.0.0.0:$API_PORT" \
-            LENS_P2P_ADDR="0.0.0.0:$P2P_PORT" \
-            LENS_BOOTSTRAP_PEERS="$BOOTSTRAP" \
-            RUST_LOG="lens_node=info,citadel_lens=info" \
-            "$BINARY" &
+            if [[ -n "$BOOTSTRAP" ]]; then
+                RUST_LOG="lens_node=info,citadel_lens=info" \
+                "$BINARY" \
+                    --data-dir "$DATA_DIR" \
+                    --api-bind "0.0.0.0:$API_PORT" \
+                    --p2p-bind "0.0.0.0:$P2P_PORT" \
+                    --peers "$BOOTSTRAP" &
+            else
+                RUST_LOG="lens_node=info,citadel_lens=info" \
+                "$BINARY" \
+                    --data-dir "$DATA_DIR" \
+                    --api-bind "0.0.0.0:$API_PORT" \
+                    --p2p-bind "0.0.0.0:$P2P_PORT" &
+            fi
 
             echo $! > "$DATA_DIR/lens.pid"
         done

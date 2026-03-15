@@ -50,6 +50,13 @@ spec:
       containers:
         - name: lens-node
           image: riffcc/lens-node:v0.2.0-a1
+          args:
+            - --data-dir
+            - /data
+            - --peers
+            - "5.78.147.14:9000,5.78.70.121:9000,116.203.235.87:9000,37.27.220.204:9000"
+            - --admin-key
+            - "ed25519p/4ca9ba8ac59d18a276bafd50a74a2b6ed83bd6d8a0066825b1eb9f98b3bcaa3a"
           ports:
             - containerPort: 8080
               name: api
@@ -59,16 +66,6 @@ spec:
               name: p2p-udp
               protocol: UDP
           env:
-            - name: LENS_DATA_DIR
-              value: /data
-            - name: LENS_API_BIND
-              value: "0.0.0.0:8080"
-            - name: LENS_P2P_BIND
-              value: "0.0.0.0:9000"
-            - name: CITADEL_PEERS
-              value: "5.78.147.14:9000,5.78.70.121:9000,116.203.235.87:9000,37.27.220.204:9000"
-            - name: ADMIN_PUBLIC_KEY
-              value: "ed25519p/4ca9ba8ac59d18a276bafd50a74a2b6ed83bd6d8a0066825b1eb9f98b3bcaa3a"
             - name: RUST_LOG
               value: "citadel_lens=info,citadel_protocols=info"
           resources:

@@ -43,11 +43,11 @@ struct Cli {
     archivist: Option<String>,
 
     /// Path to config directory (default: ~/.citadel)
-    #[arg(long, env = "CITADEL_CONFIG")]
+    #[arg(long)]
     config: Option<PathBuf>,
 
     /// Path to lens-node data directory (for local socket mode)
-    #[arg(short = 'd', long, env = "LENS_DATA_DIR")]
+    #[arg(short = 'd', long)]
     data_dir: Option<PathBuf>,
 
     #[command(subcommand)]
@@ -277,10 +277,6 @@ fn cmd_show(
 }
 
 fn get_socket_path(data_dir: Option<&PathBuf>) -> PathBuf {
-    // Priority: LENS_SOCKET env > --data-dir flag > default
-    if let Ok(socket) = std::env::var("LENS_SOCKET") {
-        return PathBuf::from(socket);
-    }
     if let Some(dir) = data_dir {
         return dir.join("admin.sock");
     }

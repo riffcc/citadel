@@ -15,7 +15,8 @@ case "${1:-help}" in
         echo "  Data: $DATA_DIR"
         pkill -f "lens-node" 2>/dev/null || true
         sleep 1
-        RUST_LOG="${RUST_LOG:-lens_node=info,citadel_lens=info}" "$BINARY" &
+        RUST_LOG="${RUST_LOG:-lens_node=info,citadel_lens=info}" \
+            "$BINARY" --data-dir "$DATA_DIR" &
         sleep 2
         if curl -s http://localhost:8080/health > /dev/null; then
             echo "lens-node started successfully"
