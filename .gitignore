@@ -5,6 +5,7 @@ CLAUDE.local.md
 .palace
 .mcp.json
 .playwright-mcp/
+.DS_Store
 
 # Lean
 **/.lake/**

@@ -1,0 +1,9 @@
+.git
+.DS_Store
+.claude
+.palace
+target
+lens-data
+docker/haproxy.cfg
+docker/__pycache__
+**/*.pyc

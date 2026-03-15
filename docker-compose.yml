@@ -1,20 +1,23 @@
-# Citadel 50-Node Mesh Deployment
-# No special bootstraps - any node can be entry point
-# Build: docker build -t citadel-lens:latest -f citadel/Dockerfile . (from lagun-project dir)
-# Run: docker compose up -d
+# Citadel 50-node mesh deployment.
+# Build and start with:
+#   docker compose up --build -d
 
 x-lens-node: &lens-node
-  image: riffcc/lens-node:latest
+  image: riffcc/citadel:latest
+  build:
+    context: .
+    dockerfile: docker/Dockerfile
+  command:
+    - lens-node
+    - --data-dir
+    - /data
+    - --admin-key
+    - a26dd671c67dce9ca905b65f3dcb4bd0ca4803a357916abdb7cdd12e8284ffb3
   networks:
     - citadel-mesh
   restart: unless-stopped
   environment: &lens-env
-    LENS_DATA_DIR: /data
-    LENS_API_ADDR: 0.0.0.0:8080
-    LENS_P2P_ADDR: 0.0.0.0:9000
     RUST_LOG: citadel_lens=info,citadel_protocols=info
-    # Auto-authorize admin key for all nodes
-    ADMIN_PUBLIC_KEY: a26dd671c67dce9ca905b65f3dcb4bd0ca4803a357916abdb7cdd12e8284ffb3
 
 services:
   # Genesis node - first to claim slot 0 (origin)

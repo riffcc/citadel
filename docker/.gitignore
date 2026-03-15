@@ -1,6 +1,0 @@
-# Generated files
-docker-compose.generated.yml
-haproxy.cfg
-
-# Environment
-.env
