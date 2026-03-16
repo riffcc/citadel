@@ -67,7 +67,7 @@ pub use error::{Error, Result};
 pub use models::{
     Category, ContentItem, ContentType, Creator, CreatorRole, DataCiteCreator,
     DataCiteResourceType, DataCiteTitle, License, MetadataContainer, NameIdentifier, Release,
-    Resource, StandardMetadata,
+    Resource, SiteManifest, StandardMetadata,
 };
 #[cfg(feature = "server")]
 pub use node::{LensConfig, LensNode};

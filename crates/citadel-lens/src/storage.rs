@@ -1,7 +1,7 @@
 //! Persistent storage using ReDB.
 
 use crate::error::Result;
-use crate::models::{Category, ContentItem, FeaturedRelease, Release, ReleaseStatus};
+use crate::models::{Category, ContentItem, FeaturedRelease, Release, ReleaseStatus, SiteManifest};
 use ed25519_dalek::SigningKey;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use std::collections::HashMap;
@@ -12,6 +12,7 @@ const RELEASES: TableDefinition<&str, &[u8]> = TableDefinition::new("releases");
 const CONTENT: TableDefinition<&str, &[u8]> = TableDefinition::new("content");
 const CATEGORIES: TableDefinition<&str, &[u8]> = TableDefinition::new("categories");
 const FEATURED: TableDefinition<&str, &[u8]> = TableDefinition::new("featured");
+const SITE: TableDefinition<&str, &[u8]> = TableDefinition::new("site");
 const ADMINS: TableDefinition<&str, &[u8]> = TableDefinition::new("admins");
 const PERMISSIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("permissions");
 const NODE_META: TableDefinition<&str, &[u8]> = TableDefinition::new("node_meta");
@@ -294,6 +295,49 @@ impl Storage {
         Ok(categories)
     }
 
+    // --- Site manifest ---
+
+    /// Store the singleton site manifest.
+    pub fn put_site_manifest(&self, manifest: &SiteManifest) -> Result<()> {
+        let value = serde_json::to_vec(manifest)?;
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(SITE)?;
+            table.insert("default", value.as_slice())?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    /// Get the singleton site manifest, if it exists.
+    pub fn get_site_manifest(&self) -> Result<Option<SiteManifest>> {
+        let read_txn = self.db.begin_read()?;
+        let table = match read_txn.open_table(SITE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+
+        match table.get("default")? {
+            Some(guard) => {
+                let bytes: &[u8] = guard.value();
+                Ok(Some(serde_json::from_slice(bytes)?))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Ensure a site manifest exists, creating a default one on first boot.
+    pub fn ensure_site_manifest(&self, address: &str) -> Result<SiteManifest> {
+        if let Some(existing) = self.get_site_manifest()? {
+            return Ok(existing);
+        }
+
+        let manifest = SiteManifest::new(address.to_string());
+        self.put_site_manifest(&manifest)?;
+        Ok(manifest)
+    }
+
     // --- Account/Permission management ---
 
     /// Check if a public key is an admin.
@@ -485,6 +529,7 @@ impl Storage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::RendererMode;
     use tempfile::tempdir;
 
     #[test]
@@ -528,5 +573,47 @@ mod tests {
 
         let music = storage.get_category("music").unwrap();
         assert!(music.is_some());
+    }
+
+    #[test]
+    fn site_manifest_round_trip_and_bootstrap() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+
+        let created = storage
+            .ensure_site_manifest("ed25519p/test-site-address")
+            .unwrap();
+        assert_eq!(created.address, "ed25519p/test-site-address");
+        assert_eq!(created.name, "Untitled Site");
+
+        let mut updated = created.clone();
+        updated.name = "Riff Archive".to_string();
+        updated.description = Some("Metadata in Citadel, assets in Archivist".to_string());
+        updated.logo = Some("archivist://logo".to_string());
+        updated.url = Some("https://riff.cc".to_string());
+        updated.renderer_mode = RendererMode::Live;
+        updated.live_preview_url = Some("https://play.dev.riff.cc".to_string());
+        updated.touch();
+        storage.put_site_manifest(&updated).unwrap();
+
+        let loaded = storage.get_site_manifest().unwrap().unwrap();
+        assert_eq!(loaded.name, "Riff Archive");
+        assert_eq!(
+            loaded.description.as_deref(),
+            Some("Metadata in Citadel, assets in Archivist")
+        );
+        assert_eq!(loaded.logo.as_deref(), Some("archivist://logo"));
+        assert_eq!(loaded.url.as_deref(), Some("https://riff.cc"));
+        assert_eq!(loaded.renderer_mode, RendererMode::Live);
+        assert_eq!(
+            loaded.live_preview_url.as_deref(),
+            Some("https://play.dev.riff.cc")
+        );
+
+        let again = storage
+            .ensure_site_manifest("ed25519p/other-address")
+            .unwrap();
+        assert_eq!(again.address, "ed25519p/test-site-address");
+        assert_eq!(again.name, "Riff Archive");
     }
 }

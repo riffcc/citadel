@@ -18,6 +18,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+fn site_address_from_storage(storage: &Storage) -> Result<String> {
+    let signing_key = storage.get_or_create_node_key()?;
+    Ok(format!(
+        "ed25519p/{}",
+        hex::encode(signing_key.verifying_key().as_bytes())
+    ))
+}
+
 /// Configuration for a Lens node.
 #[derive(Debug, Clone)]
 pub struct LensConfig {
@@ -233,6 +241,10 @@ impl LensNode {
 
         // Initialize default categories
         storage.init_default_categories()?;
+
+        // Ensure this node has a stable site manifest backed by Citadel metadata.
+        let site_address = site_address_from_storage(&storage)?;
+        storage.ensure_site_manifest(&site_address)?;
 
         // Set initial admin public key(s) if provided via env var
         // Supports comma-separated list, keeps ed25519p/ prefix as part of key
