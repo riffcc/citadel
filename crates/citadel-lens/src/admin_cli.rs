@@ -118,6 +118,12 @@ enum Commands {
 
     /// Get mesh connection statistics (always available, no profiling needed)
     MeshStats,
+
+    /// Import releases from a legacy Flagship export JSON file
+    Import {
+        /// Path to the export JSON file
+        file: PathBuf,
+    },
 }
 
 /// Admin command sent over the socket (legacy local mode)
@@ -410,6 +416,66 @@ async fn cmd_upload(
     }
 }
 
+/// Import releases from a legacy Flagship export JSON file
+async fn cmd_import(
+    client: &reqwest::Client,
+    base_url: &str,
+    signing_key: &SigningKey,
+    file: &PathBuf,
+) -> Result<(), String> {
+    if !file.exists() {
+        return Err(format!("File does not exist: {:?}", file));
+    }
+
+    let body = fs::read(file).map_err(|e| format!("Failed to read file: {}", e))?;
+    let body_str =
+        std::str::from_utf8(&body).map_err(|e| format!("File is not valid UTF-8: {}", e))?;
+
+    // Validate it's JSON
+    let _: serde_json::Value =
+        serde_json::from_str(body_str).map_err(|e| format!("File is not valid JSON: {}", e))?;
+
+    // Sign "{timestamp}:{body}" matching what the server expects
+    let timestamp = chrono::Utc::now().timestamp().to_string();
+    let verifying_key = signing_key.verifying_key();
+    let public_key_hex = format!("ed25519p/{}", hex::encode(verifying_key.to_bytes()));
+    let message = format!("{}:{}", timestamp, body_str);
+    let signature = signing_key.sign(message.as_bytes());
+    let signature_hex = hex::encode(signature.to_bytes());
+
+    let url = format!("{}/api/v1/import", base_url.trim_end_matches('/'));
+
+    println!("Importing from {:?} to {}", file, url);
+
+    let response = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .header("X-Public-Key", &public_key_hex)
+        .header("X-Signature", &signature_hex)
+        .header("X-Timestamp", &timestamp)
+        .body(body)
+        .send()
+        .await
+        .map_err(|e| format!("HTTP request failed: {}", e))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("Import failed ({}): {}", status, body));
+    }
+
+    let result: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| format!("Invalid response: {}", e))?;
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&result).unwrap_or_else(|_| result.to_string())
+    );
+    Ok(())
+}
+
 /// Upload a single file to Archivist
 async fn upload_file(
     client: &reqwest::Client,
@@ -613,6 +679,17 @@ async fn run() -> Result<(), String> {
         Commands::Init => cmd_init(&config_dir),
         Commands::Show => cmd_show(&config_dir, cli.url.as_ref(), data_dir),
 
+        // Import requires a remote URL and signs the file body
+        Commands::Import { file } => {
+            let url = cli
+                .url
+                .as_ref()
+                .ok_or("Import requires --url <LENS_URL>")?;
+            let signing_key = load_keypair(&config_dir)?;
+            let client = reqwest::Client::new();
+            cmd_import(&client, url, &signing_key, &file).await
+        }
+
         // Upload goes directly to Archivist (auth validated by Lens via forward_auth)
         Commands::Upload { path } => {
             let archivist_url = cli
@@ -733,7 +810,7 @@ async fn run() -> Result<(), String> {
                                 .await?;
                         handle_response(resp)
                     }
-                    Commands::Init | Commands::Show | Commands::Upload { .. } => unreachable!(),
+                    Commands::Init | Commands::Show | Commands::Upload { .. } | Commands::Import { .. } => unreachable!(),
                 }
             } else {
                 // Local socket mode
@@ -756,7 +833,7 @@ async fn run() -> Result<(), String> {
                     Commands::CpuProfile => AdminCommand::CpuProfile,
                     Commands::MemProfile => AdminCommand::MemProfile,
                     Commands::MeshStats => AdminCommand::MeshStats,
-                    Commands::Init | Commands::Show | Commands::Upload { .. } => unreachable!(),
+                    Commands::Init | Commands::Show | Commands::Upload { .. } | Commands::Import { .. } => unreachable!(),
                 };
 
                 let response = send_socket_command(admin_cmd, data_dir)?;
