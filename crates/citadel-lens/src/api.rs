@@ -2,7 +2,7 @@
 
 use crate::admin_socket;
 use crate::mesh::{double_hash_id, FloodMessage};
-use crate::models::{Category, FeaturedRelease, Release, ReleaseStatus, SiteManifest};
+use crate::models::{Category, FeaturedRelease, Release, ReleaseStatus, RendererMode, SiteManifest};
 use crate::node::LensState;
 use crate::ws::ws_mesh_handler;
 use crate::ws_admin;
@@ -1993,6 +1993,8 @@ struct UpdateSiteRequest {
     description: Option<String>,
     logo: Option<String>,
     url: Option<String>,
+    renderer_mode: Option<RendererMode>,
+    live_preview_url: Option<String>,
     theme: Option<serde_json::Value>,
 }
 
@@ -2127,6 +2129,28 @@ async fn update_site(
         } else {
             Some(trimmed.to_string())
         };
+    }
+
+    if let Some(renderer_mode) = req.renderer_mode {
+        manifest.renderer_mode = renderer_mode;
+    }
+
+    if let Some(live_preview_url) = req.live_preview_url {
+        let trimmed = live_preview_url.trim();
+        manifest.live_preview_url = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        };
+    }
+
+    if manifest.renderer_mode == RendererMode::Live && manifest.live_preview_url.is_none() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "livePreviewUrl is required when rendererMode is Live"
+            })),
+        ));
     }
 
     if let Some(theme) = req.theme {
