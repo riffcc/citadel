@@ -12,17 +12,14 @@ use crate::accountability::AccountabilityTracker;
 use crate::cvdf::CvdfCoordinator;
 use crate::liveness::LivenessManager;
 use crate::vdf_race::{AnchoredSlotClaim, VdfRace};
-use citadel_protocols::{KeyPair, SporeSyncManager};
+use citadel_protocols::SporeSyncManager;
 use citadel_spore::Spore;
 use citadel_topology::{ghost_target, Connection, Direction, HexCoord};
 use ed25519_dalek::SigningKey;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use tokio::net::UdpSocket;
-
-use super::peer::{AuthorizedPeer, MeshPeer};
+use super::peer::MeshPeer;
 use super::peer_addr_store::PeerAddrStore;
 use super::slot::{LatencyHistory, SlotClaim};
 
@@ -93,26 +90,12 @@ impl TrafficStats {
 
 /// Mesh service state
 pub struct MeshState {
-
     /// Our node ID (PeerID)
     pub self_id: String,
     /// Our signing key for authentication
     pub signing_key: SigningKey,
-    /// Cached TGP keypair (derived from signing_key once, reused for all sessions)
-    /// This enables zerocopy/CoW responder sessions - creating a responder is just cloning Arc
-    pub tgp_keypair: Arc<KeyPair>,
-    /// UDP socket for TGP (set when run() is called)
-    pub udp_socket: Option<Arc<UdpSocket>>,
-    /// TGP-native: Peers authorized via completed QuadProof (PeerId -> AuthorizedPeer)
-    ///
-    /// This is the TGP-native source of truth for peer authorization.
-    /// A peer exists in this map iff we have completed bilateral TGP coordination.
-    /// Unlike TCP `peers` map, there are no "phantom" or "connecting" states.
-    pub authorized_peers: HashMap<String, AuthorizedPeer>,
     /// Our claimed slot in the mesh
     pub self_slot: Option<SlotClaim>,
-    /// Slot we're currently trying to claim via TGP (event-driven, no waiting)
-    pub pending_slot_claim: Option<PendingSlotClaim>,
     /// Known peers in the mesh (by PeerID)
     pub peers: HashMap<String, MeshPeer>,
     /// SPORE-indexed address metadata for peers.
@@ -196,45 +179,37 @@ pub struct MeshState {
     pub liveness: Option<LivenessManager>,
 }
 
-/// In-flight slot claim state.
-///
-/// A slot is only finalized once enough distinct validators complete TGP
-/// to cross the scaled threshold for the current mesh view.
-#[derive(Debug, Clone)]
-pub struct PendingSlotClaim {
-    /// Slot index being claimed.
-    pub slot: u64,
-    /// Number of validators available when this claim started.
-    pub validator_count: usize,
-    /// Threshold required to finalize the claim.
-    pub scaled_threshold: usize,
-    /// Distinct peers that have completed TGP for this claim.
-    pub coordinated_peers: HashSet<String>,
-}
-
-impl PendingSlotClaim {
-    pub fn new(slot: u64, validator_count: usize, scaled_threshold: usize) -> Self {
-        Self {
-            slot,
-            validator_count,
-            scaled_threshold,
-            coordinated_peers: HashSet::new(),
-        }
-    }
-
-    /// Record a completed coordination. Returns true when the claim is ready.
-    pub fn record_coordination(&mut self, peer_id: impl Into<String>) -> bool {
-        self.coordinated_peers.insert(peer_id.into());
-        self.is_ready()
-    }
-
-    pub fn is_ready(&self) -> bool {
-        !self.coordinated_peers.is_empty()
-            && self.coordinated_peers.len() >= self.scaled_threshold
-    }
-}
-
 impl MeshState {
+    /// Count the currently fillable slot frontier for the live mesh view.
+    ///
+    /// This is the number of occupied slots plus the empty theoretical neighbor
+    /// coordinates immediately adjacent to those occupied slots. It is the live
+    /// "surface area" of the mesh that can currently be filled without inventing
+    /// an arbitrary global capacity.
+    pub fn available_slot_count(&self) -> usize {
+        if self.claimed_slots.is_empty() {
+            return 0;
+        }
+
+        let mut available = self.slot_coords.clone();
+        for claim in self.claimed_slots.values() {
+            for neighbor_coord in claim.neighbor_coords() {
+                available.insert(neighbor_coord);
+            }
+        }
+        available.len()
+    }
+
+    /// Fraction of the currently available slot frontier that is occupied.
+    pub fn mesh_density(&self) -> f64 {
+        let available = self.available_slot_count();
+        if available == 0 {
+            return 0.0;
+        }
+
+        (self.claimed_slots.len() as f64 / available as f64) * 100.0
+    }
+
     /// Record a latency measurement between two nodes
     pub fn record_latency(&mut self, from_node: &str, to_node: &str, latency_ms: u64) {
         let from_map = self
@@ -542,15 +517,81 @@ impl MeshState {
 
 #[cfg(test)]
 mod tests {
-    use super::PendingSlotClaim;
+    use super::MeshState;
+    use crate::mesh::{peer_addr_store::PeerAddrStore, slot::SlotClaim};
+    use citadel_protocols::SporeSyncManager;
+    use citadel_spore::Spore;
+    use citadel_topology::HexCoord;
+    use ed25519_dalek::SigningKey;
+    use std::collections::HashMap;
+    use std::collections::HashSet;
+
+    fn test_mesh_state() -> MeshState {
+        let signing_key = SigningKey::generate(&mut rand::thread_rng());
+        let peer_id_u256 = {
+            let hash = blake3::hash(signing_key.verifying_key().as_bytes());
+            citadel_spore::U256::from_be_bytes(hash.as_bytes())
+        };
+
+        MeshState {
+            self_id: "b3b3/self".to_string(),
+            signing_key: signing_key.clone(),
+            self_slot: None,
+            peers: HashMap::new(),
+            peer_addr_store: PeerAddrStore::new(120_000),
+            claimed_slots: HashMap::new(),
+            slot_coords: HashSet::new(),
+            spore_sync: Some(SporeSyncManager::new(peer_id_u256)),
+            vdf_race: None,
+            vdf_claims: HashMap::new(),
+            pol_manager: None,
+            pol_pending_pings: HashMap::new(),
+            cvdf: None,
+            latency_history: HashMap::new(),
+            observed_public_addr: None,
+            do_not_want: Spore::empty(),
+            erasure_confirmed: Spore::empty(),
+            erasure_synced: HashMap::new(),
+            bad_bits: HashSet::new(),
+            accountability: None,
+            liveness: None,
+        }
+    }
 
     #[test]
-    fn pending_slot_claim_requires_threshold_distinct_peers() {
-        let mut pending = PendingSlotClaim::new(7, 3, 2);
+    fn available_slot_count_uses_live_frontier_not_global_capacity() {
+        let mut state = test_mesh_state();
 
-        assert!(!pending.record_coordination("peer-a"));
-        assert!(!pending.record_coordination("peer-a"));
-        assert!(pending.record_coordination("peer-b"));
-        assert_eq!(pending.coordinated_peers.len(), 2);
+        let slot0 = SlotClaim::new(0, "self".to_string());
+        state.slot_coords.insert(slot0.coord);
+        state.claimed_slots.insert(slot0.index, slot0);
+
+        assert_eq!(state.available_slot_count(), 21);
+        assert!((state.mesh_density() - (100.0 / 21.0)).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn available_slot_count_deduplicates_overlapping_frontier() {
+        let mut state = test_mesh_state();
+
+        let slot0 = SlotClaim::new(0, "self".to_string());
+        let slot1 = SlotClaim {
+            index: 1,
+            coord: HexCoord::new(1, 0, 0),
+            peer_id: "peer-1".to_string(),
+            public_key: None,
+            confirmations: 0,
+        };
+
+        state.slot_coords.insert(slot0.coord);
+        state.slot_coords.insert(slot1.coord);
+        state.claimed_slots.insert(slot0.index, slot0);
+        state.claimed_slots.insert(slot1.index, slot1);
+
+        assert!(state.available_slot_count() < 42);
+        assert_eq!(
+            state.mesh_density(),
+            (state.claimed_slots.len() as f64 / state.available_slot_count() as f64) * 100.0
+        );
     }
 }

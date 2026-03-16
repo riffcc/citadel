@@ -278,7 +278,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/validate-upload", get(validate_upload))
         // Network mesh topology map
         .route("/api/v1/map", get(get_network_map))
-        // Mesh state (slots, peers, TGP sessions)
+        // Mesh state (slots and live peers)
         .route("/api/v1/mesh/state", get(get_mesh_state))
         // WebSocket for real-time mesh updates
         .route("/api/v1/ws/mesh", get(ws_mesh_handler))
@@ -2333,10 +2333,14 @@ struct PeerEdge {
 
 #[derive(Debug, Serialize)]
 struct NetworkStats {
-    total_nodes: u32,
+    total_peers: u32,
     server_nodes: u32,
-    browser_nodes: u32,
-    total_edges: u32,
+    browser_peers: u32,
+    mesh_edges: u32,
+    available_slots: u32,
+    filled_slots: u32,
+    mesh_density: f64,
+    relay_connections: u32,
     avg_latency_ms: Option<f64>,
 }
 
@@ -2389,12 +2393,16 @@ async fn get_network_map(State(state): State<AppState>) -> Json<NetworkMap> {
     let mut nodes = vec![self_node.clone()];
     let mut edges = Vec::new();
 
+    const LIVE_TOPOLOGY_WINDOW_SECS: u64 = 60;
+
     if let Some(ref mesh_state) = state.mesh_state {
         let mesh = mesh_state.read().await;
 
         // Build a map of coordinates to node IDs for SPIRAL edge computation
         use citadel_topology::{HexCoord, Neighbors};
         let mut coord_to_node: HashMap<HexCoord, String> = HashMap::new();
+        let mut full_to_short: HashMap<String, String> = HashMap::new();
+        full_to_short.insert(mesh.self_id.clone(), short_self_id.clone());
 
         // Add self to coord map if we have a slot
         if let Some(ref claim) = self_slot_opt {
@@ -2412,7 +2420,8 @@ async fn get_network_map(State(state): State<AppState>) -> Json<NetworkMap> {
 
             // Check if we're directly connected to this peer
             let (online, last_heartbeat) = if let Some(peer) = mesh.peers.get(&claim.peer_id) {
-                (true, peer.last_seen.elapsed().as_secs())
+                let elapsed = peer.last_seen.elapsed().as_secs();
+                (elapsed <= LIVE_TOPOLOGY_WINDOW_SECS, elapsed)
             } else {
                 // Check by short ID prefix match
                 let connected = mesh.peers.keys().any(|k| short_peer_id(k) == short_id);
@@ -2434,14 +2443,86 @@ async fn get_network_map(State(state): State<AppState>) -> Json<NetworkMap> {
                 online,
             });
 
+            full_to_short.insert(claim.peer_id.clone(), short_id.clone());
             coord_to_node.insert(claim.coord, short_id);
         }
 
-        // Second pass: compute SPIRAL edges based on actual hex neighbor topology
-        // For each node, check which of its 20 theoretical neighbors exist in the mesh
+        // Second pass: include live peers that have not claimed a slot yet.
+        for (peer_id, peer) in &mesh.peers {
+            let elapsed = peer.last_seen.elapsed().as_secs();
+            if elapsed > LIVE_TOPOLOGY_WINDOW_SECS {
+                continue;
+            }
+
+            let short_id = short_peer_id(peer_id);
+
+            if short_id == short_self_id || nodes.iter().any(|node| node.id == short_id) {
+                continue;
+            }
+
+            nodes.push(PeerNode {
+                id: short_id.clone(),
+                label: short_id.clone(),
+                slot: HexSlot {
+                    index: None,
+                    q: 0,
+                    r: 0,
+                    z: 0,
+                },
+                peer_type: "server".to_string(),
+                last_heartbeat: elapsed,
+                capabilities: vec!["storage".to_string(), "relay".to_string()],
+                online: true,
+            });
+
+            full_to_short.insert(peer_id.clone(), short_id);
+        }
+
+        // Third pass: draw live transport edges for peers we are actively talking to,
+        // even before SPIRAL slot occupancy settles.
         let mut seen_edges: std::collections::HashSet<(String, String)> =
             std::collections::HashSet::new();
+        for (peer_id, peer) in &mesh.peers {
+            let elapsed = peer.last_seen.elapsed().as_secs();
+            if elapsed > LIVE_TOPOLOGY_WINDOW_SECS {
+                continue;
+            }
 
+            let Some(peer_short_id) = full_to_short.get(peer_id).cloned() else {
+                continue;
+            };
+
+            let (from, to) = if short_self_id < peer_short_id {
+                (short_self_id.clone(), peer_short_id.clone())
+            } else {
+                (peer_short_id.clone(), short_self_id.clone())
+            };
+
+            if seen_edges.contains(&(from.clone(), to.clone())) {
+                continue;
+            }
+            seen_edges.insert((from.clone(), to.clone()));
+
+            let latency_stats = mesh
+                .latency_history
+                .get(&mesh.self_id)
+                .and_then(|history| history.get(peer_id))
+                .map(|h| h.compute_stats())
+                .unwrap_or_default();
+            let latency_ms = latency_stats.last_1s_ms.map(|v| v as u32);
+
+            edges.push(PeerEdge {
+                from,
+                to,
+                connection_type: "transport".to_string(),
+                latency_ms,
+                latency_stats,
+                bidirectional: true,
+            });
+        }
+
+        // Fourth pass: compute SPIRAL edges based on actual hex neighbor topology
+        // For each node, check which of its 20 theoretical neighbors exist in the mesh
         for (coord, node_id) in &coord_to_node {
             let neighbor_coords = Neighbors::of(*coord);
 
@@ -2481,16 +2562,41 @@ async fn get_network_map(State(state): State<AppState>) -> Json<NetworkMap> {
         }
     }
 
+    let available_slots = if let Some(ref mesh_state) = state.mesh_state {
+        let mesh = mesh_state.read().await;
+        mesh.available_slot_count() as u32
+    } else {
+        0
+    };
+    let filled_slots = nodes
+        .iter()
+        .filter(|node| node.slot.index.is_some())
+        .count() as u32;
     let stats = NetworkStats {
-        total_nodes: nodes.len() as u32,
+        total_peers: nodes.len() as u32,
         server_nodes: nodes.iter().filter(|n| n.peer_type == "server").count() as u32,
-        browser_nodes: nodes.iter().filter(|n| n.peer_type == "browser").count() as u32,
-        total_edges: edges.len() as u32,
+        browser_peers: nodes.iter().filter(|n| n.peer_type == "browser").count() as u32,
+        mesh_edges: edges.len() as u32,
+        available_slots,
+        filled_slots,
+        mesh_density: if available_slots == 0 {
+            0.0
+        } else {
+            (filled_slots as f64 / available_slots as f64) * 100.0
+        },
+        relay_connections: edges
+            .iter()
+            .filter(|edge| edge.connection_type == "relay")
+            .count() as u32,
         avg_latency_ms: if edges.is_empty() {
             None
         } else {
-            let total: u32 = edges.iter().filter_map(|e| e.latency_ms).sum();
-            Some(total as f64 / edges.len() as f64)
+            let latencies: Vec<u32> = edges.iter().filter_map(|e| e.latency_ms).collect();
+            if latencies.is_empty() {
+                None
+            } else {
+                Some(latencies.iter().sum::<u32>() as f64 / latencies.len() as f64)
+            }
         },
     };
 
@@ -2522,8 +2628,6 @@ struct MeshStateResponse {
     slot_claims: Vec<SlotInfo>,
     /// Connected peers
     peers: Vec<PeerSummary>,
-    /// Active TGP sessions count
-    tgp_sessions: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -2632,7 +2736,6 @@ async fn get_mesh_state(State(state): State<AppState>) -> Json<MeshStateResponse
         peer_count,
         slot_claims,
         peers,
-        tgp_sessions: 0, // TODO: expose TGP session count
     })
 }
 
