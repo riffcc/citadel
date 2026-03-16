@@ -265,6 +265,7 @@ async fn create_snapshot(mesh_state: &Arc<RwLock<MeshState>>) -> MeshEvent {
     use std::collections::{HashMap, HashSet};
 
     let mesh = mesh_state.read().await;
+    const LIVE_TOPOLOGY_WINDOW_SECS: u64 = 60;
 
     let short_self_id = short_peer_id(&mesh.self_id);
 
@@ -299,9 +300,11 @@ async fn create_snapshot(mesh_state: &Arc<RwLock<MeshState>>) -> MeshEvent {
         online: true,
     };
 
-    // Build peers list from claimed_slots (authoritative source, like REST API)
+    // Build peers list from claimed slots first, then live unclaimed peers.
     let mut peers = vec![self_peer];
     let mut coord_to_peer: HashMap<HexCoord, String> = HashMap::new();
+    let mut full_to_short: HashMap<String, String> = HashMap::new();
+    full_to_short.insert(mesh.self_id.clone(), short_self_id.clone());
 
     // Add self to coord map if we have a slot
     if let Some(ref claim) = mesh.self_slot {
@@ -320,12 +323,13 @@ async fn create_snapshot(mesh_state: &Arc<RwLock<MeshState>>) -> MeshEvent {
         // Check if peer is online (look up in peers map)
         let (online, last_heartbeat) = if let Some(peer) = mesh.peers.get(&claim.peer_id) {
             let elapsed = peer.last_seen.elapsed().as_secs();
-            (elapsed < 30, elapsed)
+            (elapsed <= LIVE_TOPOLOGY_WINDOW_SECS, elapsed)
         } else {
             (false, 999)
         };
 
         coord_to_peer.insert(claim.coord, short_id.clone());
+        full_to_short.insert(claim.peer_id.clone(), short_id.clone());
 
         peers.push(PeerInfo {
             id: short_id.clone(),
@@ -341,6 +345,35 @@ async fn create_snapshot(mesh_state: &Arc<RwLock<MeshState>>) -> MeshEvent {
             capabilities: vec!["storage".to_string(), "relay".to_string()],
             online,
         });
+    }
+
+    for (peer_id, peer) in &mesh.peers {
+        let elapsed = peer.last_seen.elapsed().as_secs();
+        if elapsed > LIVE_TOPOLOGY_WINDOW_SECS {
+            continue;
+        }
+
+        let short_id = short_peer_id(peer_id);
+
+        if short_id == short_self_id || peers.iter().any(|existing| existing.id == short_id) {
+            continue;
+        }
+
+        peers.push(PeerInfo {
+            id: short_id.clone(),
+            label: short_id.clone(),
+            slot: HexSlot {
+                index: None,
+                q: 0,
+                r: 0,
+                z: 0,
+            },
+            peer_type: "server".to_string(),
+            last_heartbeat: elapsed,
+            capabilities: vec!["storage".to_string(), "relay".to_string()],
+            online: true,
+        });
+        full_to_short.insert(peer_id.clone(), short_id);
     }
 
     // Build slots list
@@ -359,6 +392,56 @@ async fn create_snapshot(mesh_state: &Arc<RwLock<MeshState>>) -> MeshEvent {
     // Include latency data from mesh.latency_history for PoL visualization
     let mut edges = Vec::new();
     let mut seen_edges: HashSet<(String, String)> = HashSet::new();
+
+    for (peer_id, peer) in &mesh.peers {
+        let elapsed = peer.last_seen.elapsed().as_secs();
+        if elapsed > LIVE_TOPOLOGY_WINDOW_SECS {
+            continue;
+        }
+
+        let Some(peer_short_id) = full_to_short.get(peer_id).cloned() else {
+            continue;
+        };
+
+        let (from, to) = if short_self_id < peer_short_id {
+            (short_self_id.clone(), peer_short_id.clone())
+        } else {
+            (peer_short_id.clone(), short_self_id.clone())
+        };
+
+        if seen_edges.contains(&(from.clone(), to.clone())) {
+            continue;
+        }
+        seen_edges.insert((from.clone(), to.clone()));
+
+        let latency_stats = mesh
+            .latency_history
+            .get(&mesh.self_id)
+            .and_then(|h| h.get(peer_id))
+            .map(|h| {
+                let stats = h.compute_stats();
+                LatencyStatsWs {
+                    last_1s_ms: stats.last_1s_ms,
+                    last_60s_ms: stats.last_60s_ms,
+                    last_1h_ms: stats.last_1h_ms,
+                    samples_1s: stats.samples_1s,
+                    samples_60s: stats.samples_60s,
+                    samples_1h: stats.samples_1h,
+                }
+            })
+            .unwrap_or_default();
+
+        let latency_ms = latency_stats.last_1s_ms.map(|v| v as u32);
+
+        edges.push(EdgeInfo {
+            from,
+            to,
+            connection_type: "transport".to_string(),
+            latency_ms,
+            latency_stats,
+            bidirectional: true,
+        });
+    }
 
     for (coord, peer_id) in &coord_to_peer {
         let neighbor_coords = Neighbors::of(*coord);

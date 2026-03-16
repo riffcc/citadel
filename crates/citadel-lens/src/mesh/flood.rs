@@ -67,7 +67,7 @@ pub enum FloodMessage {
     /// CVDF chain sync response (all rounds)
     CvdfSyncResponse {
         rounds: Vec<CvdfRound>,
-        slots: Vec<(u64, [u8; 32])>,
+        claims: Vec<AnchoredSlotClaim>,
     },
     /// SPORE: Content HaveList - advertise release IDs we have (for content sync)
     ContentHaveList {

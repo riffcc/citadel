@@ -1,7 +1,7 @@
 # Citadel Lens Node Docker Image
 # Multi-stage build for minimal final image
 
-FROM rust:latest AS builder
+FROM rust:1.94 AS builder
 
 # No external C dependencies needed - ReDB is pure Rust
 
@@ -14,7 +14,7 @@ COPY citadel/Cargo.lock ./
 RUN cat > Cargo.toml << 'EOF'
 [workspace]
 resolver = "2"
-members = ["crates/citadel-lens", "crates/citadel-topology", "crates/citadel-dht", "crates/citadel-protocols", "crates/citadel-spore", "crates/citadel-docs", "crates/citadel-crdt"]
+members = ["crates/citadel-lens", "crates/citadel-topology", "crates/citadel-dht", "crates/citadel-protocols", "crates/citadel-spore", "crates/citadel-docs", "crates/citadel-crdt", "crates/citadel-ygg", "crates/yggdrasil-rs"]
 
 [workspace.package]
 version = "0.1.0"
@@ -31,8 +31,11 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 blake3 = "1"
+blake2 = "0.10"
 ed25519-dalek = "2"
 hex = "0.4"
+rand = "0.8"
+pretty_assertions = "1"
 serde_bytes = "0.11"
 EOF
 
@@ -47,6 +50,8 @@ COPY citadel/crates/citadel-protocols ./crates/citadel-protocols
 COPY citadel/crates/citadel-spore ./crates/citadel-spore
 COPY citadel/crates/citadel-docs ./crates/citadel-docs
 COPY citadel/crates/citadel-crdt ./crates/citadel-crdt
+COPY citadel/crates/citadel-ygg ./crates/citadel-ygg
+COPY citadel/crates/yggdrasil-rs ./crates/yggdrasil-rs
 
 # Fix two-generals paths for Docker build structure
 RUN sed -i 's|path = "../../../two-generals/rust"|path = "../../two-generals/rust"|' crates/citadel-protocols/Cargo.toml && \
