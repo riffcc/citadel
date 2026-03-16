@@ -590,7 +590,7 @@ impl MeshService {
         local_yggdrasil_addr: Option<String>,
         local_underlay_uri: Option<String>,
         storage: Arc<Storage>,
-        doc_store: DocumentStore,
+        doc_store: Arc<tokio::sync::RwLock<DocumentStore>>,
     ) -> Self {
         // Generate or load node keypair for peer identity
         let signing_key = storage.get_or_create_node_key().unwrap_or_else(|_| {
@@ -633,7 +633,7 @@ impl MeshService {
             local_yggdrasil_addr,
             local_underlay_uri,
             storage,
-            doc_store: Arc::new(tokio::sync::RwLock::new(doc_store)),
+            doc_store,
             state: Arc::new(RwLock::new(MeshState {
                 self_id,
                 signing_key: signing_key.clone(),
@@ -4838,6 +4838,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let storage = Arc::new(Storage::open(dir.path().join("lens.redb")).expect("storage"));
         let doc_store = DocumentStore::open(dir.path().join("docs.redb")).expect("doc_store");
+        let doc_store = Arc::new(tokio::sync::RwLock::new(doc_store));
         MeshService::new(
             "127.0.0.1:0".parse().unwrap(),
             None,

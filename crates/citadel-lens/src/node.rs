@@ -217,7 +217,7 @@ pub struct LensState {
     pub mesh_state: Option<Arc<RwLock<MeshState>>>,
     /// Document store for CRDT documents with SPORE sync (featured releases, etc.)
     /// Uses rich semantic merges (NOT LWW) - proven convergent in Lean.
-    pub doc_store: Option<Arc<tokio::sync::RwLock<citadel_docs::DocumentStore>>>,
+    pub doc_store: Arc<tokio::sync::RwLock<citadel_docs::DocumentStore>>,
     /// Flood sender for SPORE content propagation
     pub flood_tx: Option<tokio::sync::broadcast::Sender<crate::mesh::FloodMessage>>,
     /// Admin event sender for real-time moderation updates via WebSocket
@@ -258,11 +258,18 @@ impl LensNode {
             }
         }
 
+        // Open document store for CRDT documents with SPORE sync
+        // Uses rich semantic merges (NOT LWW) - proven convergent in Lean
+        let doc_store_path = config.data_dir.join("docs.redb");
+        let doc_store = citadel_docs::DocumentStore::open(&doc_store_path)
+            .map_err(|e| crate::error::Error::Storage(e.to_string()))?;
+        let doc_store = Arc::new(tokio::sync::RwLock::new(doc_store));
+
         let state = Arc::new(RwLock::new(LensState {
             storage,
             config: config.clone(),
             mesh_state: None,
-            doc_store: None, // Set when mesh service starts
+            doc_store,
             flood_tx: None,
             admin_event_tx: None,
         }));
@@ -308,11 +315,11 @@ impl LensNode {
         // Start mesh service first to get flood sender
         let mesh_storage = self.storage().await;
 
-        // Open document store for CRDT documents with SPORE sync
-        // Uses rich semantic merges (NOT LWW) - proven convergent in Lean
-        let doc_store_path = self.config.data_dir.join("docs.redb");
-        let doc_store = citadel_docs::DocumentStore::open(&doc_store_path)
-            .map_err(|e| crate::error::Error::Storage(e.to_string()))?;
+        // Share the doc_store that was opened in new() with the mesh service
+        let doc_store = {
+            let state = self.state.read().await;
+            Arc::clone(&state.doc_store)
+        };
 
         let mesh_service = Arc::new(MeshService::new(
             self.config.p2p_addr,
@@ -346,11 +353,11 @@ impl LensNode {
         // Create admin event channel for real-time moderation updates
         let (admin_event_tx, _admin_event_rx) = crate::ws_admin::create_admin_channel();
 
-        // Share mesh state, flood_tx, doc_store, and admin_event_tx with API layer
+        // Share mesh state, flood_tx, and admin_event_tx with API layer
+        // (doc_store is already shared - opened in new() and passed to MeshService)
         {
             let mut state = self.state.write().await;
             state.mesh_state = Some(mesh_service.mesh_state());
-            state.doc_store = Some(mesh_service.doc_store());
             state.flood_tx = Some(flood_tx);
             state.admin_event_tx = Some(admin_event_tx);
         }
