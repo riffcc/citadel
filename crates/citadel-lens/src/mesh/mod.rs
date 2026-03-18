@@ -12,7 +12,7 @@
 //! - `slot` - SPIRAL slot management (SlotClaim, consensus threshold)
 //! - `spore` - SPORE sync utilities (HaveList, WantList)
 //! - `flood` - Flood message types for continuous propagation
-//! - `tgp` - TGP session management
+//! - `transport` - entry-peer and dial-target resolution
 //! - `state` - MeshState (all node state)
 //! - `service` - MeshService implementation
 //!
@@ -23,9 +23,9 @@
 //! "11/20" IS THE RESULT.
 //!
 //! THE MECHANISM IS:
-//! ├── TGP at the base (bilateral consensus)
-//! ├── BFT emerges from TGP combinations
+//! ├── Occupied theoretical neighbors define the live validator surface
 //! ├── Threshold scales with network size
+//! ├── VDF-anchored claims provide deterministic ordering
 //! └── 11/20 is what BFT LOOKS LIKE at 20 neighbors
 //! ```
 //!
@@ -41,11 +41,11 @@ pub mod flood;
 pub mod peer;
 pub mod peer_addr_store;
 pub mod service;
-pub mod transport;
 pub mod slot;
 pub mod spore;
 pub mod state;
-pub mod tgp;
+mod tgp;
+pub mod transport;
 
 // Re-export core types at module level for convenience
 pub use flood::FloodMessage;
@@ -54,9 +54,8 @@ pub use peer::{
     MeshPeer,
 };
 pub use peer_addr_store::{PeerAddrRecord, PeerAddrStore};
-pub use transport::{extract_host_from_uri, resolve_entry_peer_target, resolve_peer_dial_target};
 pub use service::MeshService;
 pub use slot::{consensus_threshold, LatencyHistory, LatencySample, SlotClaim};
 pub use spore::{build_spore_havelist, build_spore_wantlist, release_id_to_u256};
 pub use state::MeshState;
-pub use tgp::TgpSession;
+pub use transport::{extract_host_from_uri, resolve_entry_peer_target, resolve_peer_dial_target};

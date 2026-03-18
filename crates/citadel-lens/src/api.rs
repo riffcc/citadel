@@ -2,7 +2,7 @@
 
 use crate::admin_socket;
 use crate::mesh::{double_hash_id, FloodMessage};
-use crate::models::{Category, FeaturedRelease, Release, ReleaseStatus, SiteManifest};
+use crate::models::{Category, FeaturedRelease, Release, ReleaseStatus, RendererMode, SiteManifest};
 use crate::node::LensState;
 use crate::ws::ws_mesh_handler;
 use crate::ws_admin;
@@ -14,7 +14,6 @@ use axum::{
     Json, Router,
 };
 use citadel_crdt::ContentId;
-use citadel_docs::Document;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -278,7 +277,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/validate-upload", get(validate_upload))
         // Network mesh topology map
         .route("/api/v1/map", get(get_network_map))
-        // Mesh state (slots, peers, TGP sessions)
+        // Mesh state (slots and live peers)
         .route("/api/v1/mesh/state", get(get_mesh_state))
         // WebSocket for real-time mesh updates
         .route("/api/v1/ws/mesh", get(ws_mesh_handler))
@@ -384,16 +383,13 @@ async fn list_releases(
         .map(|pk| state.storage.is_admin(pk).unwrap_or(false))
         .unwrap_or(false);
 
-    // Use DocumentStore for CRDT-based sync (no legacy fallback - use import/export to migrate)
-    let releases = if let Some(ref doc_store) = state.doc_store {
-        let doc_store = doc_store.read().await;
+    // Use DocumentStore for CRDT-based sync
+    let releases = {
+        let doc_store = state.doc_store.read().await;
         doc_store.list::<Release>().map_err(|e| {
             tracing::error!("DocumentStore list failed: {:?}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?
-    } else {
-        tracing::warn!("doc_store not initialized");
-        Vec::new()
     };
 
     // Filter releases based on params
@@ -587,9 +583,9 @@ async fn create_release(
 
     let state = state.read().await;
 
-    // Use DocumentStore if available (CRDT path with automatic merge)
-    if let Some(ref doc_store) = state.doc_store {
-        let mut doc_store = doc_store.write().await;
+    // Save to DocumentStore (CRDT path with automatic merge)
+    {
+        let mut doc_store = state.doc_store.write().await;
         let (_, _changed) = doc_store.put(&release).map_err(|e| {
             tracing::error!("DocumentStore put failed: {:?}", e);
             (
@@ -600,16 +596,6 @@ async fn create_release(
             )
         })?;
         tracing::info!("Created release {} in DocumentStore", release.id);
-    } else {
-        // Fallback to legacy storage
-        state.storage.put_release(&release).map_err(|_| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": "Failed to save release"
-                })),
-            )
-        })?;
     }
 
     // SPORE: Flood the release to propagate across mesh
@@ -620,8 +606,8 @@ async fn create_release(
         }
 
         // SPORE: Broadcast our updated ContentHaveList so peers know our new state
-        if let Some(ref doc_store) = state.doc_store {
-            let doc_store = doc_store.read().await;
+        {
+            let doc_store = state.doc_store.read().await;
             if let Ok(all_releases) = doc_store.list::<Release>() {
                 let release_ids: Vec<String> = all_releases.iter().map(|r| r.id.clone()).collect();
                 let _ = flood_tx.send(FloodMessage::ContentHaveList {
@@ -648,18 +634,12 @@ async fn get_release(
 ) -> Result<Json<Release>, StatusCode> {
     let state = state.read().await;
 
-    // Use DocumentStore only (no legacy fallback - use import/export to migrate)
-    if let Some(ref doc_store) = state.doc_store {
-        let doc_store = doc_store.read().await;
-        let content_id = citadel_crdt::ContentId::hash(id.as_bytes());
-        match doc_store.get::<Release>(&content_id) {
-            Ok(Some(release)) => Ok(Json(release.with_defaults())),
-            Ok(None) => Err(StatusCode::NOT_FOUND),
-            Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
-        }
-    } else {
-        tracing::warn!("doc_store not initialized");
-        Err(StatusCode::INTERNAL_SERVER_ERROR)
+    let doc_store = state.doc_store.read().await;
+    let content_id = citadel_crdt::ContentId::hash(id.as_bytes());
+    match doc_store.get::<Release>(&content_id) {
+        Ok(Some(release)) => Ok(Json(release.with_defaults())),
+        Ok(None) => Err(StatusCode::NOT_FOUND),
+        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
 
@@ -766,9 +746,9 @@ async fn update_release(
 
     let state = state.read().await;
 
-    // Get existing release - check doc_store first, then legacy
-    let mut release = if let Some(ref doc_store) = state.doc_store {
-        let doc_store = doc_store.read().await;
+    // Get existing release from doc_store
+    let mut release = {
+        let doc_store = state.doc_store.read().await;
         let content_id = citadel_crdt::ContentId::hash(id.as_bytes());
         match doc_store.get::<Release>(&content_id) {
             Ok(Some(r)) => r,
@@ -789,14 +769,6 @@ async fn update_release(
                 ))
             }
         }
-    } else {
-        tracing::warn!("doc_store not initialized");
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": "doc_store not initialized"
-            })),
-        ));
     };
 
     // Update fields if provided
@@ -853,9 +825,9 @@ async fn update_release(
         release.update_version(node_id);
     }
 
-    // Save updated release - use DocumentStore if available (CRDT merge)
-    if let Some(ref doc_store) = state.doc_store {
-        let mut doc_store = doc_store.write().await;
+    // Save updated release to DocumentStore (CRDT merge)
+    {
+        let mut doc_store = state.doc_store.write().await;
         let (_, _changed) = doc_store.put(&release).map_err(|e| {
             tracing::error!("DocumentStore put failed: {:?}", e);
             (
@@ -866,15 +838,6 @@ async fn update_release(
             )
         })?;
         tracing::debug!("Updated release {} in DocumentStore", release.id);
-    } else {
-        state.storage.put_release(&release).map_err(|_| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": "Failed to save release"
-                })),
-            )
-        })?;
     }
 
     // SPORE: Flood the updated release to propagate across mesh
@@ -952,9 +915,9 @@ async fn delete_release(
     let state = state.read().await;
 
     // Delete from DocumentStore
-    if let Some(ref doc_store) = state.doc_store {
+    {
         let content_id = citadel_crdt::ContentId::hash(id.as_bytes());
-        let mut doc_store = doc_store.write().await;
+        let mut doc_store = state.doc_store.write().await;
         if let Err(e) = doc_store.delete::<Release>(&content_id) {
             tracing::warn!("Failed to delete release from DocumentStore: {:?}", e);
             return Err((
@@ -965,14 +928,6 @@ async fn delete_release(
             ));
         }
         tracing::debug!("Deleted release {} from DocumentStore", id);
-    } else {
-        tracing::warn!("doc_store not initialized");
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": "doc_store not initialized"
-            })),
-        ));
     }
 
     // SPORE⁻¹: Compute double-hash tombstone and add to DoNotWantList
@@ -1032,30 +987,14 @@ async fn list_pending_releases(
         ));
     }
 
-    // Use DocumentStore if available (CRDT path)
-    let releases: Vec<Release> = if let Some(ref doc_store) = state.doc_store {
-        let doc_store = doc_store.read().await;
+    // List pending releases from DocumentStore (CRDT path)
+    let releases: Vec<Release> = {
+        let doc_store = state.doc_store.read().await;
         doc_store
             .list::<Release>()
             .unwrap_or_default()
             .into_iter()
             .filter(|r| r.status == ReleaseStatus::Pending)
-            .map(|r| r.with_defaults())
-            .collect()
-    } else {
-        // Fallback to legacy storage
-        state
-            .storage
-            .list_pending_releases()
-            .map_err(|_| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({
-                        "error": "Failed to list pending releases"
-                    })),
-                )
-            })?
-            .into_iter()
             .map(|r| r.with_defaults())
             .collect()
     };
@@ -1133,8 +1072,8 @@ async fn approve_release(
     let state = state.read().await;
 
     // Get release from doc_store
-    let mut release = if let Some(ref doc_store) = state.doc_store {
-        let doc_store = doc_store.read().await;
+    let mut release = {
+        let doc_store = state.doc_store.read().await;
         let content_id = citadel_crdt::ContentId::hash(id.as_bytes());
         match doc_store.get::<Release>(&content_id) {
             Ok(Some(r)) => r,
@@ -1155,14 +1094,6 @@ async fn approve_release(
                 ))
             }
         }
-    } else {
-        tracing::warn!("doc_store not initialized");
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": "doc_store not initialized"
-            })),
-        ));
     };
 
     // Approve the release
@@ -1170,8 +1101,8 @@ async fn approve_release(
     release.modified_at = chrono::Utc::now().to_rfc3339();
 
     // Save to doc_store
-    if let Some(ref doc_store) = state.doc_store {
-        let mut doc_store = doc_store.write().await;
+    {
+        let mut doc_store = state.doc_store.write().await;
         match doc_store.put(&release) {
             Ok(_) => {}
             Err(e) => {
@@ -1184,14 +1115,6 @@ async fn approve_release(
                 ));
             }
         }
-    } else {
-        tracing::warn!("doc_store not initialized");
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": "doc_store not initialized"
-            })),
-        ));
     }
 
     tracing::info!("Release {} approved by {}", id, public_key);
@@ -1287,8 +1210,8 @@ async fn reject_release(
     let state = state.read().await;
 
     // Get release from doc_store
-    let mut release = if let Some(ref doc_store) = state.doc_store {
-        let doc_store = doc_store.read().await;
+    let mut release = {
+        let doc_store = state.doc_store.read().await;
         let content_id = citadel_crdt::ContentId::hash(id.as_bytes());
         match doc_store.get::<Release>(&content_id) {
             Ok(Some(r)) => r,
@@ -1309,14 +1232,6 @@ async fn reject_release(
                 ))
             }
         }
-    } else {
-        tracing::warn!("doc_store not initialized");
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": "doc_store not initialized"
-            })),
-        ));
     };
 
     // Reject the release
@@ -1324,8 +1239,8 @@ async fn reject_release(
     release.modified_at = chrono::Utc::now().to_rfc3339();
 
     // Save to doc_store
-    if let Some(ref doc_store) = state.doc_store {
-        let mut doc_store = doc_store.write().await;
+    {
+        let mut doc_store = state.doc_store.write().await;
         match doc_store.put(&release) {
             Ok(_) => {}
             Err(e) => {
@@ -1338,14 +1253,6 @@ async fn reject_release(
                 ));
             }
         }
-    } else {
-        tracing::warn!("doc_store not initialized");
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": "doc_store not initialized"
-            })),
-        ));
     }
 
     tracing::info!(
@@ -1410,18 +1317,30 @@ async fn moderation_stats(
         ));
     }
 
-    let counts = state.storage.count_releases_by_status().map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": "Failed to get moderation stats"
-            })),
-        )
-    })?;
-
-    let pending = *counts.get("pending").unwrap_or(&0);
-    let approved = *counts.get("approved").unwrap_or(&0);
-    let rejected = *counts.get("rejected").unwrap_or(&0);
+    // Count releases by status from DocumentStore
+    let (pending, approved, rejected) = {
+        let doc_store = state.doc_store.read().await;
+        let releases = doc_store.list::<Release>().map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "Failed to get moderation stats"
+                })),
+            )
+        })?;
+        let mut pending = 0usize;
+        let mut approved = 0usize;
+        let mut rejected = 0usize;
+        for r in &releases {
+            match r.status {
+                ReleaseStatus::Pending => pending += 1,
+                ReleaseStatus::Approved => approved += 1,
+                ReleaseStatus::Rejected => rejected += 1,
+                _ => {} // Deleted etc.
+            }
+        }
+        (pending, approved, rejected)
+    };
 
     Ok(Json(ModerationStatsResponse {
         pending,
@@ -1611,26 +1530,16 @@ async fn list_featured_releases(
 ) -> Result<Json<Vec<FeaturedRelease>>, StatusCode> {
     let state = state.read().await;
 
-    // Use DocumentStore if available (new CRDT-based sync)
-    if let Some(ref doc_store) = state.doc_store {
-        let doc_store = doc_store.read().await;
-        let featured = doc_store.list::<FeaturedRelease>().map_err(|e| {
-            tracing::error!("DocumentStore list failed: {:?}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-        tracing::debug!(
-            "Listed {} featured releases from DocumentStore",
-            featured.len()
-        );
-        return Ok(Json(featured));
-    }
-
-    // Fallback to legacy storage
-    tracing::debug!("doc_store is None, listing from legacy storage");
-    let featured = state
-        .storage
-        .list_featured_releases()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    // List featured releases from DocumentStore (CRDT-based sync)
+    let doc_store = state.doc_store.read().await;
+    let featured = doc_store.list::<FeaturedRelease>().map_err(|e| {
+        tracing::error!("DocumentStore list failed: {:?}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    tracing::debug!(
+        "Listed {} featured releases from DocumentStore",
+        featured.len()
+    );
     Ok(Json(featured))
 }
 
@@ -1641,22 +1550,11 @@ async fn get_featured_release(
 ) -> Result<Json<FeaturedRelease>, StatusCode> {
     let state = state.read().await;
 
-    // Use DocumentStore if available (new CRDT-based sync)
-    if let Some(ref doc_store) = state.doc_store {
-        let doc_store = doc_store.read().await;
-        // ContentId is computed from the string ID (same as FeaturedRelease::content_id)
-        let content_id = ContentId::hash(id.as_bytes());
-        return doc_store
-            .get::<FeaturedRelease>(&content_id)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-            .map(Json)
-            .ok_or(StatusCode::NOT_FOUND);
-    }
-
-    // Fallback to legacy storage
-    state
-        .storage
-        .get_featured_release(&id)
+    let doc_store = state.doc_store.read().await;
+    // ContentId is computed from the string ID (same as FeaturedRelease::content_id)
+    let content_id = ContentId::hash(id.as_bytes());
+    doc_store
+        .get::<FeaturedRelease>(&content_id)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .map(Json)
         .ok_or(StatusCode::NOT_FOUND)
@@ -1700,17 +1598,13 @@ async fn create_featured_release(
     // Verify the release exists
     {
         let state = state.read().await;
-        let release_exists = if let Some(ref doc_store) = state.doc_store {
-            let doc_store = doc_store.read().await;
-            let content_id = citadel_crdt::ContentId::hash(req.release_id.as_bytes());
-            doc_store
-                .get::<Release>(&content_id)
-                .ok()
-                .flatten()
-                .is_some()
-        } else {
-            false
-        };
+        let doc_store = state.doc_store.read().await;
+        let content_id = citadel_crdt::ContentId::hash(req.release_id.as_bytes());
+        let release_exists = doc_store
+            .get::<Release>(&content_id)
+            .ok()
+            .flatten()
+            .is_some();
         if !release_exists {
             return Err(StatusCode::BAD_REQUEST); // Release doesn't exist
         }
@@ -1734,28 +1628,21 @@ async fn create_featured_release(
 
     let state = state.read().await;
 
-    // Use DocumentStore if available (new CRDT-based sync with rich semantic merges)
-    if let Some(ref doc_store) = state.doc_store {
-        tracing::info!("Creating featured release in DocumentStore");
-        let mut doc_store = doc_store.write().await;
+    // Save to DocumentStore (CRDT-based sync with rich semantic merges)
+    tracing::info!("Creating featured release in DocumentStore");
+    {
+        let mut doc_store = state.doc_store.write().await;
         doc_store.put(&featured).map_err(|e| {
             tracing::error!("DocumentStore put failed: {:?}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
-        tracing::info!("Featured release created successfully: {}", featured.id);
-        return Ok((StatusCode::CREATED, Json(featured)));
     }
-
-    // Fallback to legacy storage
-    tracing::warn!("doc_store is None, falling back to legacy storage for featured release");
-    state
-        .storage
-        .put_featured_release(&featured)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    tracing::info!("Featured release created successfully: {}", featured.id);
 
     // SPORE: Flood featured releases so they propagate across the mesh
     if let Some(ref flood_tx) = state.flood_tx {
-        if let Ok(all_featured) = state.storage.list_featured_releases() {
+        let doc_store = state.doc_store.read().await;
+        if let Ok(all_featured) = doc_store.list::<FeaturedRelease>() {
             let featured_json: Vec<String> = all_featured
                 .iter()
                 .filter_map(|f| serde_json::to_string(f).ok())
@@ -1784,98 +1671,37 @@ async fn update_featured_release(
     Json(req): Json<FeaturedReleaseRequest>,
 ) -> Result<Json<FeaturedRelease>, StatusCode> {
     let state = state.read().await;
+    let content_id = ContentId::hash(id.as_bytes());
 
-    // Use DocumentStore if available (new CRDT-based sync with rich semantic merges)
-    if let Some(ref doc_store) = state.doc_store {
-        let content_id = ContentId::hash(id.as_bytes());
-
-        // Get existing to verify it exists
-        {
-            let doc_store_read = doc_store.read().await;
-            if doc_store_read
-                .get::<FeaturedRelease>(&content_id)
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-                .is_none()
-            {
-                return Err(StatusCode::NOT_FOUND);
-            }
-        }
-
-        // Verify the release exists if changing releaseId
-        let release_exists = if let Some(ref doc_store) = state.doc_store {
-            let doc_store = doc_store.read().await;
-            let content_id = citadel_crdt::ContentId::hash(req.release_id.as_bytes());
-            doc_store
-                .get::<Release>(&content_id)
-                .ok()
-                .flatten()
-                .is_some()
-        } else {
-            false
-        };
-        if !release_exists {
-            return Err(StatusCode::BAD_REQUEST);
-        }
-
-        // Create updated featured release with the same ID
-        let mut featured =
-            FeaturedRelease::new(id.clone(), req.release_id, req.start_time, req.end_time);
-        featured.promoted = req.promoted;
-        featured.priority = req.priority;
-        featured.order = req.order;
-        featured.custom_title = req.custom_title;
-        featured.custom_description = req.custom_description;
-        featured.custom_thumbnail = req.custom_thumbnail;
-        featured.regions = req.regions;
-        featured.languages = req.languages;
-        featured.tags = req.tags;
-        featured.variant = req.variant;
-        featured.metadata = req.metadata;
-
-        // Put will automatically merge with existing using TotalMerge
-        let mut doc_store = doc_store.write().await;
-        doc_store
-            .put(&featured)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-        // Return the merged result
-        let merged = doc_store
+    // Get existing to verify it exists
+    {
+        let doc_store = state.doc_store.read().await;
+        if doc_store
             .get::<FeaturedRelease>(&content_id)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-            .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
-
-        return Ok(Json(merged));
+            .is_none()
+        {
+            return Err(StatusCode::NOT_FOUND);
+        }
     }
 
-    // Fallback to legacy storage (no merge semantics)
-    let mut featured = state
-        .storage
-        .get_featured_release(&id)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .ok_or(StatusCode::NOT_FOUND)?;
-
-    // Verify the release exists if changing releaseId
-    if featured.release_id != req.release_id {
-        let release_exists = if let Some(ref doc_store) = state.doc_store {
-            let doc_store = doc_store.read().await;
-            let content_id = citadel_crdt::ContentId::hash(req.release_id.as_bytes());
-            doc_store
-                .get::<Release>(&content_id)
-                .ok()
-                .flatten()
-                .is_some()
-        } else {
-            false
-        };
+    // Verify the release exists
+    {
+        let doc_store = state.doc_store.read().await;
+        let release_content_id = citadel_crdt::ContentId::hash(req.release_id.as_bytes());
+        let release_exists = doc_store
+            .get::<Release>(&release_content_id)
+            .ok()
+            .flatten()
+            .is_some();
         if !release_exists {
             return Err(StatusCode::BAD_REQUEST);
         }
     }
 
-    // Update fields
-    featured.release_id = req.release_id;
-    featured.start_time = req.start_time;
-    featured.end_time = req.end_time;
+    // Create updated featured release with the same ID
+    let mut featured =
+        FeaturedRelease::new(id.clone(), req.release_id, req.start_time, req.end_time);
     featured.promoted = req.promoted;
     featured.priority = req.priority;
     featured.order = req.order;
@@ -1888,14 +1714,24 @@ async fn update_featured_release(
     featured.variant = req.variant;
     featured.metadata = req.metadata;
 
-    state
-        .storage
-        .put_featured_release(&featured)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    // Put will automatically merge with existing using TotalMerge
+    let merged = {
+        let mut doc_store = state.doc_store.write().await;
+        doc_store
+            .put(&featured)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        // Return the merged result
+        doc_store
+            .get::<FeaturedRelease>(&content_id)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?
+    };
 
     // SPORE: Flood featured releases so they propagate across the mesh
     if let Some(ref flood_tx) = state.flood_tx {
-        if let Ok(all_featured) = state.storage.list_featured_releases() {
+        let doc_store = state.doc_store.read().await;
+        if let Ok(all_featured) = doc_store.list::<FeaturedRelease>() {
             let featured_json: Vec<String> = all_featured
                 .iter()
                 .filter_map(|f| serde_json::to_string(f).ok())
@@ -1908,7 +1744,7 @@ async fn update_featured_release(
         }
     }
 
-    Ok(Json(featured))
+    Ok(Json(merged))
 }
 
 /// Delete a featured release (admin only)
@@ -1921,56 +1757,41 @@ async fn delete_featured_release(
     let state = state.read().await;
     let content_id = ContentId::hash(id.as_bytes());
 
-    // Use DocumentStore if available (new CRDT-based sync)
-    if let Some(ref doc_store) = state.doc_store {
-        let doc_store_read = doc_store.read().await;
-
-        // Check if exists
+    // Check if exists, then delete from DocumentStore
+    {
+        let doc_store_read = state.doc_store.read().await;
         match doc_store_read.get::<FeaturedRelease>(&content_id) {
             Ok(Some(_)) => {
                 drop(doc_store_read); // Release read lock before write
-                let mut doc_store_write = doc_store.write().await;
+                let mut doc_store_write = state.doc_store.write().await;
                 if doc_store_write
                     .delete::<FeaturedRelease>(&content_id)
                     .is_ok()
                 {
-                    return StatusCode::NO_CONTENT;
-                } else {
-                    return StatusCode::INTERNAL_SERVER_ERROR;
-                }
-            }
-            Ok(None) => return StatusCode::NOT_FOUND,
-            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
-        }
-    }
-
-    // Fallback to legacy storage
-    match state.storage.get_featured_release(&id) {
-        Ok(Some(_)) => {
-            if state.storage.delete_featured_release(&id).is_ok() {
-                // SPORE: Flood updated featured releases so deletion propagates
-                if let Some(ref flood_tx) = state.flood_tx {
-                    if let Ok(all_featured) = state.storage.list_featured_releases() {
-                        let featured_json: Vec<String> = all_featured
-                            .iter()
-                            .filter_map(|f| serde_json::to_string(f).ok())
-                            .collect();
-                        let _ = flood_tx.send(FloodMessage::FeaturedSync {
-                            peer_id: "api".to_string(),
-                            featured: featured_json,
-                        });
-                        tracing::debug!(
-                            "SPORE: Broadcast FeaturedSync after deleting featured release"
-                        );
+                    // SPORE: Flood updated featured releases so deletion propagates
+                    if let Some(ref flood_tx) = state.flood_tx {
+                        if let Ok(all_featured) = doc_store_write.list::<FeaturedRelease>() {
+                            let featured_json: Vec<String> = all_featured
+                                .iter()
+                                .filter_map(|f| serde_json::to_string(f).ok())
+                                .collect();
+                            let _ = flood_tx.send(FloodMessage::FeaturedSync {
+                                peer_id: "api".to_string(),
+                                featured: featured_json,
+                            });
+                            tracing::debug!(
+                                "SPORE: Broadcast FeaturedSync after deleting featured release"
+                            );
+                        }
                     }
+                    StatusCode::NO_CONTENT
+                } else {
+                    StatusCode::INTERNAL_SERVER_ERROR
                 }
-                StatusCode::NO_CONTENT
-            } else {
-                StatusCode::INTERNAL_SERVER_ERROR
             }
+            Ok(None) => StatusCode::NOT_FOUND,
+            Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
-        Ok(None) => StatusCode::NOT_FOUND,
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
 
@@ -1993,6 +1814,8 @@ struct UpdateSiteRequest {
     description: Option<String>,
     logo: Option<String>,
     url: Option<String>,
+    renderer_mode: Option<RendererMode>,
+    live_preview_url: Option<String>,
     theme: Option<serde_json::Value>,
 }
 
@@ -2127,6 +1950,28 @@ async fn update_site(
         } else {
             Some(trimmed.to_string())
         };
+    }
+
+    if let Some(renderer_mode) = req.renderer_mode {
+        manifest.renderer_mode = renderer_mode;
+    }
+
+    if let Some(live_preview_url) = req.live_preview_url {
+        let trimmed = live_preview_url.trim();
+        manifest.live_preview_url = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        };
+    }
+
+    if manifest.renderer_mode == RendererMode::Live && manifest.live_preview_url.is_none() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "livePreviewUrl is required when rendererMode is Live"
+            })),
+        ));
     }
 
     if let Some(theme) = req.theme {
@@ -2309,10 +2154,14 @@ struct PeerEdge {
 
 #[derive(Debug, Serialize)]
 struct NetworkStats {
-    total_nodes: u32,
+    total_peers: u32,
     server_nodes: u32,
-    browser_nodes: u32,
-    total_edges: u32,
+    browser_peers: u32,
+    mesh_edges: u32,
+    available_slots: u32,
+    filled_slots: u32,
+    mesh_density: f64,
+    relay_connections: u32,
     avg_latency_ms: Option<f64>,
 }
 
@@ -2365,12 +2214,16 @@ async fn get_network_map(State(state): State<AppState>) -> Json<NetworkMap> {
     let mut nodes = vec![self_node.clone()];
     let mut edges = Vec::new();
 
+    const LIVE_TOPOLOGY_WINDOW_SECS: u64 = 60;
+
     if let Some(ref mesh_state) = state.mesh_state {
         let mesh = mesh_state.read().await;
 
         // Build a map of coordinates to node IDs for SPIRAL edge computation
         use citadel_topology::{HexCoord, Neighbors};
         let mut coord_to_node: HashMap<HexCoord, String> = HashMap::new();
+        let mut full_to_short: HashMap<String, String> = HashMap::new();
+        full_to_short.insert(mesh.self_id.clone(), short_self_id.clone());
 
         // Add self to coord map if we have a slot
         if let Some(ref claim) = self_slot_opt {
@@ -2388,7 +2241,8 @@ async fn get_network_map(State(state): State<AppState>) -> Json<NetworkMap> {
 
             // Check if we're directly connected to this peer
             let (online, last_heartbeat) = if let Some(peer) = mesh.peers.get(&claim.peer_id) {
-                (true, peer.last_seen.elapsed().as_secs())
+                let elapsed = peer.last_seen.elapsed().as_secs();
+                (elapsed <= LIVE_TOPOLOGY_WINDOW_SECS, elapsed)
             } else {
                 // Check by short ID prefix match
                 let connected = mesh.peers.keys().any(|k| short_peer_id(k) == short_id);
@@ -2410,14 +2264,86 @@ async fn get_network_map(State(state): State<AppState>) -> Json<NetworkMap> {
                 online,
             });
 
+            full_to_short.insert(claim.peer_id.clone(), short_id.clone());
             coord_to_node.insert(claim.coord, short_id);
         }
 
-        // Second pass: compute SPIRAL edges based on actual hex neighbor topology
-        // For each node, check which of its 20 theoretical neighbors exist in the mesh
+        // Second pass: include live peers that have not claimed a slot yet.
+        for (peer_id, peer) in &mesh.peers {
+            let elapsed = peer.last_seen.elapsed().as_secs();
+            if elapsed > LIVE_TOPOLOGY_WINDOW_SECS {
+                continue;
+            }
+
+            let short_id = short_peer_id(peer_id);
+
+            if short_id == short_self_id || nodes.iter().any(|node| node.id == short_id) {
+                continue;
+            }
+
+            nodes.push(PeerNode {
+                id: short_id.clone(),
+                label: short_id.clone(),
+                slot: HexSlot {
+                    index: None,
+                    q: 0,
+                    r: 0,
+                    z: 0,
+                },
+                peer_type: "server".to_string(),
+                last_heartbeat: elapsed,
+                capabilities: vec!["storage".to_string(), "relay".to_string()],
+                online: true,
+            });
+
+            full_to_short.insert(peer_id.clone(), short_id);
+        }
+
+        // Third pass: draw live transport edges for peers we are actively talking to,
+        // even before SPIRAL slot occupancy settles.
         let mut seen_edges: std::collections::HashSet<(String, String)> =
             std::collections::HashSet::new();
+        for (peer_id, peer) in &mesh.peers {
+            let elapsed = peer.last_seen.elapsed().as_secs();
+            if elapsed > LIVE_TOPOLOGY_WINDOW_SECS {
+                continue;
+            }
 
+            let Some(peer_short_id) = full_to_short.get(peer_id).cloned() else {
+                continue;
+            };
+
+            let (from, to) = if short_self_id < peer_short_id {
+                (short_self_id.clone(), peer_short_id.clone())
+            } else {
+                (peer_short_id.clone(), short_self_id.clone())
+            };
+
+            if seen_edges.contains(&(from.clone(), to.clone())) {
+                continue;
+            }
+            seen_edges.insert((from.clone(), to.clone()));
+
+            let latency_stats = mesh
+                .latency_history
+                .get(&mesh.self_id)
+                .and_then(|history| history.get(peer_id))
+                .map(|h| h.compute_stats())
+                .unwrap_or_default();
+            let latency_ms = latency_stats.last_1s_ms.map(|v| v as u32);
+
+            edges.push(PeerEdge {
+                from,
+                to,
+                connection_type: "transport".to_string(),
+                latency_ms,
+                latency_stats,
+                bidirectional: true,
+            });
+        }
+
+        // Fourth pass: compute SPIRAL edges based on actual hex neighbor topology
+        // For each node, check which of its 20 theoretical neighbors exist in the mesh
         for (coord, node_id) in &coord_to_node {
             let neighbor_coords = Neighbors::of(*coord);
 
@@ -2457,16 +2383,41 @@ async fn get_network_map(State(state): State<AppState>) -> Json<NetworkMap> {
         }
     }
 
+    let available_slots = if let Some(ref mesh_state) = state.mesh_state {
+        let mesh = mesh_state.read().await;
+        mesh.available_slot_count() as u32
+    } else {
+        0
+    };
+    let filled_slots = nodes
+        .iter()
+        .filter(|node| node.slot.index.is_some())
+        .count() as u32;
     let stats = NetworkStats {
-        total_nodes: nodes.len() as u32,
+        total_peers: nodes.len() as u32,
         server_nodes: nodes.iter().filter(|n| n.peer_type == "server").count() as u32,
-        browser_nodes: nodes.iter().filter(|n| n.peer_type == "browser").count() as u32,
-        total_edges: edges.len() as u32,
+        browser_peers: nodes.iter().filter(|n| n.peer_type == "browser").count() as u32,
+        mesh_edges: edges.len() as u32,
+        available_slots,
+        filled_slots,
+        mesh_density: if available_slots == 0 {
+            0.0
+        } else {
+            (filled_slots as f64 / available_slots as f64) * 100.0
+        },
+        relay_connections: edges
+            .iter()
+            .filter(|edge| edge.connection_type == "relay")
+            .count() as u32,
         avg_latency_ms: if edges.is_empty() {
             None
         } else {
-            let total: u32 = edges.iter().filter_map(|e| e.latency_ms).sum();
-            Some(total as f64 / edges.len() as f64)
+            let latencies: Vec<u32> = edges.iter().filter_map(|e| e.latency_ms).collect();
+            if latencies.is_empty() {
+                None
+            } else {
+                Some(latencies.iter().sum::<u32>() as f64 / latencies.len() as f64)
+            }
         },
     };
 
@@ -2498,8 +2449,6 @@ struct MeshStateResponse {
     slot_claims: Vec<SlotInfo>,
     /// Connected peers
     peers: Vec<PeerSummary>,
-    /// Active TGP sessions count
-    tgp_sessions: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -2608,7 +2557,6 @@ async fn get_mesh_state(State(state): State<AppState>) -> Json<MeshStateResponse
         peer_count,
         slot_claims,
         peers,
-        tgp_sessions: 0, // TODO: expose TGP session count
     })
 }
 
@@ -2800,18 +2748,7 @@ async fn import_releases(
         legacy_export.version
     );
 
-    // Get doc_store reference for imports
-    let doc_store = match state.doc_store.as_ref() {
-        Some(ds) => ds,
-        None => {
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": "doc_store not initialized"
-                })),
-            ));
-        }
-    };
+    let doc_store = &state.doc_store;
 
     for legacy_release in legacy_export.releases {
         // Check if release already exists in doc_store
@@ -2890,26 +2827,32 @@ async fn import_releases(
     let mut featured_imported = 0;
     let mut featured_skipped = 0;
     for featured in legacy_export.featured_releases {
-        // Check if featured release already exists
-        if state
-            .storage
-            .get_featured_release(&featured.id)
-            .ok()
-            .flatten()
-            .is_some()
+        // Check if featured release already exists in doc_store
+        let content_id = citadel_crdt::ContentId::hash(featured.id.as_bytes());
         {
-            tracing::debug!("Skipping existing featured release: {}", featured.id);
-            featured_skipped += 1;
-            continue;
+            let doc_store_read = doc_store.read().await;
+            if doc_store_read
+                .get::<FeaturedRelease>(&content_id)
+                .ok()
+                .flatten()
+                .is_some()
+            {
+                tracing::debug!("Skipping existing featured release: {}", featured.id);
+                featured_skipped += 1;
+                continue;
+            }
         }
 
-        // Save featured release
-        if let Err(e) = state.storage.put_featured_release(&featured) {
-            errors.push(format!(
-                "Failed to save featured release {}: {}",
-                featured.id, e
-            ));
-            continue;
+        // Save featured release to doc_store
+        {
+            let mut doc_store_write = doc_store.write().await;
+            if let Err(e) = doc_store_write.put(&featured) {
+                errors.push(format!(
+                    "Failed to save featured release {}: {:?}",
+                    featured.id, e
+                ));
+                continue;
+            }
         }
 
         featured_imported += 1;
@@ -2926,7 +2869,8 @@ async fn import_releases(
     // SPORE: Flood imported featured releases so they propagate across mesh
     if featured_imported > 0 {
         if let Some(ref flood_tx) = state.flood_tx {
-            if let Ok(all_featured) = state.storage.list_featured_releases() {
+            let doc_store_read = doc_store.read().await;
+            if let Ok(all_featured) = doc_store_read.list::<FeaturedRelease>() {
                 let featured_json: Vec<String> = all_featured
                     .iter()
                     .filter_map(|f| serde_json::to_string(f).ok())
@@ -2975,14 +2919,13 @@ async fn import_releases(
 async fn export_releases(State(state): State<AppState>) -> Result<Json<ExportData>, StatusCode> {
     let state = state.read().await;
 
-    let releases = state
-        .storage
-        .list_releases()
+    let doc_store = state.doc_store.read().await;
+    let releases = doc_store
+        .list::<Release>()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let featured_releases = state
-        .storage
-        .list_featured_releases()
+    let featured_releases = doc_store
+        .list::<FeaturedRelease>()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     tracing::info!(
@@ -3021,19 +2964,27 @@ async fn delete_all_releases(
         })));
     }
 
-    match state.storage.delete_all_releases() {
-        Ok(count) => {
-            tracing::warn!("Deleted {} releases by admin {}", count, req.public_key);
-            Ok(Json(serde_json::json!({
-                "success": true,
-                "deleted": count
-            })))
-        }
+    // Delete all releases from DocumentStore
+    let mut doc_store = state.doc_store.write().await;
+    let releases = match doc_store.list::<Release>() {
+        Ok(r) => r,
         Err(e) => {
-            tracing::error!("Failed to delete releases: {}", e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            tracing::error!("Failed to list releases for deletion: {:?}", e);
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
+    let count = releases.len();
+    for release in &releases {
+        let content_id = citadel_crdt::ContentId::hash(release.id.as_bytes());
+        if let Err(e) = doc_store.delete::<Release>(&content_id) {
+            tracing::warn!("Failed to delete release {}: {:?}", release.id, e);
         }
     }
+    tracing::warn!("Deleted {} releases by admin {}", count, req.public_key);
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "deleted": count
+    })))
 }
 
 // ============================================================================

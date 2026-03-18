@@ -1,0 +1,39 @@
+# Citadel Lens Node - Fly.io optimised build
+# Self-contained: fetches two-generals via git, no sibling directories needed
+
+FROM rust:1.94-slim AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+COPY . .
+
+RUN cargo build --locked --release -p citadel-lens
+
+# Runtime image
+FROM debian:trixie-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN useradd -m -u 1000 lens
+
+COPY --from=builder /build/target/release/lens-node /usr/local/bin/
+COPY --from=builder /build/target/release/lens-admin /usr/local/bin/
+
+RUN mkdir -p /data && chown lens:lens /data
+
+USER lens
+WORKDIR /data
+
+ENV LENS_DATA_DIR=/data
+ENV RUST_LOG=lens_node=info,citadel_lens=info
+
+# 8080: HTTP API
+# 9000: TCP P2P mesh + UDP TGP
+EXPOSE 8080 9000 9000/udp
+
+CMD ["lens-node"]

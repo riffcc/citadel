@@ -2,8 +2,7 @@
 //!
 //! This module contains the core MeshService that manages:
 //! - Peer connections (TCP)
-//! - TGP coordination (UDP)
-//! - Slot claiming
+//! - Live slot claiming
 //! - VDF/CVDF consensus
 //! - SPORE sync
 
@@ -34,13 +33,11 @@ use tracing::{debug, error, info, warn};
 
 // Import types from sibling modules
 use super::flood::FloodMessage;
-use super::peer::{
-    compute_peer_id, compute_peer_id_from_bytes, double_hash_id, AuthorizedPeer, MeshPeer,
-};
+use super::peer::{compute_peer_id, compute_peer_id_from_bytes, double_hash_id, AuthorizedPeer, MeshPeer};
 use super::peer_addr_store::PeerAddrRecord;
 use super::slot::{consensus_threshold, SlotClaim};
 use super::spore::{build_spore_havelist, release_id_to_u256};
-use super::state::{MeshState, PendingSlotClaim};
+use super::state::MeshState;
 use super::tgp::TgpSession;
 
 /// Citadel Mesh Service
@@ -65,9 +62,19 @@ pub struct MeshService {
     doc_store: Arc<tokio::sync::RwLock<DocumentStore>>,
     /// Mesh state (peers, slots, etc.)
     state: Arc<RwLock<MeshState>>,
+    /// Cached TGP keypair for legacy helper paths.
+    tgp_keypair: Arc<KeyPair>,
     /// TGP sessions - SEPARATE lock for contention-free TGP operations
     /// This allows send_tgp_messages to run without blocking on mesh state
     tgp_sessions: Arc<RwLock<HashMap<String, TgpSession>>>,
+    /// Legacy TGP UDP socket, intentionally unused by the live mesh runtime.
+    tgp_udp_socket: Arc<RwLock<Option<Arc<UdpSocket>>>>,
+    /// Legacy bilateral authorization records retained for helper paths and tests.
+    authorized_peers: Arc<RwLock<HashMap<String, AuthorizedPeer>>>,
+    /// Canonical/provisional peer IDs with active TCP connection counts.
+    /// Multiple simultaneous sockets to the same peer can exist briefly during
+    /// mutual dial races, so a set is not structurally sufficient here.
+    active_tcp_peers: Arc<RwLock<HashMap<String, usize>>>,
     /// Broadcast channel for continuous flooding
     flood_tx: broadcast::Sender<FloodMessage>,
     /// Notification for when CVDF is initialized (genesis or join)
@@ -86,39 +93,175 @@ pub struct MeshService {
 impl MeshService {
     const STALE_PEER_SECS: u64 = 120;
 
+    fn active_peer_count(state: &MeshState, active_peer_ids: &HashSet<String>) -> usize {
+        state
+            .peers
+            .keys()
+            .filter(|peer_id| active_peer_ids.contains(*peer_id))
+            .count()
+    }
+
+    fn inactive_peer_ids(state: &MeshState, active_peer_ids: &HashSet<String>) -> HashSet<String> {
+        state
+            .peers
+            .keys()
+            .filter(|peer_id| !active_peer_ids.contains(*peer_id))
+            .cloned()
+            .collect()
+    }
+
+    async fn active_peer_ids_snapshot(&self) -> HashSet<String> {
+        self.active_tcp_peers
+            .read()
+            .await
+            .iter()
+            .filter_map(|(peer_id, count)| (*count > 0).then_some(peer_id.clone()))
+            .collect()
+    }
+
+    fn active_tgp_candidates(
+        state: &MeshState,
+        active_peer_ids: &HashSet<String>,
+    ) -> Vec<(String, SocketAddr, [u8; 32])> {
+        state
+            .peers
+            .values()
+            .filter(|peer| active_peer_ids.contains(&peer.id))
+            .filter_map(|p| {
+                p.public_key.as_ref().and_then(|pk| {
+                    if pk.len() == 32 {
+                        let mut arr = [0u8; 32];
+                        arr.copy_from_slice(pk);
+                        Some((p.id.clone(), p.addr, arr))
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect()
+    }
+
+    fn occupied_theoretical_neighbor_validators(
+        state: &MeshState,
+        active_peer_ids: &HashSet<String>,
+        target_slot: u64,
+    ) -> Vec<(String, SocketAddr, [u8; 32])> {
+        let target_coord = spiral3d_to_coord(Spiral3DIndex::new(target_slot));
+        let mut validators = Vec::new();
+        let mut seen = HashSet::new();
+
+        for neighbor_coord in Neighbors::of(target_coord) {
+            let Some(slot_claim) = state
+                .claimed_slots
+                .values()
+                .find(|claim| claim.coord == neighbor_coord)
+            else {
+                continue;
+            };
+
+            if !active_peer_ids.contains(&slot_claim.peer_id) || !seen.insert(slot_claim.peer_id.clone()) {
+                continue;
+            }
+
+            let Some(peer) = state.peers.get(&slot_claim.peer_id) else {
+                continue;
+            };
+
+            let Some(public_key) = peer.public_key.as_ref() else {
+                continue;
+            };
+
+            if public_key.len() != 32 {
+                continue;
+            }
+
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(public_key);
+            validators.push((peer.id.clone(), peer.addr, arr));
+        }
+
+        validators
+    }
+
+    fn occupied_theoretical_neighbor_validator_ids(
+        state: &MeshState,
+        active_peer_ids: &HashSet<String>,
+        target_slot: u64,
+    ) -> HashSet<String> {
+        Self::occupied_theoretical_neighbor_validators(state, active_peer_ids, target_slot)
+            .into_iter()
+            .map(|(peer_id, _, _)| peer_id)
+            .collect()
+    }
+
+    async fn rekey_tgp_session(&self, old_peer_id: &str, new_peer_id: &str) {
+        if old_peer_id == new_peer_id {
+            return;
+        }
+
+        let mut sessions = self.tgp_sessions.write().await;
+        if let Some(session) = sessions.remove(old_peer_id) {
+            if sessions.contains_key(new_peer_id) {
+                debug!(
+                    "Dropping provisional TGP session {} after peer re-key to {} (canonical session already exists)",
+                    old_peer_id, new_peer_id
+                );
+            } else {
+                info!(
+                    "Re-keying TGP session {} -> {} after peer identification",
+                    old_peer_id, new_peer_id
+                );
+                sessions.insert(new_peer_id.to_string(), session);
+            }
+        }
+    }
+
+    async fn rekey_active_peer(&self, old_peer_id: &str, new_peer_id: &str) {
+        if old_peer_id == new_peer_id {
+            return;
+        }
+
+        let mut active_peers = self.active_tcp_peers.write().await;
+        let old_count = active_peers.remove(old_peer_id).unwrap_or(0);
+        if old_count > 0 {
+            *active_peers.entry(new_peer_id.to_string()).or_insert(0) += old_count;
+        }
+    }
+
     fn is_usable_peer_addr(addr: SocketAddr) -> bool {
         !(addr.ip().is_unspecified() || addr.ip().is_loopback())
     }
 
     async fn prune_stale_mesh_state(&self) {
         let now_ms = Self::now_ms();
+        let active_peer_ids = self.active_peer_ids_snapshot().await;
         let mut state = self.state.write().await;
         state.peer_addr_store.prune_stale(now_ms);
         let self_id = state.self_id.clone();
-        let stale_peer_ids: HashSet<String> = state
-            .peers
-            .iter()
-            .filter_map(|(peer_id, peer)| {
-                (peer.last_seen.elapsed().as_secs() > Self::STALE_PEER_SECS)
-                    .then(|| peer_id.clone())
-            })
-            .collect();
+        let inactive_peer_ids = Self::inactive_peer_ids(&state, &active_peer_ids);
 
-        state.peers.retain(|peer_id, peer| {
-            if peer.last_seen.elapsed().as_secs() <= Self::STALE_PEER_SECS {
+        state.peers.retain(|peer_id, _peer| {
+            if active_peer_ids.contains(peer_id) {
                 return true;
             }
-            debug!("Pruning stale peer {} from mesh state", peer_id);
+            debug!("Pruning inactive peer {} from live mesh state", peer_id);
             false
         });
         state.claimed_slots.retain(|_, claim| {
-            claim.peer_id == self_id || !stale_peer_ids.contains(&claim.peer_id)
+            claim.peer_id == self_id || !inactive_peer_ids.contains(&claim.peer_id)
         });
         state.slot_coords = state.claimed_slots.values().map(|claim| claim.coord).collect();
         state.vdf_claims.retain(|_, claim| {
             let claim_peer_id = compute_peer_id_from_bytes(&claim.claimer);
-            claim_peer_id == self_id || !stale_peer_ids.contains(&claim_peer_id)
+            claim_peer_id == self_id || !inactive_peer_ids.contains(&claim_peer_id)
         });
+        let should_retry_claim = state.self_slot.is_none() && !active_peer_ids.is_empty();
+        drop(state);
+
+        if should_retry_claim {
+            debug!("Live mesh changed after stale-peer prune; re-entering slot claim path");
+            self.try_claim_slot_from_live_state().await;
+        }
     }
 
     fn now_ms() -> i64 {
@@ -171,6 +314,30 @@ impl MeshService {
         }
 
         None
+    }
+
+    fn evict_stale_slots_from_state(state: &mut MeshState, stale_slots: &[u64]) -> Vec<(u64, String)> {
+        let mut evicted = Vec::new();
+
+        for slot_idx in stale_slots {
+            let removed_claim = state.claimed_slots.remove(slot_idx);
+            state.vdf_claims.remove(slot_idx);
+
+            let Some(claim) = removed_claim else {
+                continue;
+            };
+
+            state.slot_coords.remove(&claim.coord);
+            if let Some(peer) = state.peers.get_mut(&claim.peer_id) {
+                peer.slot = None;
+            }
+            if state.self_slot.as_ref().map(|slot| slot.index) == Some(*slot_idx) {
+                state.self_slot = None;
+            }
+            evicted.push((*slot_idx, claim.peer_id));
+        }
+
+        evicted
     }
 
     async fn merge_peer_addr_records(
@@ -251,12 +418,135 @@ impl MeshService {
     }
 
     fn scaled_slot_claim_threshold(mesh_size: usize, validator_count: usize) -> usize {
+        if validator_count == 0 {
+            return 0;
+        }
         let threshold = consensus_threshold(mesh_size);
         if validator_count >= 20 {
             threshold
         } else {
-            std::cmp::max(1, (validator_count * threshold + 19) / 20)
+            (validator_count * threshold + 19) / 20
         }
+    }
+
+    fn cvdf_attestation_json(att: &RoundAttestation, vouch: Option<&MeshVouch>) -> serde_json::Value {
+        let mut flood_msg = serde_json::json!({
+            "type": "cvdf_attestation",
+            "round": att.round,
+            "slot": att.slot,
+            "prev_output": hex::encode(att.prev_output),
+            "attester": hex::encode(att.attester),
+            "signature": hex::encode(att.signature),
+        });
+
+        if let Some(v) = vouch {
+            flood_msg["vouch"] = serde_json::json!({
+                "voucher": hex::encode(v.voucher),
+                "voucher_slot": v.voucher_slot,
+                "alive_neighbors": v.alive_neighbors.iter().map(hex::encode).collect::<Vec<_>>(),
+                "vdf_height": v.vdf_height,
+                "latencies": v.latencies.iter().map(|(n, l)| serde_json::json!({
+                    "node": hex::encode(n),
+                    "latency_ms": l,
+                })).collect::<Vec<_>>(),
+                "signature": hex::encode(v.signature),
+            });
+        }
+
+        flood_msg
+    }
+
+    fn cvdf_round_json(round: &CvdfRound, spore_ranges: Option<usize>) -> serde_json::Value {
+        let mut round_json = serde_json::json!({
+            "type": "cvdf_new_round",
+            "round": round.round,
+            "prev_output": hex::encode(round.prev_output),
+            "washed_input": hex::encode(round.washed_input),
+            "output": hex::encode(round.output),
+            "producer": hex::encode(round.producer),
+            "producer_signature": hex::encode(round.producer_signature),
+            "timestamp_ms": round.timestamp_ms,
+            "iterations": round.iterations,
+            "weight": round.weight(),
+            "attestation_count": round.attestations.len(),
+            "attestations": round.attestations.iter().map(|a| serde_json::json!({
+                "round": a.round,
+                "prev_output": hex::encode(a.prev_output),
+                "attester": hex::encode(a.attester),
+                "slot": a.slot,
+                "signature": hex::encode(a.signature),
+            })).collect::<Vec<_>>(),
+        });
+
+        if let Some(spore_ranges) = spore_ranges {
+            round_json["spore_ranges"] = serde_json::json!(spore_ranges);
+        }
+
+        round_json
+    }
+
+    fn parse_cvdf_attestation_json(msg: &serde_json::Value) -> Option<RoundAttestation> {
+        let round = msg.get("round")?.as_u64()?;
+        let prev_output = hex::decode(msg.get("prev_output")?.as_str()?).ok()?;
+        let attester = hex::decode(msg.get("attester")?.as_str()?).ok()?;
+        let signature = hex::decode(msg.get("signature")?.as_str()?).ok()?;
+
+        if prev_output.len() != 32 || attester.len() != 32 || signature.len() != 64 {
+            return None;
+        }
+
+        Some(RoundAttestation {
+            round,
+            prev_output: prev_output.try_into().ok()?,
+            attester: attester.try_into().ok()?,
+            slot: msg.get("slot").and_then(|s| s.as_u64()),
+            signature: signature.try_into().ok()?,
+        })
+    }
+
+    fn parse_cvdf_round_json(round_json: &serde_json::Value) -> Option<CvdfRound> {
+        let round = round_json.get("round")?.as_u64()?;
+        let prev_output = hex::decode(round_json.get("prev_output")?.as_str()?).ok()?;
+        let washed_input = hex::decode(round_json.get("washed_input")?.as_str()?).ok()?;
+        let output = hex::decode(round_json.get("output")?.as_str()?).ok()?;
+        let producer = hex::decode(round_json.get("producer")?.as_str()?).ok()?;
+        let producer_signature =
+            hex::decode(round_json.get("producer_signature")?.as_str()?).ok()?;
+        let timestamp_ms = round_json.get("timestamp_ms")?.as_u64()?;
+
+        if prev_output.len() != 32
+            || washed_input.len() != 32
+            || output.len() != 32
+            || producer.len() != 32
+            || producer_signature.len() != 64
+        {
+            return None;
+        }
+
+        let attestations = round_json
+            .get("attestations")?
+            .as_array()?
+            .iter()
+            .map(Self::parse_cvdf_attestation_json)
+            .collect::<Option<Vec<_>>>()?;
+
+        let iterations = round_json
+            .get("iterations")
+            .and_then(|i| i.as_u64())
+            .map(|i| i as u32)
+            .unwrap_or(crate::cvdf::CVDF_ITERATIONS_BASE);
+
+        Some(CvdfRound {
+            round,
+            prev_output: prev_output.try_into().ok()?,
+            washed_input: washed_input.try_into().ok()?,
+            output: output.try_into().ok()?,
+            producer: producer.try_into().ok()?,
+            producer_signature: producer_signature.try_into().ok()?,
+            timestamp_ms,
+            attestations,
+            iterations,
+        })
     }
 
     async fn prime_ygg_public_addr(&self) {
@@ -300,7 +590,7 @@ impl MeshService {
         local_yggdrasil_addr: Option<String>,
         local_underlay_uri: Option<String>,
         storage: Arc<Storage>,
-        doc_store: DocumentStore,
+        doc_store: Arc<tokio::sync::RwLock<DocumentStore>>,
     ) -> Self {
         // Generate or load node keypair for peer identity
         let signing_key = storage.get_or_create_node_key().unwrap_or_else(|_| {
@@ -343,15 +633,11 @@ impl MeshService {
             local_yggdrasil_addr,
             local_underlay_uri,
             storage,
-            doc_store: Arc::new(tokio::sync::RwLock::new(doc_store)),
+            doc_store,
             state: Arc::new(RwLock::new(MeshState {
                 self_id,
                 signing_key: signing_key.clone(),
-                tgp_keypair,
-                udp_socket: None,                 // Set when run() is called
-                authorized_peers: HashMap::new(), // TGP-native: bilateral-triple-authorized peers
                 self_slot: None,
-                pending_slot_claim: None,
                 peers: HashMap::new(),
                 peer_addr_store: super::peer_addr_store::PeerAddrStore::new(120_000),
                 claimed_slots: HashMap::new(),
@@ -373,8 +659,12 @@ impl MeshService {
                 accountability: Some(AccountabilityTracker::new(signing_key.clone())), // Misbehaviour tracking
                 liveness: Some(LivenessManager::new(signing_key)), // Structure-aware liveness (2-hop vouches)
             })),
+            tgp_keypair,
             // Separate lock for TGP sessions - contention-free TGP operations
             tgp_sessions: Arc::new(RwLock::new(HashMap::new())),
+            tgp_udp_socket: Arc::new(RwLock::new(None)),
+            authorized_peers: Arc::new(RwLock::new(HashMap::new())),
+            active_tcp_peers: Arc::new(RwLock::new(HashMap::new())),
             flood_tx,
             // Notification for CVDF initialization
             cvdf_init_notify: Arc::new(Notify::new()),
@@ -425,130 +715,86 @@ impl MeshService {
         self.claim_slot_with_vdf(index).await.is_some()
     }
 
-    /// EVENT-DRIVEN slot claiming trigger.
-    /// Called when a peer connects. NO WAITING. NO LOOPS.
-    ///
-    /// 1. Sets pending_slot_claim to next available slot
-    /// 2. Starts TGP with available peers
-    /// 3. Returns immediately
-    ///
-    /// When the bilateral triple is achieved (in handle_tgp_message), the slot is claimed.
+    /// EVENT-DRIVEN slot claiming trigger for the live validator/VDF path.
     pub fn trigger_slot_claim_if_ready(self: &Arc<Self>) {
         let mesh = Arc::clone(self);
         tokio::spawn(async move {
-            mesh.start_slot_claim_tgp().await;
+            mesh.try_claim_slot_from_live_state().await;
         });
     }
 
-    /// Start TGP exchanges for slot claiming. Returns immediately (event-driven).
-    async fn start_slot_claim_tgp(&self) {
-        let mut state = self.state.write().await;
-
-        // Already have a slot? Done.
-        if state.self_slot.is_some() {
+    async fn try_claim_slot_from_live_state(&self) {
+        if self
+            .claiming_in_progress
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_err()
+        {
             return;
         }
 
-        // Already claiming? Don't start another.
-        if state.pending_slot_claim.is_some() {
-            return;
-        }
+        let active_peer_ids = self.active_peer_ids_snapshot().await;
+        let claim_inputs = {
+            let state = self.state.read().await;
 
-        // No peers? Can't claim.
-        if state.peers.is_empty() {
-            return;
-        }
-
-        // Pick the next available slot
-        let target_slot = state.next_available_slot();
-
-        // Check if slot is already claimed (race condition check)
-        if state.claimed_slots.contains_key(&target_slot) {
-            info!(
-                "Slot {} already claimed, will retry on next peer event",
-                target_slot
-            );
-            return;
-        }
-
-        // Gather peers to start TGP with (only those with public keys)
-        let peers_to_tgp: Vec<(String, SocketAddr, [u8; 32])> = state
-            .peers
-            .values()
-            .filter_map(|p| {
-                p.public_key.as_ref().and_then(|pk| {
-                    if pk.len() == 32 {
-                        let mut arr = [0u8; 32];
-                        arr.copy_from_slice(pk);
-                        Some((p.id.clone(), p.addr, arr))
-                    } else {
+            if state.self_slot.is_some() {
+                None
+            } else {
+                let live_peer_count = Self::active_peer_count(&state, &active_peer_ids);
+                if live_peer_count == 0 {
+                    None
+                } else {
+                    let target_slot = state.next_available_slot();
+                    if state.claimed_slots.contains_key(&target_slot) {
+                        info!("Slot {} already claimed, waiting for next live mesh event", target_slot);
                         None
+                    } else {
+                        let validator_count =
+                            Self::occupied_theoretical_neighbor_validators(&state, &active_peer_ids, target_slot)
+                                .len();
+                        let mesh_size = state.claimed_slots.len();
+                        let scaled_threshold =
+                            Self::scaled_slot_claim_threshold(mesh_size, validator_count);
+                        Some((target_slot, live_peer_count, validator_count, scaled_threshold, mesh_size))
                     }
-                })
-            })
-            .collect();
+                }
+            }
+        };
 
-        // No peers with public keys? Can't start TGP yet. Will retry on next peer event.
-        if peers_to_tgp.is_empty() {
-            debug!("No peers with public keys yet, will retry slot claim later");
-            return;
-        }
-
-        let mesh_size = state.claimed_slots.len();
-        let validator_count = peers_to_tgp.len();
-        let scaled_threshold = Self::scaled_slot_claim_threshold(mesh_size, validator_count);
-
-        // Set pending claim ONLY if we have peers to TGP with
-        state.pending_slot_claim = Some(PendingSlotClaim::new(
-            target_slot,
-            validator_count,
-            scaled_threshold,
-        ));
-        let target_coord = spiral3d_to_coord(Spiral3DIndex::new(target_slot));
-        let commitment_msg = format!(
-            "mesh_slot:{}:{}:{}",
-            target_slot, target_coord.q, target_coord.r
-        );
-
-        let my_keypair = (*state.tgp_keypair).clone();
-        drop(state);
-
-        info!(
-            "Starting TGP for slot {} with {} peers (need {} completions)",
-            target_slot, validator_count, scaled_threshold
-        );
-
-        // Create TGP sessions and send first messages
-        for (peer_id, peer_addr, pubkey_bytes) in peers_to_tgp {
-            let Ok(counterparty_key) = PublicKey::from_bytes(&pubkey_bytes) else {
-                continue;
-            };
-
-            let mut coordinator = PeerCoordinator::symmetric(
-                my_keypair.clone(),
-                counterparty_key,
-                CoordinatorConfig::default()
-                    .with_commitment(commitment_msg.clone().into_bytes())
-                    .with_flood_rate(FloodRateConfig::fast()),
-            );
-            coordinator.set_active(true);
-
-            self.tgp_sessions.write().await.insert(
-                peer_id.clone(),
-                TgpSession {
-                    coordinator,
-                    commitment: commitment_msg.clone(),
-                    result_tx: None, // No channel needed - event-driven
-                    peer_tgp_addr: peer_addr,
-                },
-            );
-
-            // Send first TGP message
-            if let Some(socket) = self.state.read().await.udp_socket.clone() {
-                self.send_tgp_messages(&socket, &peer_id).await;
+        if let Some((target_slot, live_peer_count, validator_count, scaled_threshold, mesh_size)) =
+            claim_inputs
+        {
+            if scaled_threshold == 0 {
+                info!(
+                    "Claiming genesis/frontier slot {} directly (live peers {}, mesh size {})",
+                    target_slot, live_peer_count, mesh_size
+                );
+                let _ = self.claim_slot_with_vdf(target_slot).await;
+            } else if validator_count == 0 {
+                debug!(
+                    "Slot {} has no active occupied theoretical neighbors yet; deferring claim",
+                    target_slot
+                );
+            } else if validator_count >= scaled_threshold {
+                info!(
+                    "Claiming live slot {} with {} active validator peer(s) over threshold {} (live peers {}, mesh size {})",
+                    target_slot, validator_count, scaled_threshold, live_peer_count, mesh_size
+                );
+                if self.claim_slot_with_vdf(target_slot).await.is_none() {
+                    warn!(
+                        "Failed to create live VDF claim for slot {} despite validator threshold",
+                        target_slot
+                    );
+                }
             }
         }
-        // Return immediately. When the bilateral triple is achieved, handle_tgp_message will claim the slot.
+
+        self.claiming_in_progress
+            .store(false, std::sync::atomic::Ordering::Release);
     }
 
     // ==================== VDF RACE METHODS ====================
@@ -662,7 +908,7 @@ impl MeshService {
             // Compare using proven priority ordering
             if claim_has_priority(&claim, existing) {
                 info!(
-                    "VDF claim for slot {} wins: height {} < existing height {}",
+                    "VDF claim for slot {} wins by priority (incoming height {}, existing height {})",
                     slot, claim.vdf_height, existing.vdf_height
                 );
 
@@ -697,6 +943,7 @@ impl MeshService {
         };
 
         // If claim won, also update claimed_slots for REST API / WebSocket visibility
+        let mut register_cvdf = None;
         if wins {
             // Canonicalize peer IDs from pubkeys so VDF/TGP/TCP all agree.
             let peer_id = compute_peer_id_from_bytes(&claimer_pubkey);
@@ -723,6 +970,13 @@ impl MeshService {
                 SlotClaim::with_public_key(slot, peer_id, Some(claimer_pubkey.to_vec()));
             state.slot_coords.insert(slot_claim.coord);
             state.claimed_slots.insert(slot, slot_claim);
+            register_cvdf = Some((slot, claimer_pubkey));
+        }
+
+        drop(state);
+
+        if let Some((slot, pubkey)) = register_cvdf {
+            self.cvdf_register_slot(slot, pubkey).await;
         }
 
         wins
@@ -841,6 +1095,8 @@ impl MeshService {
                 let weight = cvdf.weight();
                 info!("CVDF joined (height {}, weight {})", height, weight);
                 state.cvdf = Some(cvdf);
+                drop(state);
+                self.cvdf_init_notify.notify_waiters();
                 true
             }
             None => {
@@ -913,14 +1169,14 @@ impl MeshService {
     }
 
     /// Get CVDF chain state for syncing
-    pub async fn cvdf_chain_state(&self) -> Option<(Vec<CvdfRound>, Vec<(u64, [u8; 32])>)> {
+    pub async fn cvdf_chain_state(&self) -> Option<(Vec<CvdfRound>, Vec<AnchoredSlotClaim>)> {
         let state = self.state.read().await;
         let cvdf = state.cvdf.as_ref()?;
 
         let rounds = cvdf.chain().all_rounds().to_vec();
-        let slots: Vec<(u64, [u8; 32])> = cvdf.registered_slots().clone();
+        let claims: Vec<AnchoredSlotClaim> = state.vdf_claims.values().cloned().collect();
 
-        Some((rounds, slots))
+        Some((rounds, claims))
     }
 
     /// Check if we should adopt another chain (heavier)
@@ -1017,16 +1273,14 @@ impl MeshService {
                 let stale = self.prune_stale_slots().await;
                 if !stale.is_empty() {
                     let mut state = self.state.write().await;
-                    for slot_idx in &stale {
-                        if let Some(claim) = state.claimed_slots.remove(slot_idx) {
-                            state.slot_coords.remove(&claim.coord);
-                            info!(
-                                "Evicted stale slot {} (peer {} - no attestation for {} rounds)",
-                                slot_idx,
-                                claim.peer_id,
-                                crate::cvdf::SLOT_LIVENESS_THRESHOLD
-                            );
-                        }
+                    for (slot_idx, peer_id) in Self::evict_stale_slots_from_state(&mut state, &stale)
+                    {
+                        info!(
+                            "Evicted stale slot {} and VDF claim (peer {} - no attestation for {} rounds)",
+                            slot_idx,
+                            peer_id,
+                            crate::cvdf::SLOT_LIVENESS_THRESHOLD
+                        );
                     }
                 }
             }
@@ -1034,9 +1288,9 @@ impl MeshService {
             // Periodically broadcast chain state for sync
             let height = self.cvdf_height().await;
             if height > 0 && height % 10 == 0 {
-                if let Some((rounds, slots)) = self.cvdf_chain_state().await {
+                if let Some((rounds, claims)) = self.cvdf_chain_state().await {
                     let self_id = self.self_id().await;
-                    self.flood(FloodMessage::CvdfSyncResponse { rounds, slots });
+                    self.flood(FloodMessage::CvdfSyncResponse { rounds, claims });
                 }
             }
         }
@@ -1422,34 +1676,15 @@ impl MeshService {
         // Find validators for this slot claim:
         // 1. First, look for SPIRAL neighbors (nodes at neighboring coordinates)
         // 2. If mesh is empty/forming, use ANY connected peer as witness
-        let mut potential_validators: Vec<(String, SocketAddr, Option<Vec<u8>>)> = Vec::new();
-
-        // Try SPIRAL neighbors first
-        for coord in &neighbor_coords {
-            if let Some(slot_claim) = state.claimed_slots.values().find(|s| s.coord == *coord) {
-                if let Some(peer) = state.peers.get(&slot_claim.peer_id) {
-                    potential_validators.push((
-                        peer.id.clone(),
-                        peer.addr,
-                        peer.public_key.clone(),
-                    ));
-                }
-            }
-        }
-
-        // If no SPIRAL neighbors, use ANY connected peer (bootstrap case)
-        // RULE ZERO: Any peer can witness. The topology emerges from claims, not the other way around.
-        if potential_validators.is_empty() {
-            for peer in state.peers.values() {
-                if peer.public_key.is_some() {
-                    potential_validators.push((
-                        peer.id.clone(),
-                        peer.addr,
-                        peer.public_key.clone(),
-                    ));
-                }
-            }
-        }
+        let active_peer_ids = self.active_peer_ids_snapshot().await;
+        let potential_validators = Self::occupied_theoretical_neighbor_validators(
+            &state,
+            &active_peer_ids,
+            target_slot,
+        )
+        .into_iter()
+        .map(|(peer_id, peer_addr, pubkey)| (peer_id, peer_addr, Some(pubkey.to_vec())))
+        .collect::<Vec<_>>();
 
         let validator_count = potential_validators.len();
         drop(state);
@@ -1459,20 +1694,26 @@ impl MeshService {
             target_slot, validator_count, threshold, mesh_size
         );
 
-        // RULE ZERO: NO NODE IS SPECIAL
-        // You cannot claim a slot without at least one peer to validate with.
-        // If you have no connections, you can't prove to anyone that you claimed it.
+        // Calculate scaled threshold based on existing neighbors
+        // If only 6 neighbors exist, we need ceil(6 * threshold / 20)
+        let scaled_threshold = Self::scaled_slot_claim_threshold(mesh_size, validator_count);
+
+        if scaled_threshold == 0 {
+            info!(
+                "Slot {} has zero existing neighbors and zero threshold - claiming immediately",
+                target_slot
+            );
+            return self.claim_slot(target_slot).await;
+        }
+
+        // A slot can only be occupied through its existing theoretical neighbors.
         if validator_count == 0 {
             info!(
-                "Cannot claim slot {} - no peers to validate with",
+                "Cannot claim slot {} - no occupied theoretical neighbors to validate with",
                 target_slot
             );
             return false;
         }
-
-        // Calculate scaled threshold based on existing neighbors
-        // If only 6 neighbors exist, we need ceil(6 * threshold / 20)
-        let scaled_threshold = Self::scaled_slot_claim_threshold(mesh_size, validator_count);
 
         info!(
             "Scaled threshold: {} of {} existing neighbors (full threshold: {} of 20)",
@@ -1505,10 +1746,7 @@ impl MeshService {
             };
 
             // Get cached TGP keypair (zerocopy - just clone the Arc's content)
-            let my_keypair = {
-                let state = self.state.read().await;
-                (*state.tgp_keypair).clone()
-            };
+            let my_keypair = (*self.tgp_keypair).clone();
 
             // Peer's TGP UDP address (same port as TCP - UDP and TCP share port)
             let peer_tgp_addr = peer_addr;
@@ -1552,7 +1790,7 @@ impl MeshService {
             target_slot
         );
         // Event-driven: immediately send TGP messages for all created sessions
-        if let Some(udp_socket) = self.state.read().await.udp_socket.clone() {
+        if let Some(udp_socket) = self.tgp_udp_socket.read().await.clone() {
             for peer_id in &session_peer_ids {
                 self.send_tgp_messages(&udp_socket, peer_id).await;
             }
@@ -1900,7 +2138,7 @@ impl MeshService {
             // TGP is TCP-free: we can establish coordination with ANY node that sends us
             // a valid TGP message, using just the public key from the message itself.
             // No pre-existing TCP peer relationship required!
-            let keypair = (*state.tgp_keypair).clone();
+            let keypair = (*self.tgp_keypair).clone();
 
             match peer {
                 Some((id, _peer)) => {
@@ -2077,60 +2315,12 @@ impl MeshService {
                 addr,
             );
 
-            let mut state = self.state.write().await;
-            state.authorized_peers.insert(peer_id.clone(), authorized);
-            debug!(
-                "TGP: {} authorized peers total",
-                state.authorized_peers.len()
-            );
+            let mut authorized_peers = self.authorized_peers.write().await;
+            authorized_peers.insert(peer_id.clone(), authorized);
+            debug!("TGP: {} authorized peers total", authorized_peers.len());
 
-            // EVENT-DRIVEN SLOT CLAIM: accumulate distinct bilateral triple completions
-            // until the pending claim reaches its scaled validator threshold.
-            if let Some(ref mut pending_claim) = state.pending_slot_claim {
-                let target_slot = pending_claim.slot;
-                let ready = pending_claim.record_coordination(peer_id.clone());
-                let completion_count = pending_claim.coordinated_peers.len();
-                let needed = pending_claim.scaled_threshold;
-                let validator_count = pending_claim.validator_count;
-
-                if state.claimed_slots.contains_key(&target_slot) {
-                    info!(
-                        "Slot {} was claimed by someone else during TGP, clearing pending claim and retrying",
-                        target_slot
-                    );
-                    state.pending_slot_claim = None;
-                    drop(state);
-                    self.start_slot_claim_tgp().await;
-                } else if ready {
-                    state.pending_slot_claim = None;
-                    drop(state);
-                    // Use VDF-anchored claim (signed, with VDF height for ordering)
-                    if let Some(claim) = self.claim_slot_with_vdf(target_slot).await {
-                        info!(
-                            "SLOT CLAIMED: {} after {}/{} TGP completions (VDF height {}, finalized by {})",
-                            target_slot, completion_count, validator_count, claim.vdf_height, peer_id
-                        );
-                    } else {
-                        warn!(
-                            "Failed to create VDF-anchored claim for slot {} after threshold completion",
-                            target_slot
-                        );
-                        self.start_slot_claim_tgp().await;
-                    }
-                } else {
-                    debug!(
-                        "Pending slot {} has {}/{} TGP completions",
-                        target_slot, completion_count, needed
-                    );
-                }
-            } else {
-                // TGP completed but pending_slot_claim was None (sniped during coordination)
-                // If we don't have a slot yet, retry
-                if state.self_slot.is_none() {
-                    info!("TGP completed but pending claim was sniped, retrying for next slot");
-                    drop(state);
-                    self.start_slot_claim_tgp().await;
-                }
+            if self.state.read().await.self_slot.is_none() {
+                self.try_claim_slot_from_live_state().await;
             }
         }
 
@@ -2218,25 +2408,7 @@ impl MeshService {
         let listener = TcpListener::bind(self.listen_addr).await?;
         info!("Mesh P2P (TCP) listening on {}", self.listen_addr);
 
-        // Bind UDP socket for TGP (connectionless bilateral coordination)
-        // TCP and UDP share the same port
-        let udp_socket = Arc::new(UdpSocket::bind(self.listen_addr).await?);
-        info!("TGP (UDP) listening on {}", self.listen_addr);
-
-        // Store socket in state so attempt_slot_via_tgp can use it
-        {
-            let mut state = self.state.write().await;
-            state.udp_socket = Some(Arc::clone(&udp_socket));
-        }
-
-        // Spawn UDP listener for incoming TGP messages (event-driven, no polling)
-        let self_clone = Arc::clone(&self);
-        let udp_clone = Arc::clone(&udp_socket);
-        tokio::spawn(async move {
-            self_clone.run_tgp_udp_listener(udp_clone).await;
-        });
-
-        // Spawn task to connect to bootstrap peers and join mesh via TGP
+        // Spawn task to initialize consensus state and connect to entry peers.
         let self_clone = Arc::clone(&self);
         tokio::spawn(async move {
             // CVDF Swarm Merge Theorem: Every node starts as genesis.
@@ -2281,24 +2453,22 @@ impl MeshService {
             loop {
                 tick.tick().await;
                 self_clone.prune_stale_mesh_state().await;
-                let (sent, recv, pkt_sent, pkt_recv, tgp_msgs, tgp_done) =
+                let (sent, recv, pkt_sent, pkt_recv, _tgp_msgs, _tgp_done) =
                     traffic_stats.take_snapshot();
                 // Only log if there was any traffic
                 if sent > 0 || recv > 0 {
                     info!(
-                        "Traffic: {} tx, {} rx | {}/s tx, {}/s rx | {} TGP msgs, {} completions",
+                        "Traffic: {} tx, {} rx | {}/s tx, {}/s rx",
                         pkt_sent,
                         pkt_recv,
                         super::state::TrafficStats::format_rate(sent, 10),
-                        super::state::TrafficStats::format_rate(recv, 10),
-                        tgp_msgs,
-                        tgp_done
+                        super::state::TrafficStats::format_rate(recv, 10)
                     );
                 }
             }
         });
 
-        // Spawn entry peer retry loop - keeps trying to connect when isolated
+        // Spawn entry peer retry loop - keeps trying to connect when isolated or slotless
         // Uses exponential backoff: 1s -> 2s -> 4s -> 8s -> ... -> 60s max
         // All peers are equal - CITADEL_PEERS are just entry points, not "bootstrap" nodes
         let self_clone = Arc::clone(&self);
@@ -2310,11 +2480,15 @@ impl MeshService {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(retry_secs)).await;
 
-                // Only retry if we have no peers and have entry peers configured
-                let peer_count = self_clone.state.read().await.peers.len();
-                if peer_count == 0 && !self_clone.entry_peers.is_empty() {
+                let (live_peer_count, has_slot) = {
+                    let active_peer_ids = self_clone.active_peer_ids_snapshot().await;
+                    let state = self_clone.state.read().await;
+                    (Self::active_peer_count(&state, &active_peer_ids), state.self_slot.is_some())
+                };
+
+                if live_peer_count == 0 && !self_clone.entry_peers.is_empty() {
                     info!(
-                        "Isolated (0 peers) - retrying entry peers (backoff {}s)",
+                        "Isolated (0 live peers) - retrying entry peers (backoff {}s)",
                         retry_secs
                     );
                     let connected = self_clone.connect_to_entry_peers().await;
@@ -2325,8 +2499,16 @@ impl MeshService {
                         // Exponential backoff on failure
                         retry_secs = std::cmp::min(retry_secs * 2, MAX_RETRY_SECS);
                     }
-                } else if peer_count > 0 {
-                    // Have peers - reset backoff for when we next become isolated
+                } else {
+                    if !has_slot {
+                        debug!(
+                            "Slotless with {} live peer(s) - re-entering slot claim path",
+                            live_peer_count
+                        );
+                        self_clone.trigger_slot_claim_if_ready();
+                    }
+
+                    // Have live peers - reset backoff for when we next become isolated
                     retry_secs = MIN_RETRY_SECS;
                 }
             }
@@ -2502,10 +2684,15 @@ impl MeshService {
             );
         }
 
+        {
+            let mut active_peers = self.active_tcp_peers.write().await;
+            *active_peers.entry(peer_id.clone()).or_insert(0) += 1;
+        }
+
         info!("Peer {} registered", peer_id);
 
         // EVENT: Peer connected - trigger slot claiming if we don't have a slot yet
-        self.trigger_slot_claim_if_ready();
+            self.try_claim_slot_from_live_state().await;
 
         // Simple protocol: exchange node info and sync state
         let (reader, mut writer) = stream.into_split();
@@ -2768,7 +2955,7 @@ impl MeshService {
 
         // CVDF chain sync: Send our chain state so peer can adopt heavier chain
         // CRITICAL: This enables swarm merge during initial connection
-        if let Some((rounds, slots)) = self.cvdf_chain_state().await {
+        if let Some((rounds, claims)) = self.cvdf_chain_state().await {
             let rounds_json: Vec<serde_json::Value> = rounds
                 .iter()
                 .map(|r| {
@@ -2792,29 +2979,32 @@ impl MeshService {
                     })
                 })
                 .collect();
-            let slots_json: Vec<serde_json::Value> = slots
+            let claims_json: Vec<serde_json::Value> = claims
                 .iter()
-                .map(|(idx, pk)| {
+                .map(|claim| {
                     serde_json::json!({
-                        "index": idx,
-                        "pubkey": hex::encode(pk),
+                        "slot": claim.slot,
+                        "claimer": hex::encode(claim.claimer),
+                        "vdf_height": claim.vdf_height,
+                        "vdf_output": hex::encode(claim.vdf_output),
+                        "signature": hex::encode(claim.signature),
                     })
                 })
                 .collect();
             let cvdf_sync = serde_json::json!({
                 "type": "cvdf_sync_response",
                 "rounds": rounds_json,
-                "slots": slots_json,
+                "claims": claims_json,
                 "height": rounds.last().map(|r| r.round).unwrap_or(0),
                 "total_weight": rounds.iter().map(|r| r.weight() as u64).sum::<u64>(),
             });
             writer.write_all(cvdf_sync.to_string().as_bytes()).await?;
             writer.write_all(b"\n").await?;
             debug!(
-                "Sent CVDF chain state to peer {} (height {}, {} slots)",
+                "Sent CVDF chain state to peer {} (height {}, {} claims)",
                 peer_id,
                 rounds.last().map(|r| r.round).unwrap_or(0),
-                slots.len()
+                claims.len()
             );
         }
 
@@ -3019,42 +3209,13 @@ impl MeshService {
                             let _ = writer.write_all(b"\n").await;
                         }
                         Ok(FloodMessage::CvdfAttestation { att, vouch }) => {
-                            let mut flood_msg = serde_json::json!({
-                                "type": "cvdf_attestation",
-                                "round": att.round,
-                                "slot": att.slot,
-                                "prev_output": hex::encode(att.prev_output),
-                                "attester": hex::encode(att.attester),
-                            });
-                            // Include piggybacked vouch if present
-                            if let Some(v) = vouch {
-                                flood_msg["vouch"] = serde_json::json!({
-                                    "voucher": hex::encode(v.voucher),
-                                    "voucher_slot": v.voucher_slot,
-                                    "alive_neighbors": v.alive_neighbors.iter().map(hex::encode).collect::<Vec<_>>(),
-                                    "vdf_height": v.vdf_height,
-                                    "latencies": v.latencies.iter().map(|(n, l)| serde_json::json!({
-                                        "node": hex::encode(n),
-                                        "latency_ms": l,
-                                    })).collect::<Vec<_>>(),
-                                    "signature": hex::encode(v.signature),
-                                });
-                            }
+                            let flood_msg = Self::cvdf_attestation_json(&att, vouch.as_ref());
                             let _ = writer.write_all(flood_msg.to_string().as_bytes()).await;
                             let _ = writer.write_all(b"\n").await;
                         }
                         Ok(FloodMessage::CvdfNewRound { round, spore_proof }) => {
-                            let flood_msg = serde_json::json!({
-                                "type": "cvdf_new_round",
-                                "round": round.round,
-                                "prev_output": hex::encode(round.prev_output),
-                                "washed_input": hex::encode(round.washed_input),
-                                "output": hex::encode(round.output),
-                                "producer": hex::encode(round.producer),
-                                "attestation_count": round.attestations.len(),
-                                "weight": round.weight(),
-                                "spore_ranges": spore_proof.range_count(),  // 0 at convergence
-                            });
+                            let flood_msg =
+                                Self::cvdf_round_json(&round, Some(spore_proof.range_count()));
                             let _ = writer.write_all(flood_msg.to_string().as_bytes()).await;
                             let _ = writer.write_all(b"\n").await;
                         }
@@ -3067,39 +3228,24 @@ impl MeshService {
                             let _ = writer.write_all(flood_msg.to_string().as_bytes()).await;
                             let _ = writer.write_all(b"\n").await;
                         }
-                        Ok(FloodMessage::CvdfSyncResponse { rounds, slots }) => {
+                        Ok(FloodMessage::CvdfSyncResponse { rounds, claims }) => {
                             // Serialize full chain data for proper sync
-                            // Rounds contain attestations, slots are (index, pubkey) pairs
-                            let rounds_json: Vec<serde_json::Value> = rounds.iter().map(|r| {
+                            // Rounds contain attestations, claims carry the signed occupancy truth
+                            let rounds_json: Vec<serde_json::Value> =
+                                rounds.iter().map(|r| Self::cvdf_round_json(r, None)).collect();
+                            let claims_json: Vec<serde_json::Value> = claims.iter().map(|claim| {
                                 serde_json::json!({
-                                    "round": r.round,
-                                    "prev_output": hex::encode(r.prev_output),
-                                    "washed_input": hex::encode(r.washed_input),
-                                    "output": hex::encode(r.output),
-                                    "producer": hex::encode(r.producer),
-                                    "producer_signature": hex::encode(r.producer_signature),
-                                    "timestamp_ms": r.timestamp_ms,
-                                    "attestations": r.attestations.iter().map(|a| {
-                                        serde_json::json!({
-                                            "round": a.round,
-                                            "prev_output": hex::encode(a.prev_output),
-                                            "attester": hex::encode(a.attester),
-                                            "slot": a.slot,
-                                            "signature": hex::encode(a.signature),
-                                        })
-                                    }).collect::<Vec<_>>(),
-                                })
-                            }).collect();
-                            let slots_json: Vec<serde_json::Value> = slots.iter().map(|(idx, pk)| {
-                                serde_json::json!({
-                                    "index": idx,
-                                    "pubkey": hex::encode(pk),
+                                    "slot": claim.slot,
+                                    "claimer": hex::encode(claim.claimer),
+                                    "vdf_height": claim.vdf_height,
+                                    "vdf_output": hex::encode(claim.vdf_output),
+                                    "signature": hex::encode(claim.signature),
                                 })
                             }).collect();
                             let flood_msg = serde_json::json!({
                                 "type": "cvdf_sync_response",
                                 "rounds": rounds_json,
-                                "slots": slots_json,
+                                "claims": claims_json,
                                 "height": rounds.last().map(|r| r.round).unwrap_or(0),
                                 "total_weight": rounds.iter().map(|r| r.weight() as u64).sum::<u64>(),
                             });
@@ -3211,17 +3357,43 @@ impl MeshService {
             }
         }
 
-        // Remove peer from active connections on disconnect
-        // NOTE: We do NOT remove their slot claim - they still own the slot even if disconnected!
-        // Slots are only invalidated via CVDF chain adoption, not TCP disconnect.
+        // Remove peer from the live mesh on disconnect.
+        // A dead peer does not remain in the live peer set and cannot continue occupying a slot.
         {
+            let still_active = {
+                let mut active_peers = self.active_tcp_peers.write().await;
+                match active_peers.get_mut(&current_peer_key) {
+                    Some(count) if *count > 1 => {
+                        *count -= 1;
+                        true
+                    }
+                    Some(_) => {
+                        active_peers.remove(&current_peer_key);
+                        false
+                    }
+                    None => false,
+                }
+            };
             let mut state = self.state.write().await;
-            if let Some(_peer) = state.peers.remove(&current_peer_key) {
-                debug!(
-                    "Peer {} disconnected (slot claim preserved)",
-                    current_peer_key
-                );
-            }
+            let evicted = if still_active {
+                if let Some(peer) = state.peers.get_mut(&current_peer_key) {
+                    peer.last_seen = std::time::Instant::now();
+                }
+                Vec::new()
+            } else {
+                if let Some(_peer) = state.peers.remove(&current_peer_key) {
+                    debug!("Peer {} disconnected and removed from live mesh", current_peer_key);
+                }
+
+                let stale_slots: Vec<u64> = state
+                    .claimed_slots
+                    .iter()
+                    .filter_map(|(slot_idx, claim)| {
+                        (claim.peer_id == current_peer_key).then_some(*slot_idx)
+                    })
+                    .collect();
+                Self::evict_stale_slots_from_state(&mut state, &stale_slots)
+            };
 
             // Clean up latency history for this peer to prevent memory leak
             // latency_history uses short peer IDs (first 8 chars after b3b3/)
@@ -3230,6 +3402,23 @@ impl MeshService {
             // Also remove any entries where this peer was the target
             for (_, targets) in state.latency_history.iter_mut() {
                 targets.remove(&short_peer);
+            }
+            let should_retry_claim = state.self_slot.is_none();
+            drop(state);
+
+            for (slot_idx, peer_id) in evicted {
+                info!(
+                    "Evicted slot {} after peer {} disconnected from live mesh",
+                    slot_idx, peer_id
+                );
+            }
+
+            if should_retry_claim {
+                debug!(
+                    "Peer {} disconnected while slotless; re-entering slot claim path",
+                    current_peer_key
+                );
+                self.try_claim_slot_from_live_state().await;
             }
         }
 
@@ -3250,7 +3439,7 @@ impl MeshService {
         match msg_type {
             "hello" => {
                 debug!("Received hello from {}: {:?}", peer_id, msg);
-                // Re-key peer entry with real PeerID and store public key for TGP
+                // Re-key peer entry with the canonical PeerID and store public key metadata.
                 if let Some(node_id) = msg.get("node_id").and_then(|n| n.as_str()) {
                     // Extract public key from hello (hex-encoded ed25519 public key)
                     let public_key = msg
@@ -3300,41 +3489,68 @@ impl MeshService {
                             state.observed_public_addr = Some(public_addr);
                         }
                     }
-                    // Remove temporary peer-{port} entry and re-add with real ID
+                    // Remove temporary peer-{addr} entry and merge it into the canonical peer ID.
+                    // Multiple sockets can race to the same peer; we keep the canonical peer
+                    // state and simply move this connection's liveness accounting over to it.
                     if let Some(mut peer) = state.peers.remove(peer_id) {
-                        // Only add if we don't already have this peer (avoid duplicates)
-                        if node_id != state.self_id && !state.peers.contains_key(node_id) {
-                            peer.id = node_id.to_string();
-                            peer.yggdrasil_addr = yggdrasil_addr;
-                            peer.underlay_uri = underlay_uri;
-                            peer.ygg_peer_uri = ygg_peer_uri;
-                            peer.public_key = public_key;
-                            peer.addr = advertised_addr.unwrap_or_else(|| {
+                        if node_id != state.self_id {
+                            let canonical_id = node_id.to_string();
+                            let merged_addr = advertised_addr.unwrap_or_else(|| {
                                 SocketAddr::new(
                                     peer.addr.ip(),
                                     advertised_port.unwrap_or(peer.addr.port()),
                                 )
                             });
-                            peer.last_seen = std::time::Instant::now();
-                            let peer_addr = peer.addr;
-                            state.peers.insert(node_id.to_string(), peer);
-                            if let Some(stored_peer) = state.peers.get(node_id).cloned() {
+
+                            if let Some(existing_peer) = state.peers.get_mut(&canonical_id) {
+                                if Self::should_refresh_peer_hint(existing_peer.addr, merged_addr) {
+                                    existing_peer.addr = merged_addr;
+                                }
+                                if existing_peer.yggdrasil_addr.is_none() && yggdrasil_addr.is_some() {
+                                    existing_peer.yggdrasil_addr = yggdrasil_addr.clone();
+                                }
+                                if existing_peer.underlay_uri.is_none() && underlay_uri.is_some() {
+                                    existing_peer.underlay_uri = underlay_uri.clone();
+                                }
+                                if existing_peer.ygg_peer_uri.is_none() && ygg_peer_uri.is_some() {
+                                    existing_peer.ygg_peer_uri = ygg_peer_uri.clone();
+                                }
+                                if existing_peer.public_key.is_none() && public_key.is_some() {
+                                    existing_peer.public_key = public_key.clone();
+                                }
+                                existing_peer.last_seen = std::time::Instant::now();
+                                existing_peer.is_entry_peer |= peer.is_entry_peer;
+                            } else {
+                                peer.id = canonical_id.clone();
+                                peer.yggdrasil_addr = yggdrasil_addr;
+                                peer.underlay_uri = underlay_uri;
+                                peer.ygg_peer_uri = ygg_peer_uri;
+                                peer.public_key = public_key;
+                                peer.addr = merged_addr;
+                                peer.last_seen = std::time::Instant::now();
+                                let peer_addr = peer.addr;
+                                state.peers.insert(canonical_id.clone(), peer);
+                                info!(
+                                    "Peer {} identified as {} at {}",
+                                    peer_id, canonical_id, peer_addr
+                                );
+                            }
+
+                            if let Some(stored_peer) = state.peers.get(&canonical_id).cloned() {
                                 let _ = state.peer_addr_store.insert(
                                     PeerAddrRecord::from_mesh_peer(&stored_peer, Self::now_ms()),
                                 );
                             }
-                            info!(
-                                "Peer {} identified as {} at {}",
-                                peer_id, node_id, peer_addr
-                            );
 
-                            // Peer now has public key - try slot claiming if we don't have a slot
-                            if state.self_slot.is_none() && state.pending_slot_claim.is_none() {
-                                drop(state);
-                                self.start_slot_claim_tgp().await;
+                            let should_start_claim = state.self_slot.is_none();
+                            drop(state);
+
+                            self.rekey_active_peer(peer_id, &canonical_id).await;
+                            if should_start_claim {
+                                self.trigger_slot_claim_if_ready();
                             }
 
-                            return Ok((Some(node_id.to_string()), vec![]));
+                            return Ok((Some(canonical_id), vec![]));
                         }
                     }
                 }
@@ -3769,129 +3985,84 @@ impl MeshService {
             // ==================== CVDF MESSAGE HANDLERS ====================
             "cvdf_attestation" => {
                 // Parse attestation and process it
-                if let (
-                    Some(round),
-                    Some(slot),
-                    Some(prev_output_hex),
-                    Some(attester_hex),
-                    Some(sig_hex),
-                ) = (
-                    msg.get("round").and_then(|r| r.as_u64()),
-                    msg.get("slot").and_then(|s| s.as_u64()),
-                    msg.get("prev_output").and_then(|p| p.as_str()),
-                    msg.get("attester").and_then(|a| a.as_str()),
-                    msg.get("signature").and_then(|s| s.as_str()),
-                ) {
-                    if let (Ok(prev_output), Ok(attester), Ok(signature)) = (
-                        hex::decode(prev_output_hex),
-                        hex::decode(attester_hex),
-                        hex::decode(sig_hex),
-                    ) {
-                        if prev_output.len() == 32 && attester.len() == 32 && signature.len() == 64
-                        {
-                            let att = RoundAttestation {
-                                round,
-                                prev_output: prev_output.try_into().unwrap(),
-                                attester: attester.try_into().unwrap(),
-                                slot: Some(slot),
-                                signature: signature.try_into().unwrap(),
-                            };
-                            if self.cvdf_process_attestation(att.clone()).await {
-                                debug!(
-                                    "Processed CVDF attestation for round {} from {}",
-                                    round, peer_id
-                                );
-                            }
+                if let Some(att) = Self::parse_cvdf_attestation_json(&msg) {
+                    if self.cvdf_process_attestation(att.clone()).await {
+                        debug!(
+                            "Processed CVDF attestation for round {} from {}",
+                            att.round, peer_id
+                        );
+                    }
 
-                            // Handle piggybacked vouch (2-hop propagation)
-                            if let Some(vouch_data) = msg.get("vouch") {
-                                if let (
-                                    Some(voucher_hex),
-                                    Some(voucher_slot),
-                                    Some(alive_neighbors),
-                                    Some(vdf_height),
-                                    Some(vouch_sig_hex),
-                                ) = (
-                                    vouch_data.get("voucher").and_then(|v| v.as_str()),
-                                    vouch_data.get("voucher_slot").and_then(|v| v.as_u64()),
-                                    vouch_data.get("alive_neighbors").and_then(|v| v.as_array()),
-                                    vouch_data.get("vdf_height").and_then(|v| v.as_u64()),
-                                    vouch_data.get("signature").and_then(|v| v.as_str()),
-                                ) {
-                                    if let (Ok(voucher), Ok(vouch_sig)) =
-                                        (hex::decode(voucher_hex), hex::decode(vouch_sig_hex))
-                                    {
-                                        if voucher.len() == 32 && vouch_sig.len() == 64 {
-                                            // Parse alive neighbors
-                                            let mut alive: Vec<[u8; 32]> = Vec::new();
-                                            for n in alive_neighbors {
-                                                if let Some(n_hex) = n.as_str() {
-                                                    if let Ok(n_bytes) = hex::decode(n_hex) {
-                                                        if n_bytes.len() == 32 {
-                                                            alive.push(n_bytes.try_into().unwrap());
-                                                        }
-                                                    }
-                                                }
-                                            }
-
-                                            // Parse latencies (optional)
-                                            let latencies = vouch_data
-                                                .get("latencies")
-                                                .and_then(|l| l.as_array())
-                                                .map(|arr| {
-                                                    arr.iter()
-                                                        .filter_map(|item| {
-                                                            let node = hex::decode(
-                                                                item.get("node")?.as_str()?,
-                                                            )
-                                                            .ok()?;
-                                                            let latency =
-                                                                item.get("latency_ms")?.as_u64()?;
-                                                            if node.len() == 32 {
-                                                                Some((
-                                                                    node.try_into().unwrap(),
-                                                                    latency,
-                                                                ))
-                                                            } else {
-                                                                None
-                                                            }
-                                                        })
-                                                        .collect::<Vec<_>>()
-                                                })
-                                                .unwrap_or_default();
-
-                                            let vouch = MeshVouch {
-                                                voucher: voucher.try_into().unwrap(),
-                                                voucher_slot,
-                                                alive_neighbors: alive,
-                                                vdf_height,
-                                                latencies,
-                                                signature: vouch_sig.try_into().unwrap(),
-                                            };
-
-                                            // Handle vouch with 2-hop propagation
-                                            match self.handle_mesh_vouch(vouch.clone()).await {
-                                                PropagationDecision::ForwardToNeighbors => {
-                                                    // I'm judged - re-flood to my neighbors (witnesses)
-                                                    debug!(
-                                                        "Vouch judges me - forwarding to witnesses"
-                                                    );
-                                                    self.flood(FloodMessage::CvdfAttestation {
-                                                        att,
-                                                        vouch: Some(vouch),
-                                                    });
-                                                }
-                                                PropagationDecision::Stop => {
-                                                    // I'm a witness - recorded, stop propagation
-                                                    debug!(
-                                                        "Vouch witnessed for neighbor - stopping"
-                                                    );
-                                                }
-                                                PropagationDecision::Drop => {
-                                                    // Not relevant to me
+                    // Handle piggybacked vouch (2-hop propagation)
+                    if let Some(vouch_data) = msg.get("vouch") {
+                        if let (
+                            Some(voucher_hex),
+                            Some(voucher_slot),
+                            Some(alive_neighbors),
+                            Some(vdf_height),
+                            Some(vouch_sig_hex),
+                        ) = (
+                            vouch_data.get("voucher").and_then(|v| v.as_str()),
+                            vouch_data.get("voucher_slot").and_then(|v| v.as_u64()),
+                            vouch_data.get("alive_neighbors").and_then(|v| v.as_array()),
+                            vouch_data.get("vdf_height").and_then(|v| v.as_u64()),
+                            vouch_data.get("signature").and_then(|v| v.as_str()),
+                        ) {
+                            if let (Ok(voucher), Ok(vouch_sig)) =
+                                (hex::decode(voucher_hex), hex::decode(vouch_sig_hex))
+                            {
+                                if voucher.len() == 32 && vouch_sig.len() == 64 {
+                                    let mut alive: Vec<[u8; 32]> = Vec::new();
+                                    for n in alive_neighbors {
+                                        if let Some(n_hex) = n.as_str() {
+                                            if let Ok(n_bytes) = hex::decode(n_hex) {
+                                                if n_bytes.len() == 32 {
+                                                    alive.push(n_bytes.try_into().unwrap());
                                                 }
                                             }
                                         }
+                                    }
+
+                                    let latencies = vouch_data
+                                        .get("latencies")
+                                        .and_then(|l| l.as_array())
+                                        .map(|arr| {
+                                            arr.iter()
+                                                .filter_map(|item| {
+                                                    let node =
+                                                        hex::decode(item.get("node")?.as_str()?).ok()?;
+                                                    let latency = item.get("latency_ms")?.as_u64()?;
+                                                    if node.len() == 32 {
+                                                        Some((node.try_into().unwrap(), latency))
+                                                    } else {
+                                                        None
+                                                    }
+                                                })
+                                                .collect::<Vec<_>>()
+                                        })
+                                        .unwrap_or_default();
+
+                                    let vouch = MeshVouch {
+                                        voucher: voucher.try_into().unwrap(),
+                                        voucher_slot,
+                                        alive_neighbors: alive,
+                                        vdf_height,
+                                        latencies,
+                                        signature: vouch_sig.try_into().unwrap(),
+                                    };
+
+                                    match self.handle_mesh_vouch(vouch.clone()).await {
+                                        PropagationDecision::ForwardToNeighbors => {
+                                            debug!("Vouch judges me - forwarding to witnesses");
+                                            self.flood(FloodMessage::CvdfAttestation {
+                                                att,
+                                                vouch: Some(vouch),
+                                            });
+                                        }
+                                        PropagationDecision::Stop => {
+                                            debug!("Vouch witnessed for neighbor - stopping");
+                                        }
+                                        PropagationDecision::Drop => {}
                                     }
                                 }
                             }
@@ -3900,14 +4071,12 @@ impl MeshService {
                 }
             }
             "cvdf_new_round" => {
-                // Parse and process new round
-                // Note: This requires full round data including attestations
-                debug!(
-                    "Received cvdf_new_round from {} (round {})",
-                    peer_id,
-                    msg.get("round").and_then(|r| r.as_u64()).unwrap_or(0)
-                );
-                // Full round processing requires attestations array - handled by flood
+                if let Some(round) = Self::parse_cvdf_round_json(&msg) {
+                    let round_number = round.round;
+                    if self.cvdf_process_round(round).await {
+                        debug!("Processed cvdf_new_round {} from {}", round_number, peer_id);
+                    }
+                }
             }
             "cvdf_sync_request" => {
                 // Respond with our chain state
@@ -3917,8 +4086,8 @@ impl MeshService {
                         peer_id, from_height
                     );
                     // Send our chain state via flood
-                    if let Some((rounds, slots)) = self.cvdf_chain_state().await {
-                        self.flood(FloodMessage::CvdfSyncResponse { rounds, slots });
+                    if let Some((rounds, claims)) = self.cvdf_chain_state().await {
+                        self.flood(FloodMessage::CvdfSyncResponse { rounds, claims });
                     }
                 }
             }
@@ -3930,99 +4099,47 @@ impl MeshService {
                 let mut parsed_rounds: Vec<CvdfRound> = Vec::new();
                 if let Some(rounds_arr) = msg.get("rounds").and_then(|r| r.as_array()) {
                     for round_json in rounds_arr {
+                        if let Some(round) = Self::parse_cvdf_round_json(round_json) {
+                            parsed_rounds.push(round);
+                        }
+                    }
+                }
+
+                // Parse signed VDF claims
+                let mut parsed_claims: Vec<AnchoredSlotClaim> = Vec::new();
+                if let Some(claims_arr) = msg.get("claims").and_then(|s| s.as_array()) {
+                    for claim_json in claims_arr {
                         if let (
-                            Some(round_num),
-                            Some(prev_output_hex),
-                            Some(washed_input_hex),
-                            Some(output_hex),
-                            Some(producer_hex),
-                            Some(producer_sig_hex),
-                            Some(timestamp_ms),
-                            Some(attestations_arr),
+                            Some(slot),
+                            Some(claimer_hex),
+                            Some(vdf_height),
+                            Some(vdf_output_hex),
+                            Some(signature_hex),
                         ) = (
-                            round_json.get("round").and_then(|r| r.as_u64()),
-                            round_json.get("prev_output").and_then(|p| p.as_str()),
-                            round_json.get("washed_input").and_then(|w| w.as_str()),
-                            round_json.get("output").and_then(|o| o.as_str()),
-                            round_json.get("producer").and_then(|p| p.as_str()),
-                            round_json
-                                .get("producer_signature")
-                                .and_then(|s| s.as_str()),
-                            round_json.get("timestamp_ms").and_then(|t| t.as_u64()),
-                            round_json.get("attestations").and_then(|a| a.as_array()),
+                            claim_json.get("slot").and_then(|s| s.as_u64()),
+                            claim_json.get("claimer").and_then(|p| p.as_str()),
+                            claim_json.get("vdf_height").and_then(|h| h.as_u64()),
+                            claim_json.get("vdf_output").and_then(|o| o.as_str()),
+                            claim_json.get("signature").and_then(|s| s.as_str()),
                         ) {
-                            // Parse byte arrays
-                            let prev_output = hex::decode(prev_output_hex).ok();
-                            let washed_input = hex::decode(washed_input_hex).ok();
-                            let output = hex::decode(output_hex).ok();
-                            let producer = hex::decode(producer_hex).ok();
-                            let producer_sig = hex::decode(producer_sig_hex).ok();
-
-                            if let (Some(prev), Some(washed), Some(out), Some(prod), Some(sig)) =
-                                (prev_output, washed_input, output, producer, producer_sig)
-                            {
-                                if prev.len() == 32
-                                    && washed.len() == 32
-                                    && out.len() == 32
-                                    && prod.len() == 32
-                                    && sig.len() == 64
-                                {
-                                    // Parse attestations
-                                    let mut attestations = Vec::new();
-                                    for att_json in attestations_arr {
-                                        if let (
-                                            Some(att_round),
-                                            Some(att_prev_hex),
-                                            Some(att_attester_hex),
-                                            Some(att_sig_hex),
-                                        ) = (
-                                            att_json.get("round").and_then(|r| r.as_u64()),
-                                            att_json.get("prev_output").and_then(|p| p.as_str()),
-                                            att_json.get("attester").and_then(|a| a.as_str()),
-                                            att_json.get("signature").and_then(|s| s.as_str()),
-                                        ) {
-                                            let att_prev = hex::decode(att_prev_hex).ok();
-                                            let att_attester = hex::decode(att_attester_hex).ok();
-                                            let att_sig = hex::decode(att_sig_hex).ok();
-                                            let att_slot =
-                                                att_json.get("slot").and_then(|s| s.as_u64());
-
-                                            if let (Some(ap), Some(aa), Some(asig)) =
-                                                (att_prev, att_attester, att_sig)
-                                            {
-                                                if ap.len() == 32
-                                                    && aa.len() == 32
-                                                    && asig.len() == 64
-                                                {
-                                                    attestations.push(RoundAttestation {
-                                                        round: att_round,
-                                                        prev_output: ap.try_into().unwrap(),
-                                                        attester: aa.try_into().unwrap(),
-                                                        slot: att_slot,
-                                                        signature: asig.try_into().unwrap(),
-                                                    });
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    // Get iterations from JSON, default to base if not present (backwards compat)
-                                    let iterations = round_json
-                                        .get("iterations")
-                                        .and_then(|i| i.as_u64())
-                                        .map(|i| i as u32)
-                                        .unwrap_or(crate::cvdf::CVDF_ITERATIONS_BASE);
-
-                                    parsed_rounds.push(CvdfRound {
-                                        round: round_num,
-                                        prev_output: prev.try_into().unwrap(),
-                                        washed_input: washed.try_into().unwrap(),
-                                        output: out.try_into().unwrap(),
-                                        producer: prod.try_into().unwrap(),
-                                        producer_signature: sig.try_into().unwrap(),
-                                        timestamp_ms,
-                                        attestations,
-                                        iterations,
+                            if let (Ok(claimer), Ok(vdf_output), Ok(signature)) = (
+                                hex::decode(claimer_hex),
+                                hex::decode(vdf_output_hex),
+                                hex::decode(signature_hex),
+                            ) {
+                                if claimer.len() == 32 && vdf_output.len() == 32 && signature.len() == 64 {
+                                    let mut claimer_arr = [0u8; 32];
+                                    let mut vdf_output_arr = [0u8; 32];
+                                    let mut signature_arr = [0u8; 64];
+                                    claimer_arr.copy_from_slice(&claimer);
+                                    vdf_output_arr.copy_from_slice(&vdf_output);
+                                    signature_arr.copy_from_slice(&signature);
+                                    parsed_claims.push(AnchoredSlotClaim {
+                                        slot,
+                                        claimer: claimer_arr,
+                                        vdf_height,
+                                        vdf_output: vdf_output_arr,
+                                        signature: signature_arr,
                                     });
                                 }
                             }
@@ -4030,24 +4147,10 @@ impl MeshService {
                     }
                 }
 
-                // Parse slots
-                let mut parsed_slots: Vec<(u64, [u8; 32])> = Vec::new();
-                if let Some(slots_arr) = msg.get("slots").and_then(|s| s.as_array()) {
-                    for slot_json in slots_arr {
-                        if let (Some(index), Some(pubkey_hex)) = (
-                            slot_json.get("index").and_then(|i| i.as_u64()),
-                            slot_json.get("pubkey").and_then(|p| p.as_str()),
-                        ) {
-                            if let Ok(pubkey) = hex::decode(pubkey_hex) {
-                                if pubkey.len() == 32 {
-                                    parsed_slots.push((index, pubkey.try_into().unwrap()));
-                                }
-                            }
-                        }
-                    }
-                }
+                let mut chain_state_changed = false;
 
-                // Check if we should adopt this chain
+                // Check if we should adopt this chain.
+                // Even when we do NOT adopt, we still need to reconcile slot holders below.
                 if !parsed_rounds.is_empty() && self.cvdf_should_adopt(&parsed_rounds).await {
                     let their_height = parsed_rounds.last().map(|r| r.round).unwrap_or(0);
                     let their_weight: u64 = parsed_rounds.iter().map(|r| r.weight() as u64).sum();
@@ -4057,41 +4160,38 @@ impl MeshService {
                     );
 
                     if self.cvdf_adopt(parsed_rounds).await {
-                        // Chain adopted - now process slots with tiebreaker
-                        // CRITICAL: This is where slot recalculation happens during swarm merge
-                        let mut we_lost_our_slot = false;
+                        chain_state_changed = true;
+                    }
+                }
 
-                        for (slot_idx, pubkey) in &parsed_slots {
-                            // Register slot in CVDF
-                            self.cvdf_register_slot(*slot_idx, *pubkey).await;
+                // Reconcile advertised signed claims regardless of whether the chain itself was adopted.
+                // Equal-weight peers still need to converge on the same live occupancy set.
+                if !parsed_claims.is_empty() {
+                    let mut we_lost_our_slot = false;
+                    let mut saw_slot_change = chain_state_changed;
 
-                            // Compute peer_id from pubkey for tiebreaker
-                            let their_peer_id = compute_peer_id_from_bytes(pubkey);
+                    for claim in &parsed_claims {
+                        self.cvdf_register_slot(claim.slot, claim.claimer).await;
 
-                            // Get slot coord
-                            let coord = spiral3d_to_coord(Spiral3DIndex::new(*slot_idx));
-
-                            // Process through tiebreaker - this handles conflicts
-                            let (lost, _race_won) = self
-                                .process_slot_claim(
-                                    *slot_idx,
-                                    their_peer_id,
-                                    (coord.q, coord.r, coord.z),
-                                    Some(pubkey.to_vec()),
-                                )
-                                .await;
-
-                            if lost {
-                                we_lost_our_slot = true;
-                            }
+                        let had_slot = self.has_claimed_slot().await;
+                        if self.process_vdf_claim(claim.clone()).await {
+                            saw_slot_change = true;
+                            self.flood(FloodMessage::VdfSlotClaim { claim: claim.clone() });
                         }
-
-                        // EVENT: Chain adopted - mesh state changed
-                        // Per FailureDetectorElimination.lean: state changes are valid trigger events
-                        if we_lost_our_slot {
-                            info!("Lost slot during chain adoption - triggering reclaim");
+                        let has_slot = self.has_claimed_slot().await;
+                        if had_slot && !has_slot {
+                            we_lost_our_slot = true;
+                            saw_slot_change = true;
                         }
-                        // Always trigger after chain adoption - we learned about new mesh state
+                    }
+
+                    if we_lost_our_slot {
+                        info!("Lost slot during CVDF sync reconciliation - triggering reclaim");
+                    }
+
+                    // EVENT: CVDF sync taught us about live topology state.
+                    // Per FailureDetectorElimination.lean, this is a valid trigger event.
+                    if saw_slot_change {
                         self.trigger_slot_claim_if_ready();
                     }
                 }
@@ -4562,10 +4662,14 @@ impl MeshService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mesh::PeerAddrStore;
+    use crate::storage::Storage;
+    use citadel_docs::DocumentStore;
     use citadel_protocols::{CoordinatorConfig, FloodRateConfig, PeerCoordinator, QuadProof};
     use std::net::SocketAddr;
     use std::thread::sleep;
     use std::time::Duration;
+    use tempfile::tempdir;
 
     #[test]
     fn test_should_refresh_peer_hint_prefers_ipv6_overlay() {
@@ -4675,27 +4779,224 @@ mod tests {
     /// Test threshold scaling based on mesh size
     #[test]
     fn test_threshold_scaling() {
-        // At mesh size 1-2, threshold should be 1
-        // At mesh size 6, with 6 neighbors, scaled threshold = max(1, (6 * 4 + 19) / 20) = 2
-        // At mesh size 20+, threshold follows the BFT ladder
-
-        // Small mesh - need fewer confirmations
-        let mesh_size_3_neighbors_2 = std::cmp::max(1, (2 * 3 + 19) / 20);
+        let mesh_size_3_neighbors_2 = MeshService::scaled_slot_claim_threshold(3, 2);
         assert_eq!(
             mesh_size_3_neighbors_2, 1,
             "With 2 neighbors in mesh of 3, need 1 confirmation"
         );
 
-        // Medium mesh
-        let mesh_size_10_neighbors_5 = std::cmp::max(1, (5 * 5 + 19) / 20);
+        let mesh_size_10_neighbors_5 = MeshService::scaled_slot_claim_threshold(10, 5);
         assert_eq!(
             mesh_size_10_neighbors_5, 2,
             "With 5 neighbors in mesh of 10, need 2 confirmations"
         );
 
-        // Large mesh (full 20 neighbors)
-        let full_mesh = 11; // 11/20 at full maturity
+        let full_mesh = MeshService::scaled_slot_claim_threshold(20, 20);
         assert_eq!(full_mesh, 11, "Full mesh requires 11/20 confirmations");
+    }
+
+    #[test]
+    fn test_threshold_scaling_allows_zero_neighbor_genesis() {
+        assert_eq!(
+            MeshService::scaled_slot_claim_threshold(0, 0),
+            0,
+            "Genesis slot must be occupiable with zero existing neighbors"
+        );
+    }
+
+    #[test]
+    fn test_cvdf_attestation_json_roundtrip_preserves_signature() {
+        let signing_key = SigningKey::generate(&mut rand::thread_rng());
+        let att = RoundAttestation::new(7, [9u8; 32], Some(3), &signing_key);
+
+        let json = MeshService::cvdf_attestation_json(&att, None);
+        let parsed = MeshService::parse_cvdf_attestation_json(&json).expect("attestation should parse");
+
+        assert_eq!(parsed.round, att.round);
+        assert_eq!(parsed.slot, att.slot);
+        assert_eq!(parsed.prev_output, att.prev_output);
+        assert_eq!(parsed.attester, att.attester);
+        assert_eq!(parsed.signature, att.signature);
+    }
+
+    #[test]
+    fn test_cvdf_round_json_roundtrip_preserves_attestations() {
+        let signing_key = SigningKey::generate(&mut rand::thread_rng());
+        let round = CvdfRound::genesis(b"mesh-test", &signing_key);
+
+        let json = MeshService::cvdf_round_json(&round, Some(0));
+        let parsed = MeshService::parse_cvdf_round_json(&json).expect("round should parse");
+
+        assert_eq!(parsed.round, round.round);
+        assert_eq!(parsed.output, round.output);
+        assert_eq!(parsed.producer, round.producer);
+        assert_eq!(parsed.producer_signature, round.producer_signature);
+        assert_eq!(parsed.attestations, round.attestations);
+    }
+
+    fn test_mesh_service() -> MeshService {
+        let dir = tempdir().expect("tempdir");
+        let storage = Arc::new(Storage::open(dir.path().join("lens.redb")).expect("storage"));
+        let doc_store = DocumentStore::open(dir.path().join("docs.redb")).expect("doc_store");
+        let doc_store = Arc::new(tokio::sync::RwLock::new(doc_store));
+        MeshService::new(
+            "127.0.0.1:0".parse().unwrap(),
+            None,
+            Vec::new(),
+            None,
+            None,
+            None,
+            storage,
+            doc_store,
+        )
+    }
+
+    #[tokio::test]
+    async fn test_process_vdf_claim_registers_remote_slot_in_cvdf() {
+        let mesh = test_mesh_service();
+        mesh.init_cvdf_genesis().await;
+
+        let claimer = [7u8; 32];
+        let claim = AnchoredSlotClaim {
+            slot: 4,
+            claimer,
+            vdf_height: 1,
+            vdf_output: [9u8; 32],
+            signature: [0u8; 64],
+        };
+
+        assert!(mesh.process_vdf_claim(claim).await);
+
+        let (_rounds, slots) = mesh.cvdf_chain_state().await.expect("cvdf state");
+        assert!(slots.iter().any(|claim| claim.slot == 4 && claim.claimer == claimer));
+    }
+
+    #[test]
+    fn test_evict_stale_slots_clears_claim_and_vdf_entry() {
+        let peer_id = "b3b3/test-peer".to_string();
+        let claim = SlotClaim::new(2, peer_id.clone());
+        let coord = claim.coord;
+        let mut state = MeshState {
+            self_id: "b3b3/self".to_string(),
+            signing_key: SigningKey::generate(&mut rand::thread_rng()),
+            self_slot: None,
+            peers: HashMap::new(),
+            peer_addr_store: PeerAddrStore::new(120_000),
+            claimed_slots: HashMap::from([(2, claim.clone())]),
+            slot_coords: HashSet::from([coord]),
+            spore_sync: None,
+            vdf_race: None,
+            vdf_claims: HashMap::from([(
+                2,
+                AnchoredSlotClaim {
+                    slot: 2,
+                    claimer: [3u8; 32],
+                    vdf_height: 5,
+                    vdf_output: [4u8; 32],
+                    signature: [0u8; 64],
+                },
+            )]),
+            pol_manager: None,
+            pol_pending_pings: HashMap::new(),
+            cvdf: None,
+            latency_history: HashMap::new(),
+            observed_public_addr: None,
+            do_not_want: Spore::empty(),
+            erasure_confirmed: Spore::empty(),
+            erasure_synced: HashMap::new(),
+            bad_bits: HashSet::new(),
+            accountability: None,
+            liveness: None,
+        };
+
+        let evicted = MeshService::evict_stale_slots_from_state(&mut state, &[2]);
+
+        assert_eq!(evicted, vec![(2, peer_id)]);
+        assert!(!state.claimed_slots.contains_key(&2));
+        assert!(!state.vdf_claims.contains_key(&2));
+        assert!(!state.slot_coords.contains(&coord));
+    }
+
+    #[test]
+    fn test_slot_claim_validators_require_occupied_theoretical_neighbors() {
+        let occupied_peer_id = "b3b3/occupied".to_string();
+        let slotless_peer_id = "b3b3/slotless".to_string();
+        let occupied_claim = SlotClaim::with_public_key(0, occupied_peer_id.clone(), Some(vec![1u8; 32]));
+        let mut peers = HashMap::new();
+        peers.insert(
+            occupied_peer_id.clone(),
+            MeshPeer {
+                id: occupied_peer_id.clone(),
+                addr: "10.0.0.10:9000".parse().unwrap(),
+                yggdrasil_addr: None,
+                underlay_uri: None,
+                ygg_peer_uri: None,
+                public_key: Some(vec![1u8; 32]),
+                last_seen: std::time::Instant::now(),
+                coordinated: false,
+                slot: Some(occupied_claim.clone()),
+                is_entry_peer: false,
+                content_synced: false,
+                their_have: None,
+                their_peer_addr_have: None,
+            },
+        );
+        peers.insert(
+            slotless_peer_id.clone(),
+            MeshPeer {
+                id: slotless_peer_id.clone(),
+                addr: "10.0.0.11:9000".parse().unwrap(),
+                yggdrasil_addr: None,
+                underlay_uri: None,
+                ygg_peer_uri: None,
+                public_key: Some(vec![2u8; 32]),
+                last_seen: std::time::Instant::now(),
+                coordinated: false,
+                slot: None,
+                is_entry_peer: false,
+                content_synced: false,
+                their_have: None,
+                their_peer_addr_have: None,
+            },
+        );
+
+        let state = MeshState {
+            self_id: "b3b3/self".to_string(),
+            signing_key: SigningKey::generate(&mut rand::thread_rng()),
+            self_slot: None,
+            peers,
+            peer_addr_store: PeerAddrStore::new(120_000),
+            claimed_slots: HashMap::from([(0, occupied_claim.clone())]),
+            slot_coords: HashSet::from([occupied_claim.coord]),
+            spore_sync: None,
+            vdf_race: None,
+            vdf_claims: HashMap::new(),
+            pol_manager: None,
+            pol_pending_pings: HashMap::new(),
+            cvdf: None,
+            latency_history: HashMap::new(),
+            observed_public_addr: None,
+            do_not_want: Spore::empty(),
+            erasure_confirmed: Spore::empty(),
+            erasure_synced: HashMap::new(),
+            bad_bits: HashSet::new(),
+            accountability: None,
+            liveness: None,
+        };
+
+        let active_peer_ids = HashSet::from([occupied_peer_id.clone(), slotless_peer_id.clone()]);
+
+        let slot_one_validators =
+            MeshService::occupied_theoretical_neighbor_validator_ids(&state, &active_peer_ids, 1);
+        assert!(slot_one_validators.contains(&occupied_peer_id));
+        assert!(!slot_one_validators.contains(&slotless_peer_id));
+
+        let slot_zero_validators =
+            MeshService::occupied_theoretical_neighbor_validator_ids(&state, &active_peer_ids, 0);
+        assert!(
+            slot_zero_validators.is_empty(),
+            "slotless peers must not witness a duplicate slot 0 claim"
+        );
     }
 
     /// 1000-node mesh formation test with flooding-based coordination

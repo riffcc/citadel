@@ -1,0 +1,57 @@
+app = "citadel-live"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile.fly"
+
+[env]
+  LENS_DATA_DIR = "/data"
+  LENS_API_BIND = "0.0.0.0:8080"
+  LENS_P2P_BIND = "0.0.0.0:9000"
+  RUST_LOG = "lens_node=info,citadel_lens=info"
+  CITADEL_PEERS = "5.78.147.14:9000,5.78.70.121:9000,116.203.235.87:9000,37.27.220.204:9000"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [http_service.concurrency]
+    type = "connections"
+    hard_limit = 250
+    soft_limit = 200
+
+# P2P mesh transport (TCP + UDP on port 9000)
+[[services]]
+  protocol = "tcp"
+  internal_port = 9000
+
+  [[services.ports]]
+    port = 9000
+
+[[services]]
+  protocol = "udp"
+  internal_port = 9000
+
+  [[services.ports]]
+    port = 9000
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = 256
+
+[mounts]
+  source = "citadel_data"
+  destination = "/data"
+
+[checks]
+  [checks.health]
+    port = 8080
+    type = "http"
+    interval = "15s"
+    timeout = "5s"
+    grace_period = "30s"
+    method = "GET"
+    path = "/health"

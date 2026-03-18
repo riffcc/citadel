@@ -1,0 +1,32 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main, dev, staging]
+
+concurrency:
+  group: deploy-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy to Fly.io (${{ github.ref_name }})
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+
+      - name: Select environment
+        id: env
+        run: |
+          case "${{ github.ref_name }}" in
+            main)    echo "app=citadel-live"    >> "$GITHUB_OUTPUT" ;;
+            staging) echo "app=citadel-staging" >> "$GITHUB_OUTPUT" ;;
+            dev)     echo "app=citadel-dev"     >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - name: Deploy
+        run: flyctl deploy --remote-only --app "${{ steps.env.outputs.app }}"
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
