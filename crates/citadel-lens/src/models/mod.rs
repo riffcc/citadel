@@ -38,3 +38,6 @@ pub use metadata::{
     StandardMetadata,
 };
 pub use release::{Release, ReleaseStatus};
+
+mod site_manifest;
+pub use site_manifest::SiteManifest;

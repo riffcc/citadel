@@ -1,7 +1,7 @@
 //! Persistent storage using ReDB.
 
 use crate::error::Result;
-use crate::models::{Category, ContentItem, FeaturedRelease, Release, ReleaseStatus};
+use crate::models::{Category, ContentItem, FeaturedRelease, Release, ReleaseStatus, SiteManifest};
 use ed25519_dalek::SigningKey;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use std::collections::HashMap;
@@ -479,6 +479,34 @@ impl Storage {
     pub fn list_active_featured_releases(&self) -> Result<Vec<FeaturedRelease>> {
         let all = self.list_featured_releases()?;
         Ok(all.into_iter().filter(|fr| fr.is_active()).collect())
+    }
+
+    // --- Site Manifest ---
+
+    /// Get or create the site manifest for the given address.
+    pub fn ensure_site_manifest(&self, address: &str) -> Result<SiteManifest> {
+        let read_txn = self.db.begin_read()?;
+        if let Ok(table) = read_txn.open_table(NODE_META) {
+            if let Ok(Some(value)) = table.get("site_manifest") {
+                if let Ok(manifest) = serde_json::from_slice::<SiteManifest>(value.value()) {
+                    return Ok(manifest);
+                }
+            }
+        }
+        // Create default
+        Ok(SiteManifest::new(address.to_string()))
+    }
+
+    /// Store the site manifest.
+    pub fn put_site_manifest(&self, manifest: &SiteManifest) -> Result<()> {
+        let value = serde_json::to_vec(manifest)?;
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(NODE_META)?;
+            table.insert("site_manifest", value.as_slice())?;
+        }
+        write_txn.commit()?;
+        Ok(())
     }
 }
 
