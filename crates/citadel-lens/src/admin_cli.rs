@@ -118,6 +118,31 @@ enum Commands {
 
     /// Get mesh connection statistics (always available, no profiling needed)
     MeshStats,
+
+    /// List all releases
+    ListReleases,
+
+    /// Get a release by ID
+    GetRelease {
+        /// Release ID
+        id: String,
+    },
+
+    /// Update a release (provide fields as JSON)
+    UpdateRelease {
+        /// Release ID
+        id: String,
+        /// JSON body with fields to update (e.g. '{"contentCID":"..."}')
+        #[arg(long, short)]
+        json: String,
+    },
+
+    /// Create a new release from JSON
+    CreateRelease {
+        /// JSON body for the new release
+        #[arg(long, short)]
+        json: String,
+    },
 }
 
 /// Admin command sent over the socket (legacy local mode)
@@ -330,6 +355,29 @@ fn create_auth_headers(signing_key: &SigningKey) -> Result<Vec<(String, String)>
     ])
 }
 
+/// Create signed headers for the release API.
+///
+/// The release API expects `X-Public-Key`, `X-Signature`, `X-Timestamp`
+/// where the signature covers `{timestamp}:{body}`.
+fn create_release_auth_headers(
+    signing_key: &SigningKey,
+    body: &str,
+) -> Result<Vec<(String, String)>, String> {
+    let timestamp = chrono::Utc::now().timestamp_millis().to_string();
+    let verifying_key = signing_key.verifying_key();
+    let public_key_hex = format!("ed25519p/{}", hex::encode(verifying_key.to_bytes()));
+
+    let message = format!("{}:{}", timestamp, body);
+    let signature = signing_key.sign(message.as_bytes());
+    let signature_hex = hex::encode(signature.to_bytes());
+
+    Ok(vec![
+        ("X-Public-Key".to_string(), public_key_hex),
+        ("X-Timestamp".to_string(), timestamp),
+        ("X-Signature".to_string(), signature_hex),
+    ])
+}
+
 /// Send command via HTTP API
 async fn send_http_command(
     client: &reqwest::Client,
@@ -377,6 +425,145 @@ async fn send_http_command(
         .json()
         .await
         .map_err(|e| format!("Invalid response: {}", e))
+}
+
+/// List all releases from the Lens API
+async fn cmd_list_releases(
+    client: &reqwest::Client,
+    base_url: &str,
+) -> Result<(), String> {
+    let url = format!("{}/api/v1/releases", base_url.trim_end_matches('/'));
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("HTTP request failed: {}", e))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("API error ({}): {}", status, body));
+    }
+
+    let body = response.text().await.map_err(|e| format!("Read error: {}", e))?;
+    let releases: Vec<serde_json::Value> =
+        serde_json::from_str(&body).map_err(|e| format!("Parse error: {}", e))?;
+
+    for release in &releases {
+        let id = release["id"].as_str().unwrap_or("?");
+        let name = release["name"].as_str().unwrap_or("Untitled");
+        let cid = release["contentCID"].as_str().unwrap_or("none");
+        let status = release["status"].as_str().unwrap_or("?");
+        println!("[{}] {} (content: {}) - {}", status, name, cid, id);
+    }
+    println!("\n{} releases total", releases.len());
+    Ok(())
+}
+
+/// Get a single release by ID
+async fn cmd_get_release(
+    client: &reqwest::Client,
+    base_url: &str,
+    id: &str,
+) -> Result<(), String> {
+    let url = format!("{}/api/v1/releases/{}", base_url.trim_end_matches('/'), id);
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("HTTP request failed: {}", e))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("API error ({}): {}", status, body));
+    }
+
+    let body = response.text().await.map_err(|e| format!("Read error: {}", e))?;
+    let release: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| format!("Parse error: {}", e))?;
+    println!("{}", serde_json::to_string_pretty(&release).unwrap());
+    Ok(())
+}
+
+/// Update a release by ID with a JSON body
+async fn cmd_update_release(
+    client: &reqwest::Client,
+    base_url: &str,
+    signing_key: &SigningKey,
+    id: &str,
+    json_body: &str,
+) -> Result<(), String> {
+    // Validate JSON
+    let _: serde_json::Value =
+        serde_json::from_str(json_body).map_err(|e| format!("Invalid JSON: {}", e))?;
+
+    let url = format!("{}/api/v1/releases/{}", base_url.trim_end_matches('/'), id);
+    let headers = create_release_auth_headers(signing_key, json_body)?;
+
+    let mut req = client.put(&url);
+    for (key, value) in headers {
+        req = req.header(&key, &value);
+    }
+
+    let response = req
+        .header("Content-Type", "application/json")
+        .body(json_body.to_string())
+        .send()
+        .await
+        .map_err(|e| format!("HTTP request failed: {}", e))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("API error ({}): {}", status, body));
+    }
+
+    let body = response.text().await.map_err(|e| format!("Read error: {}", e))?;
+    let release: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| format!("Parse error: {}", e))?;
+    println!("Updated release:");
+    println!("{}", serde_json::to_string_pretty(&release).unwrap());
+    Ok(())
+}
+
+/// Create a new release from JSON
+async fn cmd_create_release(
+    client: &reqwest::Client,
+    base_url: &str,
+    signing_key: &SigningKey,
+    json_body: &str,
+) -> Result<(), String> {
+    let _: serde_json::Value =
+        serde_json::from_str(json_body).map_err(|e| format!("Invalid JSON: {}", e))?;
+
+    let url = format!("{}/api/v1/releases", base_url.trim_end_matches('/'));
+    let headers = create_release_auth_headers(signing_key, json_body)?;
+
+    let mut req = client.post(&url);
+    for (key, value) in headers {
+        req = req.header(&key, &value);
+    }
+
+    let response = req
+        .header("Content-Type", "application/json")
+        .body(json_body.to_string())
+        .send()
+        .await
+        .map_err(|e| format!("HTTP request failed: {}", e))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("API error ({}): {}", status, body));
+    }
+
+    let body = response.text().await.map_err(|e| format!("Read error: {}", e))?;
+    let release: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| format!("Parse error: {}", e))?;
+    println!("Created release:");
+    println!("{}", serde_json::to_string_pretty(&release).unwrap());
+    Ok(())
 }
 
 /// Upload a file or folder to Archivist
@@ -621,6 +808,33 @@ async fn run() -> Result<(), String> {
             cmd_upload(&client, archivist_url, &signing_key, &path).await
         }
 
+        // Release commands go directly to the Lens release API
+        Commands::ListReleases => {
+            let url = cli.url.as_ref().ok_or("list-releases requires --url <URL>")?;
+            let client = reqwest::Client::new();
+            cmd_list_releases(&client, url).await
+        }
+
+        Commands::GetRelease { id } => {
+            let url = cli.url.as_ref().ok_or("get-release requires --url <URL>")?;
+            let client = reqwest::Client::new();
+            cmd_get_release(&client, url, &id).await
+        }
+
+        Commands::UpdateRelease { id, json } => {
+            let url = cli.url.as_ref().ok_or("update-release requires --url <URL>")?;
+            let signing_key = load_keypair(&config_dir)?;
+            let client = reqwest::Client::new();
+            cmd_update_release(&client, url, &signing_key, &id, &json).await
+        }
+
+        Commands::CreateRelease { json } => {
+            let url = cli.url.as_ref().ok_or("create-release requires --url <URL>")?;
+            let signing_key = load_keypair(&config_dir)?;
+            let client = reqwest::Client::new();
+            cmd_create_release(&client, url, &signing_key, &json).await
+        }
+
         // Admin commands go to Lens
         cmd => {
             if let Some(ref url) = cli.url {
@@ -729,7 +943,9 @@ async fn run() -> Result<(), String> {
                                 .await?;
                         handle_response(resp)
                     }
-                    Commands::Init | Commands::Show | Commands::Upload { .. } => unreachable!(),
+                    Commands::Init | Commands::Show | Commands::Upload { .. }
+                    | Commands::ListReleases | Commands::GetRelease { .. }
+                    | Commands::UpdateRelease { .. } | Commands::CreateRelease { .. } => unreachable!(),
                 }
             } else {
                 // Local socket mode
@@ -752,7 +968,9 @@ async fn run() -> Result<(), String> {
                     Commands::CpuProfile => AdminCommand::CpuProfile,
                     Commands::MemProfile => AdminCommand::MemProfile,
                     Commands::MeshStats => AdminCommand::MeshStats,
-                    Commands::Init | Commands::Show | Commands::Upload { .. } => unreachable!(),
+                    Commands::Init | Commands::Show | Commands::Upload { .. }
+                    | Commands::ListReleases | Commands::GetRelease { .. }
+                    | Commands::UpdateRelease { .. } | Commands::CreateRelease { .. } => unreachable!(),
                 };
 
                 let response = send_socket_command(admin_cmd, data_dir)?;
