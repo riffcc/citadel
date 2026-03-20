@@ -9,7 +9,7 @@ primary_region = "iad"
   LENS_API_BIND = "0.0.0.0:8080"
   LENS_P2P_BIND = "0.0.0.0:9000"
   RUST_LOG = "lens_node=info,citadel_lens=info"
-  CITADEL_PEERS = "66.241.124.53:9000"
+  CITADEL_PEERS = ""
 
 [http_service]
   internal_port = 8080
@@ -23,14 +23,16 @@ primary_region = "iad"
     hard_limit = 250
     soft_limit = 200
 
-# P2P mesh transport (TCP + UDP on port 9000)
+# Switchboard — raw TCP, bypasses Fly's HTTP proxy.
+# Mesh entry point: half-dial routing + Ygg peering on port 9443.
 [[services]]
   protocol = "tcp"
-  internal_port = 9000
+  internal_port = 9443
 
   [[services.ports]]
-    port = 9000
+    port = 9443
 
+# UDP for TGP (mesh coordination)
 [[services]]
   protocol = "udp"
   internal_port = 9000

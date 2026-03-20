@@ -3032,68 +3032,62 @@ impl MeshService {
         }
     }
 
-    /// Connect to bootstrap peers, returns count of successful connections
+    /// Connect to bootstrap peers via switchboard half-dial protocol.
+    ///
+    /// Entry peers are switchboard addresses (host:port where port is the
+    /// switchboard port, typically 9443). The switchboard handles peer discovery
+    /// and routing — on PeerReady the TCP stream continues as a normal mesh session.
     async fn connect_to_entry_peers(self: &Arc<Self>) -> usize {
         let mut connected = 0;
+        let our_peer_id = self.self_id().await;
 
         for peer_addr in &self.entry_peers {
-            info!("Connecting to peer: {}", peer_addr);
+            info!("Connecting to entry peer via switchboard: {}", peer_addr);
 
-            let (_, mesh_port) = super::transport::extract_host_and_port(peer_addr, self.listen_addr.port());
-            let _ = mesh_port; // used by resolve below
+            let (host, mesh_port) = super::transport::extract_host_and_port(peer_addr, self.listen_addr.port());
 
-            let candidate_addrs = super::transport::resolve_entry_peer_targets(
-                peer_addr,
-                self.ygg_admin_socket.as_deref(),
-            )
-            .await;
-            if candidate_addrs.is_empty() {
-                warn!("No Ygg dial path found for entry peer {}", peer_addr);
-                continue;
-            }
-
-            let mut peer_connected = false;
-            let addr_count = candidate_addrs.len();
-            let connect_timeout = std::time::Duration::from_secs(5);
-
-            for resolved_addr in candidate_addrs {
-                debug!("Trying {} -> {}", peer_addr, resolved_addr);
-
-                match tokio::time::timeout(connect_timeout, TcpStream::connect(resolved_addr)).await
-                {
-                    Ok(Ok(stream)) => {
-                        info!("Connected to entry peer {} at {}", peer_addr, resolved_addr);
-                        connected += 1;
-                        peer_connected = true;
-
-                        // Spawn connection handler as task - don't block!
-                        // Entry peers are marked as such for later pruning when we have enough SPIRAL neighbors
-                        let self_clone = Arc::clone(self);
-                        let addr = resolved_addr;
-                        tokio::spawn(async move {
-                            if let Err(e) = self_clone.handle_connection(stream, addr, true).await {
-                                warn!("Entry peer {} disconnected: {}", addr, e);
-                            }
-                        });
-                        break; // Connected successfully, don't try other addresses
-                    }
-                    Ok(Err(e)) => {
-                        debug!(
-                            "Failed to connect to {} ({}): {}",
-                            peer_addr, resolved_addr, e
-                        );
-                    }
-                    Err(_) => {
-                        debug!("Timeout connecting to {} ({})", peer_addr, resolved_addr);
+            match connect_switchboard(&host, mesh_port, &our_peer_id, "any").await {
+                Ok(SwitchboardOutcome::Ready(stream, addr)) => {
+                    info!("Connected to entry peer {} via switchboard ({})", peer_addr, addr);
+                    connected += 1;
+                    let self_clone = Arc::clone(self);
+                    tokio::spawn(async move {
+                        if let Err(e) = self_clone.handle_connection(stream, addr, true).await {
+                            warn!("Entry peer {} disconnected: {}", addr, e);
+                        }
+                    });
+                }
+                Ok(SwitchboardOutcome::DirectRedirect { target_peer_id, dial_host, mesh_port: redir_port }) => {
+                    // Switchboard told us to dial a specific peer directly
+                    info!("Switchboard redirected to {} at {}:{}", target_peer_id, dial_host, redir_port);
+                    match connect_switchboard(&dial_host, redir_port, &our_peer_id, &format!("peer:{}", target_peer_id)).await {
+                        Ok(SwitchboardOutcome::Ready(stream, addr)) => {
+                            info!("Connected to redirected peer {} at {}", target_peer_id, addr);
+                            connected += 1;
+                            let self_clone = Arc::clone(self);
+                            tokio::spawn(async move {
+                                if let Err(e) = self_clone.handle_connection(stream, addr, true).await {
+                                    warn!("Redirected peer {} disconnected: {}", addr, e);
+                                }
+                            });
+                        }
+                        Ok(SwitchboardOutcome::SelfDetected) => {
+                            debug!("Self-detected on redirect to {}", target_peer_id);
+                        }
+                        Ok(SwitchboardOutcome::DirectRedirect { .. }) => {
+                            warn!("Double redirect from switchboard — giving up");
+                        }
+                        Err(e) => {
+                            debug!("Redirect dial to {} failed: {}", dial_host, e);
+                        }
                     }
                 }
-            }
-
-            if !peer_connected {
-                warn!(
-                    "Failed to connect to peer {} (tried {} addresses)",
-                    peer_addr, addr_count
-                );
+                Ok(SwitchboardOutcome::SelfDetected) => {
+                    debug!("Switchboard self-detected for {} (anycast routed to self)", peer_addr);
+                }
+                Err(e) => {
+                    warn!("Switchboard connect to {} failed: {}", peer_addr, e);
+                }
             }
         }
 

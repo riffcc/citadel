@@ -9,7 +9,9 @@ primary_region = "ord"
   LENS_API_BIND = "0.0.0.0:8080"
   LENS_P2P_BIND = "0.0.0.0:9000"
   RUST_LOG = "lens_node=info,citadel_lens=info,citadel_lens::mesh::service=debug,citadel_lens::mesh::transport=debug"
-  CITADEL_PEERS = "66.241.124.2:9000"
+  CITADEL_PEERS = "66.241.124.53:9000"
+  # Note: port 9000 here is the mesh_port. The switchboard port is mesh_port+443=9443.
+  # connect_to_entry_peers dials switchboard_port_for_mesh_port(9000) = 9443.
 
 [http_service]
   internal_port = 8080
@@ -23,26 +25,21 @@ primary_region = "ord"
     hard_limit = 250
     soft_limit = 200
 
-[[services]]
-  protocol = "tcp"
-  internal_port = 9000
-
-  [[services.ports]]
-    port = 9000
-
-[[services]]
-  protocol = "udp"
-  internal_port = 9000
-
-  [[services.ports]]
-    port = 9000
-
+# Switchboard — raw TCP, bypasses Fly's HTTP proxy.
 [[services]]
   protocol = "tcp"
   internal_port = 9443
 
   [[services.ports]]
     port = 9443
+
+# UDP for TGP
+[[services]]
+  protocol = "udp"
+  internal_port = 9000
+
+  [[services.ports]]
+    port = 9000
 
 [[vm]]
   size = "shared-cpu-1x"
