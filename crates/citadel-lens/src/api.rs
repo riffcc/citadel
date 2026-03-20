@@ -2461,6 +2461,18 @@ struct MeshStateResponse {
     slot_claims: Vec<SlotInfo>,
     /// Connected peers
     peers: Vec<PeerSummary>,
+    /// CVDF chain state (for swarm sync verification)
+    cvdf: Option<CvdfStateInfo>,
+}
+
+#[derive(Debug, Serialize)]
+struct CvdfStateInfo {
+    /// Chain height (number of rounds)
+    height: u64,
+    /// Chain weight (sum of round weights; heavier = more cooperation)
+    weight: u64,
+    /// Tip hash (hex) — two nodes with same tip are synced
+    tip: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -2492,7 +2504,7 @@ async fn get_mesh_state(State(state): State<AppState>) -> Json<MeshStateResponse
     let state = state.read().await;
     const LIVE_PEER_WINDOW_MS: u64 = 60_000;
 
-    let (self_id, our_slot, peer_count, slot_claims, peers) =
+    let (self_id, our_slot, peer_count, slot_claims, peers, cvdf_info) =
         if let Some(ref mesh_state) = state.mesh_state {
             let mesh = mesh_state.read().await;
 
@@ -2552,15 +2564,22 @@ async fn get_mesh_state(State(state): State<AppState>) -> Json<MeshStateResponse
 
             let peer_count = peers.iter().filter(|peer| peer.connected).count();
 
+            let cvdf_info = mesh.cvdf.as_ref().map(|c| CvdfStateInfo {
+                height: c.height(),
+                weight: c.weight(),
+                tip: hex::encode(c.chain().tip_output()),
+            });
+
             (
                 mesh.self_id.clone(),
                 our_slot,
                 peer_count,
                 slot_claims,
                 peers,
+                cvdf_info,
             )
         } else {
-            (String::new(), None, 0, Vec::new(), Vec::new())
+            (String::new(), None, 0, Vec::new(), Vec::new(), None)
         };
 
     Json(MeshStateResponse {
@@ -2569,6 +2588,7 @@ async fn get_mesh_state(State(state): State<AppState>) -> Json<MeshStateResponse
         peer_count,
         slot_claims,
         peers,
+        cvdf: cvdf_info,
     })
 }
 
