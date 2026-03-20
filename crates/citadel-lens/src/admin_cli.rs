@@ -21,6 +21,7 @@
 //!   lens-admin init     # Generate keypair
 //!   lens-admin show     # Show configuration
 
+use cid::{multibase::Base, Cid};
 use clap::{Parser, Subcommand};
 use ed25519_dalek::{Signer, SigningKey, SECRET_KEY_LENGTH};
 use serde::{Deserialize, Serialize};
@@ -28,6 +29,28 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+
+#[derive(Debug, Serialize)]
+struct DirectoryUploadEntry {
+    path: String,
+    cid: String,
+    size: u64,
+    #[serde(rename = "mimetype")]
+    mime_type: String,
+}
+
+#[derive(Debug, Serialize)]
+struct DirectoryFinalizeRequest<'a> {
+    name: Option<&'a str>,
+    entries: &'a [DirectoryUploadEntry],
+}
+
+fn cid_to_base58btc(cid: &str) -> String {
+    cid.parse::<Cid>()
+        .ok()
+        .and_then(|cid| cid.to_string_of_base(Base::Base58Btc).ok())
+        .unwrap_or_else(|| cid.to_string())
+}
 
 /// Lens node administration tool
 #[derive(Parser)]
@@ -460,7 +483,15 @@ async fn cmd_list_releases(
         let name = release["name"].as_str().unwrap_or("Untitled");
         let cid = release["contentCID"].as_str().unwrap_or("none");
         let status = release["status"].as_str().unwrap_or("?");
-        println!("[{}] {} (content: {}) - {}", status, name, cid, id);
+        let quality_count = release["qualities"].as_array().map(|q| q.len()).unwrap_or(0);
+        if quality_count > 0 {
+            println!(
+                "[{}] {} (content: {}, qualities: {}) - {}",
+                status, name, cid, quality_count, id
+            );
+        } else {
+            println!("[{}] {} (content: {}) - {}", status, name, cid, id);
+        }
     }
     println!("\n{} releases total", releases.len());
     Ok(())
@@ -593,7 +624,14 @@ async fn cmd_upload(
         println!("CID: {}", cid);
         Ok(())
     } else if path.is_dir() {
-        upload_directory(client, archivist_url, &headers, path).await
+        let dir_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("directory");
+        let cid = upload_directory(client, archivist_url, &headers, path).await?;
+        println!("Uploaded directory: {}", dir_name);
+        println!("CID: {}", cid);
+        Ok(())
     } else {
         Err(format!("Path is neither a file nor directory: {:?}", path))
     }
@@ -672,27 +710,31 @@ async fn upload_file(
         .unwrap_or("file")
         .to_string();
 
+    // Guess content type from extension
+    let content_type = guess_content_type(path);
+
     let file_bytes = fs::read(path).map_err(|e| format!("Failed to read file: {}", e))?;
 
-    // Guess content type from extension
-    let content_type = match path.extension().and_then(|e| e.to_str()) {
-        Some("png") => "image/png",
-        Some("jpg") | Some("jpeg") => "image/jpeg",
-        Some("gif") => "image/gif",
-        Some("webp") => "image/webp",
-        Some("mp4") => "video/mp4",
-        Some("webm") => "video/webm",
-        Some("mp3") => "audio/mpeg",
-        Some("flac") => "audio/flac",
-        Some("ogg") => "audio/ogg",
-        Some("pdf") => "application/pdf",
-        Some("json") => "application/json",
-        Some("txt") => "text/plain",
-        Some("html") => "text/html",
-        Some("css") => "text/css",
-        Some("js") => "application/javascript",
-        _ => "application/octet-stream",
-    };
+    upload_bytes(
+        client,
+        archivist_url,
+        headers,
+        &file_name,
+        content_type,
+        file_bytes,
+    )
+    .await
+}
+
+async fn upload_bytes(
+    client: &reqwest::Client,
+    archivist_url: &str,
+    headers: &[(String, String)],
+    file_name: &str,
+    content_type: &str,
+    file_bytes: Vec<u8>,
+) -> Result<String, String> {
+    let file_name = file_name.to_string();
 
     // Archivist upload endpoint: POST /api/archivist/v1/data
     let url = format!(
@@ -733,7 +775,69 @@ async fn upload_file(
         .trim()
         .to_string();
 
-    Ok(cid)
+    Ok(cid_to_base58btc(&cid))
+}
+
+fn guess_content_type(path: &PathBuf) -> &'static str {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("mp4") => "video/mp4",
+        Some("webm") => "video/webm",
+        Some("mp3") => "audio/mpeg",
+        Some("flac") => "audio/flac",
+        Some("ogg") => "audio/ogg",
+        Some("pdf") => "application/pdf",
+        Some("json") => "application/json",
+        Some("txt") => "text/plain",
+        Some("html") => "text/html",
+        Some("css") => "text/css",
+        Some("js") => "application/javascript",
+        _ => "application/octet-stream",
+    }
+}
+
+async fn finalize_directory(
+    client: &reqwest::Client,
+    archivist_url: &str,
+    headers: &[(String, String)],
+    name: Option<&str>,
+    entries: &[DirectoryUploadEntry],
+) -> Result<String, String> {
+    let url = format!(
+        "{}/api/archivist/v1/directory",
+        archivist_url.trim_end_matches('/')
+    );
+
+    let mut req = client.post(&url);
+    for (key, value) in headers {
+        req = req.header(key, value);
+    }
+
+    let response = req
+        .header("content-type", "application/json")
+        .json(&DirectoryFinalizeRequest { name, entries })
+        .send()
+        .await
+        .map_err(|e| format!("Directory finalize failed: {}", e))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("Directory finalize failed ({}): {}", status, body));
+    }
+
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| format!("Invalid directory response: {}", e))?;
+
+    body.get("cid")
+        .and_then(|v| v.as_str())
+        .map(cid_to_base58btc)
+        .ok_or_else(|| format!("Directory finalize response missing cid: {}", body))
 }
 
 /// Upload a directory recursively
@@ -742,8 +846,13 @@ async fn upload_directory(
     archivist_url: &str,
     headers: &[(String, String)],
     path: &PathBuf,
-) -> Result<(), String> {
-    let entries: Vec<_> = walkdir(path)?;
+) -> Result<String, String> {
+    let mut entries: Vec<_> = walkdir(path)?;
+    entries.sort_by(|a, b| {
+        let a_rel = a.strip_prefix(path).unwrap_or(a);
+        let b_rel = b.strip_prefix(path).unwrap_or(b);
+        a_rel.cmp(b_rel)
+    });
     let file_count = entries.iter().filter(|e| e.is_file()).count();
 
     println!("Uploading {} files from {:?}", file_count, path);
@@ -751,6 +860,7 @@ async fn upload_directory(
 
     let mut success_count = 0;
     let mut fail_count = 0;
+    let mut manifest_entries = Vec::new();
 
     for entry in entries {
         if entry.is_file() {
@@ -762,6 +872,14 @@ async fn upload_directory(
                 Ok(cid) => {
                     println!("{}", cid);
                     success_count += 1;
+                    manifest_entries.push(DirectoryUploadEntry {
+                        path: relative.to_string_lossy().replace('\\', "/"),
+                        cid,
+                        size: fs::metadata(&entry)
+                            .map_err(|e| format!("Failed to stat {:?}: {}", entry, e))?
+                            .len(),
+                        mime_type: guess_content_type(&entry).to_string(),
+                    });
                 }
                 Err(e) => {
                     println!("FAILED: {}", e);
@@ -777,7 +895,13 @@ async fn upload_directory(
     if fail_count > 0 {
         Err(format!("{} uploads failed", fail_count))
     } else {
-        Ok(())
+        let dir_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("directory");
+        println!();
+        println!("Finalizing directory {} ...", dir_name);
+        finalize_directory(client, archivist_url, headers, Some(dir_name), &manifest_entries).await
     }
 }
 
