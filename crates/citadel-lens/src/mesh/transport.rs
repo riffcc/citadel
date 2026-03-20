@@ -27,6 +27,31 @@ pub fn extract_host_from_uri(uri: &str) -> String {
     stripped.to_string()
 }
 
+pub fn extract_host_and_port(entry_peer: &str, default_port: u16) -> (String, u16) {
+    let stripped = entry_peer.strip_prefix("tcp://").unwrap_or(entry_peer);
+    if stripped.starts_with('[') {
+        if let Some(bracket_end) = stripped.find(']') {
+            let host = stripped[1..bracket_end].to_string();
+            let rest = &stripped[bracket_end + 1..];
+            let port = rest
+                .strip_prefix(':')
+                .and_then(|p| p.parse::<u16>().ok())
+                .unwrap_or(default_port);
+            return (host, port);
+        }
+    }
+
+    if let Some(colon) = stripped.rfind(':') {
+        let host = &stripped[..colon];
+        let port = stripped[colon + 1..].parse::<u16>().unwrap_or(default_port);
+        if !host.is_empty() {
+            return (host.to_string(), port);
+        }
+    }
+
+    (stripped.to_string(), default_port)
+}
+
 async fn resolve_remote_ip_via_ygg(
     ygg_admin_socket: Option<&str>,
     remote_ip: IpAddr,
@@ -153,6 +178,22 @@ mod tests {
     #[test]
     fn test_extract_host_from_uri_ipv6() {
         assert_eq!(extract_host_from_uri("tcp://[fdaa::1]:9443"), "fdaa::1");
+    }
+
+    #[test]
+    fn test_extract_host_and_port_hostname() {
+        assert_eq!(
+            extract_host_and_port("citadel-sync-canary.fly.dev:9000", 9000),
+            ("citadel-sync-canary.fly.dev".into(), 9000)
+        );
+    }
+
+    #[test]
+    fn test_extract_host_and_port_ipv6() {
+        assert_eq!(
+            extract_host_and_port("[fdaa::1]:9000", 9000),
+            ("fdaa::1".into(), 9000)
+        );
     }
 
     #[tokio::test]

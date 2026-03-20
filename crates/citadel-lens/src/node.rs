@@ -86,7 +86,7 @@ impl LensConfig {
             .parse()
             .expect("Invalid api-bind address");
 
-        let p2p_addr = p2p_bind
+        let p2p_addr: SocketAddr = p2p_bind
             .unwrap_or_else(|| "0.0.0.0:9000".to_string())
             .parse()
             .expect("Invalid p2p-bind address");
@@ -120,7 +120,8 @@ impl LensConfig {
             .filter(|s| !s.is_empty())
             .or_else(detect_admin_socket);
         let yggdrasil_addr = detect_yggdrasil_addr().map(|a| a.to_string());
-        let underlay_uri = detect_underlay_addr().map(|addr| format_tcp_peer_uri(addr, 9443));
+        let underlay_port = crate::mesh::switchboard_port_for_mesh_port(p2p_addr.port());
+        let underlay_uri = detect_underlay_addr().map(|addr| format_tcp_peer_uri(addr, underlay_port));
 
         let admin_public_key = admin_key.filter(|s| !s.is_empty());
 

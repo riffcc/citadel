@@ -34,8 +34,10 @@ pub async fn test_16_node_convergence() -> (bool, Duration, usize) {
         let storage = Arc::new(
             Storage::open(temp_dir.path().join("storage.redb")).expect("Failed to create storage"),
         );
-        let doc_store = DocumentStore::open(temp_dir.path().join("docs.redb"))
-            .expect("Failed to create doc store");
+        let doc_store = Arc::new(tokio::sync::RwLock::new(
+            DocumentStore::open(temp_dir.path().join("docs.redb"))
+                .expect("Failed to create doc store"),
+        ));
 
         let listen_addr: SocketAddr = format!("127.0.0.1:{}", BASE_PORT + i as u16)
             .parse()

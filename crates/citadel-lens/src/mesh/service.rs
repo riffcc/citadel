@@ -22,6 +22,7 @@ use citadel_spore::{Spore, U256};
 use citadel_topology::{spiral3d_to_coord, Direction, HexCoord, Neighbors, Spiral3DIndex};
 use citadel_ygg::{query_self_sync, YggMetricsStore};
 use ed25519_dalek::SigningKey;
+use rand::Rng;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -37,6 +38,10 @@ use super::peer::{compute_peer_id, compute_peer_id_from_bytes, double_hash_id, A
 use super::peer_addr_store::PeerAddrRecord;
 use super::slot::{consensus_threshold, SlotClaim};
 use super::spore::{build_spore_havelist, release_id_to_u256};
+use super::switchboard::{
+    connect_switchboard, read_json_line, switchboard_port_for_mesh_port, SwitchboardControl,
+    SwitchboardMessage, SwitchboardOutcome,
+};
 use super::state::MeshState;
 use super::tgp::TgpSession;
 
@@ -88,10 +93,248 @@ pub struct MeshService {
     traffic_stats: Arc<super::state::TrafficStats>,
     /// Cached Yggdrasil link metrics from admin socket queries.
     ygg_metrics: Arc<RwLock<YggMetricsStore>>,
+    /// Control channel for pausing/resuming the switchboard listener around
+    /// anycast bootstrap dials.
+    switchboard_ctl: Arc<RwLock<Option<mpsc::UnboundedSender<SwitchboardControl>>>>,
 }
 
 impl MeshService {
     const STALE_PEER_SECS: u64 = 120;
+
+    fn switchboard_listen_addr(&self) -> SocketAddr {
+        SocketAddr::new(
+            self.listen_addr.ip(),
+            switchboard_port_for_mesh_port(self.listen_addr.port()),
+        )
+    }
+
+    fn redirect_host_for_peer(peer: &MeshPeer) -> Option<String> {
+        peer.underlay_uri
+            .as_deref()
+            .map(super::transport::extract_host_from_uri)
+            .or_else(|| {
+                let ip = peer.addr.ip();
+                (!ip.is_unspecified() && !ip.is_loopback()).then(|| ip.to_string())
+            })
+    }
+
+    async fn switchboard_decision_for_want(
+        &self,
+        want: &str,
+    ) -> (Option<String>, Option<(String, String, u16)>) {
+        let state = self.state.read().await;
+        let self_id = state.self_id.clone();
+        let self_slot = state.self_slot.as_ref().map(|slot| slot.index);
+
+        if want == "any" {
+            return (Some(self_id), None);
+        }
+
+        if let Some(target_peer_id) = want.strip_prefix("peer:") {
+            if target_peer_id == self_id {
+                return (Some(self_id), None);
+            }
+
+            if let Some(peer) = state.peers.get(target_peer_id) {
+                if let Some(host) = Self::redirect_host_for_peer(peer) {
+                    return (
+                        None,
+                        Some((target_peer_id.to_string(), host, peer.addr.port())),
+                    );
+                }
+            }
+
+            // "Any point of entry" fallback: if we don't know the exact route,
+            // still attach the joiner to the mesh via this responder.
+            return (Some(self_id), None);
+        }
+
+        if let Some(slot_str) = want.strip_prefix("spiral_slot:") {
+            if let Ok(target_slot) = slot_str.parse::<u64>() {
+                if self_slot == Some(target_slot) {
+                    return (Some(self_id), None);
+                }
+
+                if let Some(peer) = state
+                    .peers
+                    .values()
+                    .find(|peer| peer.slot.as_ref().map(|slot| slot.index) == Some(target_slot))
+                {
+                    if let Some(host) = Self::redirect_host_for_peer(peer) {
+                        return (None, Some((peer.id.clone(), host, peer.addr.port())));
+                    }
+                }
+            }
+        }
+
+        (Some(self_id), None)
+    }
+
+    async fn try_switchboard_connect(
+        &self,
+        host: &str,
+        mesh_port: u16,
+        want: &str,
+        attempts: usize,
+        pause_local_listener: bool,
+    ) -> std::io::Result<Option<(TcpStream, SocketAddr)>> {
+        let our_peer_id = self.state.read().await.self_id.clone();
+        let mut dial_host = host.to_string();
+        let mut dial_mesh_port = mesh_port;
+        let mut dial_want = want.to_string();
+        let max_attempts = attempts.max(1);
+
+        for _ in 0..max_attempts {
+            if pause_local_listener {
+                let jitter_ms = rand::thread_rng().gen_range(25..125);
+                tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
+            }
+
+            let paused = if pause_local_listener {
+                self.pause_switchboard_listener().await
+            } else {
+                false
+            };
+
+            let outcome =
+                connect_switchboard(&dial_host, dial_mesh_port, &our_peer_id, &dial_want).await;
+
+            if paused {
+                self.resume_switchboard_listener().await;
+            }
+
+            match outcome {
+                Ok(SwitchboardOutcome::Ready(stream, addr)) => return Ok(Some((stream, addr))),
+                Ok(SwitchboardOutcome::SelfDetected) => {
+                    dial_host = host.to_string();
+                    dial_mesh_port = mesh_port;
+                    dial_want = want.to_string();
+                    continue;
+                }
+                Ok(SwitchboardOutcome::DirectRedirect {
+                    target_peer_id,
+                    dial_host: next_host,
+                    mesh_port: next_mesh_port,
+                }) => {
+                    dial_host = next_host;
+                    dial_mesh_port = next_mesh_port;
+                    dial_want = format!("peer:{target_peer_id}");
+                }
+                Err(e)
+                    if pause_local_listener
+                        && matches!(
+                            e.kind(),
+                            std::io::ErrorKind::ConnectionRefused
+                                | std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::TimedOut
+                        ) =>
+                {
+                    debug!(
+                        "Switchboard bootstrap dial to {}:{} self-hit via kernel reset/refusal: {}",
+                        host, mesh_port, e
+                    );
+                    dial_host = host.to_string();
+                    dial_mesh_port = mesh_port;
+                    dial_want = want.to_string();
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        Ok(None)
+    }
+
+    async fn pause_switchboard_listener(&self) -> bool {
+        let ctl = { self.switchboard_ctl.read().await.clone() };
+        let Some(ctl) = ctl else {
+            return false;
+        };
+
+        let (ack_tx, ack_rx) = oneshot::channel();
+        if ctl.send(SwitchboardControl::Pause(ack_tx)).is_err() {
+            return false;
+        }
+
+        ack_rx.await.is_ok()
+    }
+
+    async fn resume_switchboard_listener(&self) {
+        let ctl = { self.switchboard_ctl.read().await.clone() };
+        let Some(ctl) = ctl else {
+            return;
+        };
+
+        let (ack_tx, ack_rx) = oneshot::channel();
+        if ctl.send(SwitchboardControl::Resume(ack_tx)).is_err() {
+            return;
+        }
+
+        let _ = ack_rx.await;
+    }
+
+    async fn handle_switchboard_connection(
+        self: &Arc<Self>,
+        mut stream: TcpStream,
+        addr: SocketAddr,
+    ) -> Result<()> {
+        let request_line = match read_json_line(&mut stream, std::time::Duration::from_secs(5)).await {
+            Ok(Some(line)) => line,
+            Ok(None) => return Ok(()),
+            Err(e) => return Err(crate::error::Error::Protocol(format!("switchboard read failed: {e}"))),
+        };
+
+        let (my_peer_id, want) = match SwitchboardMessage::from_line(&request_line) {
+            Ok(SwitchboardMessage::PeerRequest { my_peer_id, want }) => (my_peer_id, want),
+            Ok(other) => {
+                return Err(crate::error::Error::Protocol(format!(
+                    "switchboard expected peer_request, got {other:?}"
+                )))
+            }
+            Err(e) => {
+                return Err(crate::error::Error::Protocol(format!(
+                    "switchboard invalid request: {e}"
+                )))
+            }
+        };
+
+        let (self_id, self_slot) = {
+            let state = self.state.read().await;
+            (state.self_id.clone(), state.self_slot.as_ref().map(|slot| slot.index))
+        };
+
+        if my_peer_id == self_id {
+            debug!("Switchboard self-hit from {} for want={} - closing silently", addr, want);
+            return Ok(());
+        }
+
+        let hello = SwitchboardMessage::SwitchboardHello {
+            peer_id: self_id.clone(),
+            spiral_slot: self_slot,
+        };
+        use tokio::io::AsyncWriteExt as _;
+        stream.write_all(hello.to_line()?.as_bytes()).await?;
+
+        let (ready_peer_id, redirect) = self.switchboard_decision_for_want(&want).await;
+        if let Some(peer_id) = ready_peer_id {
+            let ready = SwitchboardMessage::PeerReady { peer_id };
+            stream.write_all(ready.to_line()?.as_bytes()).await?;
+            return self.handle_connection(stream, addr, false).await;
+        }
+
+        if let Some((target_peer_id, dial_host, mesh_port)) = redirect {
+            let redirect = SwitchboardMessage::PeerRedirect {
+                target_peer_id,
+                method: "direct".into(),
+                dial_host: Some(dial_host),
+                mesh_port: Some(mesh_port),
+            };
+            stream.write_all(redirect.to_line()?.as_bytes()).await?;
+            return Ok(());
+        }
+
+        Ok(())
+    }
 
     fn active_peer_count(state: &MeshState, active_peer_ids: &HashSet<String>) -> usize {
         state
@@ -676,6 +919,7 @@ impl MeshService {
             // Traffic statistics for aggregate logging (instead of per-packet spam)
             traffic_stats: Arc::new(super::state::TrafficStats::new()),
             ygg_metrics: Arc::new(RwLock::new(YggMetricsStore::new())),
+            switchboard_ctl: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -2407,6 +2651,74 @@ impl MeshService {
         // Start TCP listener for incoming connections
         let listener = TcpListener::bind(self.listen_addr).await?;
         info!("Mesh P2P (TCP) listening on {}", self.listen_addr);
+        let switchboard_addr = self.switchboard_listen_addr();
+        let switchboard_listener = TcpListener::bind(switchboard_addr).await?;
+        info!("Mesh switchboard listening on {}", switchboard_addr);
+        let (switchboard_ctl_tx, mut switchboard_ctl_rx) =
+            mpsc::unbounded_channel::<SwitchboardControl>();
+        {
+            let mut ctl = self.switchboard_ctl.write().await;
+            *ctl = Some(switchboard_ctl_tx);
+        }
+        let self_clone = Arc::clone(&self);
+        tokio::spawn(async move {
+            let mut switchboard_listener = Some(switchboard_listener);
+
+            loop {
+                if let Some(listener) = switchboard_listener.as_mut() {
+                    tokio::select! {
+                        switchboard_accept = listener.accept() => {
+                            match switchboard_accept {
+                                Ok((stream, addr)) => {
+                                    debug!("Incoming switchboard connection from {}", addr);
+                                    let self_clone = Arc::clone(&self_clone);
+                                    tokio::spawn(async move {
+                                        if let Err(e) = self_clone.handle_switchboard_connection(stream, addr).await {
+                                            debug!("Switchboard error from {}: {}", addr, e);
+                                        }
+                                    });
+                                }
+                                Err(e) => {
+                                    error!("Switchboard accept error: {}", e);
+                                }
+                            }
+                        }
+                        ctl = switchboard_ctl_rx.recv() => {
+                            match ctl {
+                                Some(SwitchboardControl::Pause(ack_tx)) => {
+                                    switchboard_listener = None;
+                                    let _ = ack_tx.send(());
+                                    debug!("Switchboard paused (listener dropped)");
+                                }
+                                Some(SwitchboardControl::Resume(ack_tx)) => {
+                                    let _ = ack_tx.send(());
+                                }
+                                None => break,
+                            }
+                        }
+                    }
+                } else {
+                    match switchboard_ctl_rx.recv().await {
+                        Some(SwitchboardControl::Pause(ack_tx)) => {
+                            let _ = ack_tx.send(());
+                        }
+                        Some(SwitchboardControl::Resume(ack_tx)) => {
+                            match TcpListener::bind(switchboard_addr).await {
+                                Ok(listener) => {
+                                    switchboard_listener = Some(listener);
+                                    debug!("Switchboard resumed (listener rebound)");
+                                }
+                                Err(e) => {
+                                    error!("Switchboard rebind error: {}", e);
+                                }
+                            }
+                            let _ = ack_tx.send(());
+                        }
+                        None => break,
+                    }
+                }
+            }
+        });
 
         // Spawn task to initialize consensus state and connect to entry peers.
         let self_clone = Arc::clone(&self);
@@ -2564,8 +2876,50 @@ impl MeshService {
                             return;
                         };
 
-                        match TcpStream::connect(&addr).await {
-                            Ok(stream) => {
+                        let asp_host = known_peer
+                            .as_ref()
+                            .and_then(Self::redirect_host_for_peer)
+                            .or_else(|| {
+                                let ip = addr_hint.ip();
+                                (!ip.is_unspecified() && !ip.is_loopback()).then(|| ip.to_string())
+                            });
+
+                        let asp_stream = if let Some(host) = asp_host {
+                            match self_clone
+                                .try_switchboard_connect(
+                                    &host,
+                                    addr.port(),
+                                    &format!("peer:{discovered_id}"),
+                                    2,
+                                    false,
+                                )
+                                .await
+                            {
+                                Ok(stream) => stream,
+                                Err(e) => {
+                                    debug!(
+                                        "Switchboard connect to discovered peer {} via {} failed: {}",
+                                        discovered_id, host, e
+                                    );
+                                    None
+                                }
+                            }
+                        } else {
+                            None
+                        };
+
+                        match asp_stream {
+                            Some((stream, connected_addr)) => {
+                                debug!(
+                                    "Connected to discovered peer {} via switchboard {}",
+                                    discovered_id, connected_addr
+                                );
+                                if let Err(e) = self_clone.handle_connection(stream, connected_addr, false).await {
+                                    debug!("Discovered peer {} connection closed: {}", discovered_id, e);
+                                }
+                            }
+                            None => match TcpStream::connect(&addr).await {
+                                Ok(stream) => {
                                 debug!(
                                     "Connected to discovered peer {} via Ygg {} (hint {})",
                                     discovered_id, addr, addr_hint
@@ -2575,8 +2929,9 @@ impl MeshService {
                                     debug!("Discovered peer {} connection closed: {}", discovered_id, e);
                                 }
                             }
-                            Err(e) => {
-                                debug!("Failed to connect to discovered peer {}: {}", discovered_id, e);
+                                Err(e) => {
+                                    debug!("Failed to connect to discovered peer {}: {}", discovered_id, e);
+                                }
                             }
                         }
                     });
@@ -2591,6 +2946,39 @@ impl MeshService {
 
         for peer_addr in &self.entry_peers {
             info!("Connecting to peer: {}", peer_addr);
+
+            let (host, mesh_port) = super::transport::extract_host_and_port(peer_addr, self.listen_addr.port());
+            let mut allow_direct_fallback = true;
+            match self
+                .try_switchboard_connect(&host, mesh_port, "any", 3, true)
+                .await
+            {
+                Ok(Some((stream, connected_addr))) => {
+                    info!(
+                        "Connected to entry peer {} via switchboard {}",
+                        peer_addr, connected_addr
+                    );
+                    connected += 1;
+                    let self_clone = Arc::clone(self);
+                    tokio::spawn(async move {
+                        if let Err(e) = self_clone.handle_connection(stream, connected_addr, true).await {
+                            warn!("Entry peer {} disconnected: {}", connected_addr, e);
+                        }
+                    });
+                    continue;
+                }
+                Ok(None) => {
+                    debug!("Switchboard self-hit or redirect exhaustion for {}", peer_addr);
+                    allow_direct_fallback = false;
+                }
+                Err(e) => {
+                    debug!("Switchboard connect to {} failed: {}", peer_addr, e);
+                }
+            }
+
+            if !allow_direct_fallback {
+                continue;
+            }
 
             let candidate_addrs = super::transport::resolve_entry_peer_targets(
                 peer_addr,
@@ -3042,16 +3430,29 @@ impl MeshService {
                             break;
                         }
                         Ok(_) => {
-                            if let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line) {
-                                // handle_message returns (real_id, peers_to_connect)
-                                if let Ok((real_id, peers_to_connect)) = self.handle_message(&current_peer_key, msg).await {
-                                    if let Some(id) = real_id {
-                                        current_peer_key = id;
+                            if line.trim().is_empty() {
+                                continue;
+                            }
+                            match serde_json::from_str::<serde_json::Value>(&line) {
+                                Ok(msg) => {
+                                    // handle_message returns (real_id, peers_to_connect)
+                                    if let Ok((real_id, peers_to_connect)) = self.handle_message(&current_peer_key, msg).await {
+                                        if let Some(id) = real_id {
+                                            current_peer_key = id;
+                                        }
+                                        // Queue discovered peers for connection (spawned by listener)
+                                        for (discovered_id, addr) in peers_to_connect {
+                                            let _ = self.pending_connect_tx.send((discovered_id, addr)).await;
+                                        }
                                     }
-                                    // Queue discovered peers for connection (spawned by listener)
-                                    for (discovered_id, addr) in peers_to_connect {
-                                        let _ = self.pending_connect_tx.send((discovered_id, addr)).await;
-                                    }
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "Failed to parse peer JSON from {}: {} ({} bytes)",
+                                        current_peer_key,
+                                        e,
+                                        line.len()
+                                    );
                                 }
                             }
                         }
@@ -3268,6 +3669,11 @@ impl MeshService {
                             });
                             let _ = writer.write_all(flood_msg.to_string().as_bytes()).await;
                             let _ = writer.write_all(b"\n").await;
+                            debug!(
+                                "Forwarded release_flood to peer {} ({} bytes)",
+                                current_peer_key,
+                                release_json.len()
+                            );
                         }
                         Ok(FloodMessage::DoNotWantList { peer_id, do_not_want }) => {
                             // SPORE⁻¹: Send deletion ranges directly as Spore
@@ -4254,6 +4660,11 @@ impl MeshService {
                                 }
                             }
                         }
+                    } else {
+                        warn!(
+                            "Failed to deserialize release_flood from {}: {:?}",
+                            peer_id, release_data
+                        );
                     }
                 }
             }
