@@ -3,6 +3,8 @@
 .claude/
 .palace/
 target/
+proofs/
+papers/
 lens-data/
 docker/haproxy.cfg
 docker/__pycache__/
