@@ -9,7 +9,7 @@ primary_region = "iad"
   LENS_API_BIND = "[::]:8080"
   LENS_P2P_BIND = "[::]:9000"
   RUST_LOG = "lens_node=info,citadel_lens=info"
-  CITADEL_PEERS = ""
+  CITADEL_PEERS = "109.105.216.123:9000"
 
 [http_service]
   internal_port = 8080

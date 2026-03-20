@@ -15,6 +15,7 @@ And finally
 * **NO SLEEPS. NO POLLING. NO DELAYS.** - Sleeps, waits, and polling are ANTIPATTERNS and EXPRESSLY FORBIDDEN everywhere, including test scripts. Use async event-driven patterns ONLY.
 * No "FOR NOW" compromises - Do it right or don't do it
 * No "TODO" or "SIMPLIFIED IMPLEMENTATION" - Complete implementations only
+* **NO .internal ADDRESSES FOR MESH ENTRY PEERS** - Nodes use the PUBLIC IPv4 ANYCAST ADDRESS via APE (Any Point of Entry). The switchboard on port 9443 handles routing. This is non-negotiable. `.internal` is NOT the entry path.
 
 ## CVDF - Cooperative VDF (NOT "Cluster", "Chained", "Collaborative", etc.)
 

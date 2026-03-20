@@ -3034,9 +3034,10 @@ impl MeshService {
 
     /// Connect to bootstrap peers via switchboard half-dial protocol.
     ///
-    /// Entry peers are switchboard addresses (host:port where port is the
-    /// switchboard port, typically 9443). The switchboard handles peer discovery
-    /// and routing — on PeerReady the TCP stream continues as a normal mesh session.
+    /// Entry peers are anycast switchboard addresses. Since WE are part of the
+    /// anycast group, we pause our own switchboard listener before dialing so
+    /// the kernel RSTs SYNs routed back to us and Fly forwards to another machine.
+    /// Multiple attempts handle the case where anycast keeps routing to self.
     async fn connect_to_entry_peers(self: &Arc<Self>) -> usize {
         let mut connected = 0;
         let our_peer_id = self.self_id().await;
@@ -3046,48 +3047,74 @@ impl MeshService {
 
             let (host, mesh_port) = super::transport::extract_host_and_port(peer_addr, self.listen_addr.port());
 
-            match connect_switchboard(&host, mesh_port, &our_peer_id, "any").await {
-                Ok(SwitchboardOutcome::Ready(stream, addr)) => {
-                    info!("Connected to entry peer {} via switchboard ({})", peer_addr, addr);
-                    connected += 1;
-                    let self_clone = Arc::clone(self);
-                    tokio::spawn(async move {
-                        if let Err(e) = self_clone.handle_connection(stream, addr, true).await {
-                            warn!("Entry peer {} disconnected: {}", addr, e);
-                        }
-                    });
+            // Try up to 3 times — anycast may route to self on first attempts.
+            // Pausing our switchboard listener makes the kernel RST self-routed SYNs
+            // so Fly forwards to the next machine.
+            let mut attempt_connected = false;
+            for attempt in 0..3 {
+                // Pause our switchboard so self-routed SYNs get kernel RST
+                let paused = self.pause_switchboard_listener().await;
+
+                let result = connect_switchboard(&host, mesh_port, &our_peer_id, "any").await;
+
+                // Resume immediately after dial completes
+                if paused {
+                    self.resume_switchboard_listener().await;
                 }
-                Ok(SwitchboardOutcome::DirectRedirect { target_peer_id, dial_host, mesh_port: redir_port }) => {
-                    // Switchboard told us to dial a specific peer directly
-                    info!("Switchboard redirected to {} at {}:{}", target_peer_id, dial_host, redir_port);
-                    match connect_switchboard(&dial_host, redir_port, &our_peer_id, &format!("peer:{}", target_peer_id)).await {
-                        Ok(SwitchboardOutcome::Ready(stream, addr)) => {
-                            info!("Connected to redirected peer {} at {}", target_peer_id, addr);
-                            connected += 1;
-                            let self_clone = Arc::clone(self);
-                            tokio::spawn(async move {
-                                if let Err(e) = self_clone.handle_connection(stream, addr, true).await {
-                                    warn!("Redirected peer {} disconnected: {}", addr, e);
-                                }
-                            });
+
+                match result {
+                    Ok(SwitchboardOutcome::Ready(stream, addr)) => {
+                        info!("Connected to entry peer {} via switchboard ({}) on attempt {}", peer_addr, addr, attempt);
+                        connected += 1;
+                        attempt_connected = true;
+                        let self_clone = Arc::clone(self);
+                        tokio::spawn(async move {
+                            if let Err(e) = self_clone.handle_connection(stream, addr, true).await {
+                                warn!("Entry peer {} disconnected: {}", addr, e);
+                            }
+                        });
+                        break;
+                    }
+                    Ok(SwitchboardOutcome::DirectRedirect { target_peer_id, dial_host, mesh_port: redir_port }) => {
+                        info!("Switchboard redirected to {} at {}:{}", target_peer_id, dial_host, redir_port);
+                        // Redirect target is a specific host — no pause needed
+                        match connect_switchboard(&dial_host, redir_port, &our_peer_id, &format!("peer:{}", target_peer_id)).await {
+                            Ok(SwitchboardOutcome::Ready(stream, addr)) => {
+                                info!("Connected to redirected peer {} at {}", target_peer_id, addr);
+                                connected += 1;
+                                attempt_connected = true;
+                                let self_clone = Arc::clone(self);
+                                tokio::spawn(async move {
+                                    if let Err(e) = self_clone.handle_connection(stream, addr, true).await {
+                                        warn!("Redirected peer {} disconnected: {}", addr, e);
+                                    }
+                                });
+                            }
+                            Ok(SwitchboardOutcome::SelfDetected) => {
+                                debug!("Self-detected on redirect to {}", target_peer_id);
+                            }
+                            Ok(SwitchboardOutcome::DirectRedirect { .. }) => {
+                                warn!("Double redirect from switchboard — giving up");
+                            }
+                            Err(e) => {
+                                debug!("Redirect dial to {} failed: {}", dial_host, e);
+                            }
                         }
-                        Ok(SwitchboardOutcome::SelfDetected) => {
-                            debug!("Self-detected on redirect to {}", target_peer_id);
-                        }
-                        Ok(SwitchboardOutcome::DirectRedirect { .. }) => {
-                            warn!("Double redirect from switchboard — giving up");
-                        }
-                        Err(e) => {
-                            debug!("Redirect dial to {} failed: {}", dial_host, e);
-                        }
+                        break;
+                    }
+                    Ok(SwitchboardOutcome::SelfDetected) => {
+                        debug!("Switchboard self-detected for {} attempt {} — retrying", peer_addr, attempt);
+                        continue; // Retry — anycast will route to different machine
+                    }
+                    Err(e) => {
+                        warn!("Switchboard connect to {} failed: {}", peer_addr, e);
+                        break;
                     }
                 }
-                Ok(SwitchboardOutcome::SelfDetected) => {
-                    debug!("Switchboard self-detected for {} (anycast routed to self)", peer_addr);
-                }
-                Err(e) => {
-                    warn!("Switchboard connect to {} failed: {}", peer_addr, e);
-                }
+            }
+
+            if !attempt_connected {
+                warn!("Failed to connect to entry peer {} after retries", peer_addr);
             }
         }
 
