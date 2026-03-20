@@ -30,7 +30,7 @@ use tracing::{debug, trace, warn};
 use two_generals::{
     crypto::{KeyPair, PublicKey},
     types::Party,
-    Message, ProtocolState, QuadProof,
+    Message, ProtocolState, QuadProof, TripleProof,
 };
 
 use crate::error::{Error, Result};
@@ -487,8 +487,28 @@ impl PeerCoordinator {
         Ok(advanced)
     }
 
-    /// Get the bilateral receipt if coordination is complete.
+    /// Get the bilateral triple proof pair (6-packet model).
+    ///
+    /// Returns the (own_triple, other_triple) pair if coordination is complete.
+    /// This is the correct API for the 6-packet bilateral construction model.
     #[must_use]
+    pub fn get_bilateral_triple(&self) -> Option<(&TripleProof, &TripleProof)> {
+        if self.is_coordinated() {
+            self.protocol.get_bilateral_triple()
+        } else {
+            None
+        }
+    }
+
+    /// Get the bilateral receipt if coordination is complete.
+    ///
+    /// **Deprecated**: Use [`get_bilateral_triple`](Self::get_bilateral_triple) for the 6-packet model.
+    #[must_use]
+    #[deprecated(
+        since = "0.2.0",
+        note = "Use get_bilateral_triple() for the 6-packet model"
+    )]
+    #[allow(deprecated)]
     pub fn get_bilateral_receipt(&self) -> Option<(&QuadProof, &QuadProof)> {
         if self.is_coordinated() {
             self.protocol.get_bilateral_receipt()
@@ -642,9 +662,9 @@ mod tests {
         assert!(alice.can_proceed());
         assert!(bob.can_proceed());
 
-        // Verify bilateral receipts
-        assert!(alice.get_bilateral_receipt().is_some());
-        assert!(bob.get_bilateral_receipt().is_some());
+        // Verify bilateral triples (6-packet model)
+        assert!(alice.get_bilateral_triple().is_some());
+        assert!(bob.get_bilateral_triple().is_some());
 
         // Verify packets were sent
         assert!(alice.packet_count() > 0);
