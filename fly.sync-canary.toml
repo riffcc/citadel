@@ -1,0 +1,63 @@
+app = "citadel-sync-canary"
+primary_region = "ord"
+
+[build]
+  dockerfile = "Dockerfile.fly"
+
+[env]
+  LENS_DATA_DIR = "/data"
+  LENS_API_BIND = "0.0.0.0:8080"
+  LENS_P2P_BIND = "0.0.0.0:9000"
+  RUST_LOG = "lens_node=info,citadel_lens=info,citadel_lens::mesh::service=debug,citadel_lens::mesh::transport=debug"
+  CITADEL_PEERS = "66.241.124.2:9000"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [http_service.concurrency]
+    type = "connections"
+    hard_limit = 250
+    soft_limit = 200
+
+[[services]]
+  protocol = "tcp"
+  internal_port = 9000
+
+  [[services.ports]]
+    port = 9000
+
+[[services]]
+  protocol = "udp"
+  internal_port = 9000
+
+  [[services.ports]]
+    port = 9000
+
+[[services]]
+  protocol = "tcp"
+  internal_port = 9443
+
+  [[services.ports]]
+    port = 9443
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = 256
+
+[mounts]
+  source = "citadel_data"
+  destination = "/data"
+
+[checks]
+  [checks.health]
+    port = 8080
+    type = "http"
+    interval = "15s"
+    timeout = "5s"
+    grace_period = "30s"
+    method = "GET"
+    path = "/health"
