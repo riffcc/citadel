@@ -200,6 +200,43 @@ impl std::fmt::Display for ReleaseStatus {
     }
 }
 
+/// A named content variant for a release.
+///
+/// This lets a single release expose a quality ladder or alternate delivery
+/// formats while keeping one primary compatibility CID.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReleaseQuality {
+    /// Stable tier key, e.g. "master", "lossless", "opus_192", "1080p".
+    pub key: String,
+    /// CID for this quality variant.
+    pub cid: String,
+    /// Optional human-friendly label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Optional container hint, e.g. "mp4", "flac", "opus".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container: Option<String>,
+    /// Optional codec hint, e.g. "h264", "aac", "flac".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codec: Option<String>,
+    /// Optional provenance hint, e.g. "master", "lossless", "transcode".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// Optional quality rank; higher is better.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rank: Option<i32>,
+    /// Optional approximate bitrate in kbps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bitrate_kbps: Option<u32>,
+    /// Optional video width.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    /// Optional video height.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+}
+
 /// A release in the Lens ecosystem.
 ///
 /// Represents any distributable content unit: music album, movie, TV series,
@@ -238,6 +275,10 @@ pub struct Release {
     /// Content Identifier (CID) for the actual content
     #[serde(rename = "contentCID", alias = "content_cid")]
     pub content_cid: Option<String>,
+
+    /// Additional named content variants / quality ladder entries.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub qualities: Vec<ReleaseQuality>,
 
     /// Description/synopsis
     pub description: Option<String>,
@@ -311,6 +352,7 @@ impl Release {
             category_id,
             thumbnail_cid: None,
             content_cid: None,
+            qualities: Vec::new(),
             description: None,
             tags: Vec::new(),
             schema_version: default_schema_version(),
@@ -398,6 +440,34 @@ impl Release {
         if let Some(content) = &self.content_cid {
             hasher.update(content.as_bytes());
         }
+        for quality in &self.qualities {
+            hasher.update(quality.key.as_bytes());
+            hasher.update(quality.cid.as_bytes());
+            if let Some(label) = &quality.label {
+                hasher.update(label.as_bytes());
+            }
+            if let Some(container) = &quality.container {
+                hasher.update(container.as_bytes());
+            }
+            if let Some(codec) = &quality.codec {
+                hasher.update(codec.as_bytes());
+            }
+            if let Some(source) = &quality.source {
+                hasher.update(source.as_bytes());
+            }
+            if let Some(rank) = quality.rank {
+                hasher.update(&rank.to_le_bytes());
+            }
+            if let Some(bitrate_kbps) = quality.bitrate_kbps {
+                hasher.update(&bitrate_kbps.to_le_bytes());
+            }
+            if let Some(width) = quality.width {
+                hasher.update(&width.to_le_bytes());
+            }
+            if let Some(height) = quality.height {
+                hasher.update(&height.to_le_bytes());
+            }
+        }
         if let Some(description) = &self.description {
             hasher.update(description.as_bytes());
         }
@@ -464,6 +534,54 @@ impl Release {
             (None, None) => false,
         }
     }
+
+    /// Populate the legacy primary content CID from the quality list if needed.
+    pub fn ensure_primary_content_cid(&mut self) {
+        if self.content_cid.is_none() {
+            self.content_cid = self.primary_quality_cid();
+        }
+    }
+
+    /// Pick the best available quality CID using explicit rank first, then heuristics.
+    pub fn primary_quality_cid(&self) -> Option<String> {
+        self.qualities
+            .iter()
+            .max_by_key(|quality| {
+                (
+                    quality.rank.unwrap_or_else(|| default_quality_rank(&quality.key)),
+                    quality.height.unwrap_or(0),
+                    quality.width.unwrap_or(0),
+                    quality.bitrate_kbps.unwrap_or(0),
+                )
+            })
+            .map(|quality| quality.cid.clone())
+    }
+}
+
+fn default_quality_rank(key: &str) -> i32 {
+    match key {
+        "master" => 10_000,
+        "24bit_lossless" => 9_600,
+        "lossless" => 9_500,
+        "2160p" => 9_400,
+        "1440p" => 9_200,
+        "1080p" => 9_000,
+        "720p" => 8_800,
+        "480p" => 8_600,
+        "360p" => 8_400,
+        "opus_320" => 8_300,
+        "opus_256" => 8_200,
+        "mp3_320" => 8_100,
+        "opus_192" => 8_000,
+        "mp3_v0" => 7_950,
+        "mobile" => 7_900,
+        "opus_128" => 7_800,
+        "mp3_256" => 7_700,
+        "mp3_192" => 7_600,
+        "aac" => 7_500,
+        "mp3_128" => 7_400,
+        _ => 0,
+    }
 }
 
 #[cfg(test)]
@@ -501,6 +619,18 @@ mod tests {
             category_slug: Some("music".to_string()),
             thumbnail_cid: None,
             content_cid: Some("QmContentCid".to_string()),
+            qualities: vec![ReleaseQuality {
+                key: "lossless".to_string(),
+                cid: "QmContentCid".to_string(),
+                label: Some("Lossless".to_string()),
+                container: Some("flac".to_string()),
+                codec: Some("flac".to_string()),
+                source: Some("master".to_string()),
+                rank: Some(9500),
+                bitrate_kbps: None,
+                width: None,
+                height: None,
+            }],
             description: Some("A test release".to_string()),
             tags: vec!["rock".to_string(), "indie".to_string()],
             schema_version: "1.0.0".to_string(),
@@ -659,6 +789,44 @@ mod tests {
         assert_eq!(merged.title, release.title);
         assert_eq!(merged.modified_at, release.modified_at);
     }
+
+    #[test]
+    fn primary_content_cid_falls_back_to_best_quality() {
+        let mut release = Release::new(
+            "release-123".to_string(),
+            "Test Title".to_string(),
+            "music".to_string(),
+        );
+        release.qualities = vec![
+            ReleaseQuality {
+                key: "opus_192".to_string(),
+                cid: "cid-opus".to_string(),
+                label: None,
+                container: Some("opus".to_string()),
+                codec: Some("opus".to_string()),
+                source: Some("lossless".to_string()),
+                rank: None,
+                bitrate_kbps: Some(192),
+                width: None,
+                height: None,
+            },
+            ReleaseQuality {
+                key: "lossless".to_string(),
+                cid: "cid-lossless".to_string(),
+                label: None,
+                container: Some("flac".to_string()),
+                codec: Some("flac".to_string()),
+                source: Some("master".to_string()),
+                rank: None,
+                bitrate_kbps: None,
+                width: None,
+                height: None,
+            },
+        ];
+
+        release.ensure_primary_content_cid();
+        assert_eq!(release.content_cid, Some("cid-lossless".to_string()));
+    }
 }
 
 // ============================================================================
@@ -699,6 +867,7 @@ impl TotalMerge for Release {
             category_slug: newer.category_slug.clone(),
             thumbnail_cid: newer.thumbnail_cid.clone(),
             content_cid: newer.content_cid.clone(),
+            qualities: newer.qualities.clone(),
             description: newer.description.clone(),
             tags: newer.tags.clone(),
             schema_version: newer.schema_version.clone(),

@@ -319,6 +319,7 @@ fn make_release(id: &str, title: &str) -> Release {
         category_slug: Some("music".to_string()),
         thumbnail_cid: None,
         content_cid: None,
+        qualities: Vec::new(),
         description: Some(format!("Description for {}", title)),
         tags: vec!["test".to_string()],
         schema_version: "1.0.0".to_string(),

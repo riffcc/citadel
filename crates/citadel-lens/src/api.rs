@@ -2,7 +2,9 @@
 
 use crate::admin_socket;
 use crate::mesh::{double_hash_id, FloodMessage};
-use crate::models::{Category, FeaturedRelease, Release, ReleaseStatus, RendererMode, SiteManifest};
+use crate::models::{
+    Category, FeaturedRelease, Release, ReleaseQuality, ReleaseStatus, RendererMode, SiteManifest,
+};
 use crate::node::LensState;
 use crate::ws::ws_mesh_handler;
 use crate::ws_admin;
@@ -448,6 +450,8 @@ struct CreateReleaseRequest {
     /// Content CID (optional)
     #[serde(alias = "content_cid", alias = "contentCID")]
     content_cid: Option<String>,
+    /// Optional named quality variants for this release
+    qualities: Option<Vec<ReleaseQuality>>,
     /// Thumbnail CID (optional)
     #[serde(alias = "thumbnail_cid", alias = "thumbnailCID")]
     thumbnail_cid: Option<String>,
@@ -565,8 +569,10 @@ async fn create_release(
     release.description = req.description;
     release.tags = req.tags.unwrap_or_default();
     release.content_cid = req.content_cid;
+    release.qualities = req.qualities.unwrap_or_default();
     release.thumbnail_cid = req.thumbnail_cid;
     release.metadata = req.metadata;
+    release.ensure_primary_content_cid();
 
     // Set status if provided (admin can create as pending for moderation queue)
     if let Some(status_str) = req.status {
@@ -665,6 +671,8 @@ struct UpdateReleaseRequest {
     /// Content CID (frontend sends contentCID)
     #[serde(alias = "contentCID")]
     content_cid: Option<String>,
+    /// Optional named quality variants for this release
+    qualities: Option<Vec<ReleaseQuality>>,
     /// Thumbnail CID (frontend sends thumbnailCID)
     #[serde(alias = "thumbnailCID")]
     thumbnail_cid: Option<String>,
@@ -794,6 +802,9 @@ async fn update_release(
     if let Some(content_cid) = req.content_cid {
         release.content_cid = Some(content_cid);
     }
+    if let Some(qualities) = req.qualities {
+        release.qualities = qualities;
+    }
     if let Some(thumbnail_cid) = req.thumbnail_cid {
         release.thumbnail_cid = Some(thumbnail_cid);
     }
@@ -817,6 +828,7 @@ async fn update_release(
             release.metadata = Some(new_metadata);
         }
     }
+    release.ensure_primary_content_cid();
 
     // Update modified_at for LWW merge semantics
     release.modified_at = chrono::Utc::now().to_rfc3339();
