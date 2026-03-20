@@ -1315,8 +1315,10 @@ impl MeshService {
         state.cvdf = Some(cvdf);
         drop(state); // Release lock before notify
 
-        // Signal that CVDF is ready - unblocks the coordination loop
-        self.cvdf_init_notify.notify_waiters();
+        // Signal that CVDF is ready - unblocks the coordination loop.
+        // notify_one() stores a permit even if the loop hasn't registered yet,
+        // preventing a race where init completes before the loop starts waiting.
+        self.cvdf_init_notify.notify_one();
     }
 
     /// Initialize CVDF by joining existing swarm
@@ -1340,7 +1342,7 @@ impl MeshService {
                 info!("CVDF joined (height {}, weight {})", height, weight);
                 state.cvdf = Some(cvdf);
                 drop(state);
-                self.cvdf_init_notify.notify_waiters();
+                self.cvdf_init_notify.notify_one();
                 true
             }
             None => {
@@ -1423,6 +1425,73 @@ impl MeshService {
         Some((rounds, claims))
     }
 
+    /// Check if we should adopt another chain (heavier) and adopt if so.
+    ///
+    /// Two-phase approach to avoid holding the state lock across expensive VDF
+    /// verification (which would block the CVDF coordination loop):
+    ///   Phase 1: Quick weight check + snapshot under read lock (cheap)
+    ///   Phase 2: Full VDF verification with NO lock held (expensive)
+    ///   Phase 3: Adopt under write lock (cheap)
+    pub async fn cvdf_check_and_adopt(&self, other_rounds: Vec<CvdfRound>) -> bool {
+        if other_rounds.is_empty() {
+            return false;
+        }
+
+        // Phase 1: Quick rejection under read lock (microseconds)
+        let (our_weight, our_tip, genesis_seed, signing_key) = {
+            let state = self.state.read().await;
+            match state.cvdf.as_ref() {
+                Some(c) => (
+                    c.weight(),
+                    c.chain().tip_output(),
+                    c.chain().genesis_seed(),
+                    c.chain().signing_key().clone(),
+                ),
+                None => return false,
+            }
+        };
+        // Lock released here
+
+        let their_weight: u64 = other_rounds.iter().map(|r| r.weight()).sum();
+        let their_tip = other_rounds.last().map(|r| r.output).unwrap_or([0u8; 32]);
+
+        // Reject if strictly lighter
+        if their_weight < our_weight {
+            return false;
+        }
+        // Equal weight: deterministic tiebreaker — lower tip hash wins
+        if their_weight == our_weight {
+            if their_tip >= our_tip {
+                return false; // Our tip is lower or same, we keep ours
+            }
+            // their_tip < our_tip → they win tiebreak
+        }
+
+        // Phase 2: Expensive VDF verification WITHOUT lock
+        // Verify the chain is valid before adopting (prevents forged chains)
+        let rounds_for_verify = other_rounds.clone();
+        let verified = tokio::task::spawn_blocking(move || {
+            match crate::cvdf::CvdfChain::from_rounds(genesis_seed, rounds_for_verify, signing_key) {
+                Some(c) => c.total_weight() == their_weight,
+                None => false,
+            }
+        })
+        .await
+        .unwrap_or(false);
+
+        if !verified {
+            return false;
+        }
+
+        // Phase 3: Adopt under write lock (fast — just replaces the chain)
+        // Re-delegate to should_adopt which has the full tiebreaker logic
+        let mut state = self.state.write().await;
+        if let Some(cvdf) = state.cvdf.as_mut() {
+            return cvdf.adopt(other_rounds);
+        }
+        false
+    }
+
     /// Check if we should adopt another chain (heavier)
     pub async fn cvdf_should_adopt(&self, other_rounds: &[CvdfRound]) -> bool {
         let state = self.state.read().await;
@@ -1435,6 +1504,24 @@ impl MeshService {
         let mut state = self.state.write().await;
         let cvdf = state.cvdf.as_mut();
         cvdf.map(|c| c.adopt(rounds)).unwrap_or(false)
+    }
+
+    /// Diagnostic: why is CVDF not producing?
+    pub async fn cvdf_debug_state(&self) -> String {
+        let state = self.state.read().await;
+        match state.cvdf.as_ref() {
+            None => "no cvdf".to_string(),
+            Some(c) => {
+                let is_turn = c.is_our_turn();
+                let slot_count = c.slot_holder_count();
+                let our_slot = c.our_slot_index();
+                let pending = c.pending_count();
+                format!(
+                    "h={} w={} is_turn={} slots={} our_slot={:?} pending={}",
+                    c.height(), c.weight(), is_turn, slot_count, our_slot, pending
+                )
+            }
+        }
     }
 
     /// Get CVDF height
@@ -1510,6 +1597,11 @@ impl MeshService {
                 // Staple SPORE proof to heartbeat - empty at convergence (zero overhead)
                 let spore_proof = citadel_spore::Spore::empty();
                 self.flood(FloodMessage::CvdfNewRound { round, spore_proof });
+
+                // Flood full chain state so peers on different chains can evaluate merge
+                if let Some((rounds, claims)) = self.cvdf_chain_state().await {
+                    self.flood(FloodMessage::CvdfSyncResponse { rounds, claims });
+                }
 
                 // EVENT-DRIVEN SLOT EVICTION: On round production, evict stale slots.
                 // Slots that haven't attested in SLOT_LIVENESS_THRESHOLD rounds are dead.
@@ -3038,6 +3130,31 @@ impl MeshService {
         connected
     }
 
+    /// Connect to a specific peer address (for bridging swarms in tests/API)
+    pub async fn connect_to_peer(self: &Arc<Self>, addr: &str) {
+        let connect_timeout = std::time::Duration::from_secs(5);
+        let resolved: SocketAddr = match addr.parse() {
+            Ok(a) => a,
+            Err(e) => {
+                warn!("Invalid peer address {}: {}", addr, e);
+                return;
+            }
+        };
+        match tokio::time::timeout(connect_timeout, TcpStream::connect(resolved)).await {
+            Ok(Ok(stream)) => {
+                info!("Connected to peer {} (bridge)", resolved);
+                let self_clone = Arc::clone(self);
+                tokio::spawn(async move {
+                    if let Err(e) = self_clone.handle_connection(stream, resolved, true).await {
+                        warn!("Bridge peer {} disconnected: {}", resolved, e);
+                    }
+                });
+            }
+            Ok(Err(e)) => warn!("Failed to connect to bridge peer {}: {}", addr, e),
+            Err(_) => warn!("Timeout connecting to bridge peer {}", addr),
+        }
+    }
+
     /// Handle a peer connection
     async fn handle_connection(
         self: &Arc<Self>,
@@ -4481,6 +4598,20 @@ impl MeshService {
                     let round_number = round.round;
                     if self.cvdf_process_round(round).await {
                         debug!("Processed cvdf_new_round {} from {}", round_number, peer_id);
+                    } else {
+                        // Round rejected — peer is on a different chain (different tip
+                        // or different height). Request their full chain for merge evaluation.
+                        // This is the EVENT that triggers swarm merge: seeing a foreign round.
+                        debug!(
+                            "Foreign cvdf_new_round {} from {} — requesting full chain sync",
+                            round_number, peer_id
+                        );
+                        let self_id = self.self_id().await;
+                        let our_height = self.cvdf_height().await;
+                        self.flood(FloodMessage::CvdfSyncRequest {
+                            from_node: self_id,
+                            from_height: our_height,
+                        });
                     }
                 }
             }
@@ -4555,17 +4686,18 @@ impl MeshService {
 
                 let mut chain_state_changed = false;
 
-                // Check if we should adopt this chain.
-                // Even when we do NOT adopt, we still need to reconcile slot holders below.
-                if !parsed_rounds.is_empty() && self.cvdf_should_adopt(&parsed_rounds).await {
+                // Check and adopt heavier chain WITHOUT holding state lock across VDF
+                // verification. cvdf_check_and_adopt uses spawn_blocking for the expensive
+                // VDF recomputation so the CVDF coordination loop isn't starved.
+                if !parsed_rounds.is_empty() {
                     let their_height = parsed_rounds.last().map(|r| r.round).unwrap_or(0);
                     let their_weight: u64 = parsed_rounds.iter().map(|r| r.weight() as u64).sum();
-                    info!(
-                        "Adopting heavier CVDF chain from {} (height {}, weight {})",
-                        peer_id, their_height, their_weight
-                    );
 
-                    if self.cvdf_adopt(parsed_rounds).await {
+                    if self.cvdf_check_and_adopt(parsed_rounds).await {
+                        info!(
+                            "Adopted heavier CVDF chain from {} (height {}, weight {})",
+                            peer_id, their_height, their_weight
+                        );
                         chain_state_changed = true;
                     }
                 }

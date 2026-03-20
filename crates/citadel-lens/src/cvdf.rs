@@ -618,6 +618,16 @@ impl CvdfChain {
         }
     }
 
+    /// Genesis seed used to start this chain
+    pub fn genesis_seed(&self) -> [u8; 32] {
+        self.genesis_seed
+    }
+
+    /// Signing key (for cloning into verification tasks)
+    pub fn signing_key(&self) -> &SigningKey {
+        &self.signing_key
+    }
+
     /// Current chain height (round number)
     pub fn height(&self) -> u64 {
         self.rounds.last().map(|r| r.round).unwrap_or(0)
@@ -788,9 +798,26 @@ impl CvdfChain {
         let their_weight: u64 = other_rounds.iter().map(|r| r.weight()).sum();
         let our_weight = self.total_weight();
 
-        // Quick rejection: if not heavier, don't bother verifying
-        if their_weight <= our_weight {
+        // Quick rejection: lighter chain never wins
+        if their_weight < our_weight {
             return false;
+        }
+
+        // Equal weight: deterministic tiebreaker from pvdf.rs evaluate_merge —
+        // lower tip hash wins. Both nodes compute the same comparison independently,
+        // so exactly one adopts. (See proofs/CitadelProofs/CVDF.lean mergeChains:
+        // >= means first-checked wins; here we use tip hash for symmetric resolution.)
+        if their_weight == our_weight {
+            let our_tip = self.tip_output();
+            let their_tip = other_rounds.last().map(|r| r.output).unwrap_or([0u8; 32]);
+            if our_tip == their_tip {
+                return false; // Same chain, no merge needed
+            }
+            // Adopt only if their tip is lower (they win the tiebreak)
+            if their_tip >= our_tip {
+                return false; // Our tip is lower, we win — keep ours
+            }
+            // their_tip < our_tip → they win, we adopt
         }
 
         // Find common ancestry for incremental verification
@@ -928,6 +955,21 @@ impl CvdfCoordinator {
     /// Set our slot
     pub fn set_slot(&mut self, slot: u64) {
         self.our_slot = Some(slot);
+    }
+
+    /// Diagnostic: number of registered slot holders
+    pub fn slot_holder_count(&self) -> usize {
+        self.slot_holders.len()
+    }
+
+    /// Diagnostic: our slot index
+    pub fn our_slot_index(&self) -> Option<u64> {
+        self.our_slot
+    }
+
+    /// Diagnostic: number of pending attestations
+    pub fn pending_count(&self) -> usize {
+        self.pending_attestations.len()
     }
 
     /// Register a slot holder
