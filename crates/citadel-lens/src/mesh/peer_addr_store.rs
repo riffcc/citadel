@@ -214,8 +214,9 @@ mod tests {
     use super::*;
 
     fn make_record(peer_id: &str, ts: i64) -> PeerAddrRecord {
+        let full_id = format!("b3b3/{peer_id}");
         PeerAddrRecord::new(
-            peer_id.to_owned(),
+            full_id.clone(),
             format!("{peer_id}.lagun.co"),
             peer_id.to_owned(),
             "lagun.co".to_owned(),
@@ -230,8 +231,9 @@ mod tests {
     }
 
     fn make_record_with_addr(peer_id: &str, ts: i64, underlay: &str) -> PeerAddrRecord {
+        let full_id = format!("b3b3/{peer_id}");
         PeerAddrRecord::new(
-            peer_id.to_owned(),
+            full_id,
             format!("{peer_id}.lagun.co"),
             peer_id.to_owned(),
             "lagun.co".to_owned(),
