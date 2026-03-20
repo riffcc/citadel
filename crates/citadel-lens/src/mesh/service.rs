@@ -3039,38 +3039,8 @@ impl MeshService {
         for peer_addr in &self.entry_peers {
             info!("Connecting to peer: {}", peer_addr);
 
-            let (host, mesh_port) = super::transport::extract_host_and_port(peer_addr, self.listen_addr.port());
-            let mut allow_direct_fallback = true;
-            match self
-                .try_switchboard_connect(&host, mesh_port, "any", 3, true)
-                .await
-            {
-                Ok(Some((stream, connected_addr))) => {
-                    info!(
-                        "Connected to entry peer {} via switchboard {}",
-                        peer_addr, connected_addr
-                    );
-                    connected += 1;
-                    let self_clone = Arc::clone(self);
-                    tokio::spawn(async move {
-                        if let Err(e) = self_clone.handle_connection(stream, connected_addr, true).await {
-                            warn!("Entry peer {} disconnected: {}", connected_addr, e);
-                        }
-                    });
-                    continue;
-                }
-                Ok(None) => {
-                    debug!("Switchboard self-hit or redirect exhaustion for {}", peer_addr);
-                    allow_direct_fallback = false;
-                }
-                Err(e) => {
-                    debug!("Switchboard connect to {} failed: {}", peer_addr, e);
-                }
-            }
-
-            if !allow_direct_fallback {
-                continue;
-            }
+            let (_, mesh_port) = super::transport::extract_host_and_port(peer_addr, self.listen_addr.port());
+            let _ = mesh_port; // used by resolve below
 
             let candidate_addrs = super::transport::resolve_entry_peer_targets(
                 peer_addr,
