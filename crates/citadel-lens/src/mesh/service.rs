@@ -4954,8 +4954,20 @@ impl MeshService {
                             "SPORE: Merged {} releases from delta transfer (CRDT)",
                             stored_count
                         );
-                        // NOTE: Don't broadcast HaveList here - would cause feedback loop
-                        // HaveLists are exchanged on connection, not on every state change
+                        // Broadcast updated HaveList so peers see our new state and can
+                        // recompute content_synced. SPORE is continuous — XOR converges
+                        // to empty when both sides match, so this doesn't loop.
+                        let all_releases = doc_store
+                            .list::<crate::models::Release>()
+                            .unwrap_or_default();
+                        let self_id = self.state.read().await.self_id.clone();
+                        let release_ids: Vec<String> =
+                            all_releases.iter().map(|r| r.id.clone()).collect();
+                        let have_list = build_spore_havelist(&release_ids);
+                        self.flood(FloodMessage::SporeSync {
+                            peer_id: self_id,
+                            have_list,
+                        });
                     }
                 }
             }
