@@ -3623,6 +3623,17 @@ impl MeshService {
         let mut entry_peer_check_interval =
             tokio::time::interval(std::time::Duration::from_secs(10));
 
+        // Helper: write a JSON message as a newline-delimited line.
+        // Combines JSON + \n into a single write to prevent interleaving.
+        // Returns Err on write failure — caller should close the connection.
+        macro_rules! write_json_line {
+            ($writer:expr, $msg:expr) => {{
+                let mut buf = $msg.to_string().into_bytes();
+                buf.push(b'\n');
+                $writer.write_all(&buf).await
+            }};
+        }
+
         // Read peer messages and forward floods concurrently
         // NOTE: TGP is now over UDP (connectionless), not TCP
         let mut line = String::new();
@@ -3696,16 +3707,14 @@ impl MeshService {
                                     })
                                 }).collect::<Vec<_>>(),
                             });
-                            let _ = writer.write_all(flood_msg.to_string().as_bytes()).await;
-                            let _ = writer.write_all(b"\n").await;
+                            if write_json_line!(writer, flood_msg).is_err() { break; }
                         }
                         Ok(FloodMessage::Admins(admins)) => {
                             let flood_msg = serde_json::json!({
                                 "type": "flood_admins",
                                 "admins": admins,
                             });
-                            let _ = writer.write_all(flood_msg.to_string().as_bytes()).await;
-                            let _ = writer.write_all(b"\n").await;
+                            if write_json_line!(writer, flood_msg).is_err() { break; }
                         }
                         // NOTE: Unsigned SlotClaim removed - use VdfSlotClaim only
                         Ok(FloodMessage::SporeHaveList { peer_id, slots }) => {
@@ -3714,8 +3723,7 @@ impl MeshService {
                                 "peer_id": peer_id,
                                 "slots": slots,
                             });
-                            let _ = writer.write_all(flood_msg.to_string().as_bytes()).await;
-                            let _ = writer.write_all(b"\n").await;
+                            if write_json_line!(writer, flood_msg).is_err() { break; }
                         }
                         Ok(FloodMessage::VdfChain { links }) => {
                             let flood_msg = serde_json::json!({
@@ -3728,8 +3736,7 @@ impl MeshService {
                                     "timestamp_ms": l.timestamp_ms,
                                 })).collect::<Vec<_>>(),
                             });
-                            let _ = writer.write_all(flood_msg.to_string().as_bytes()).await;
-                            let _ = writer.write_all(b"\n").await;
+                            if write_json_line!(writer, flood_msg).is_err() { break; }
                         }
                         Ok(FloodMessage::VdfSlotClaim { claim }) => {
                             let flood_msg = serde_json::json!({
@@ -3740,8 +3747,7 @@ impl MeshService {
                                 "vdf_output": hex::encode(claim.vdf_output),
                                 "signature": hex::encode(claim.signature),
                             });
-                            let _ = writer.write_all(flood_msg.to_string().as_bytes()).await;
-                            let _ = writer.write_all(b"\n").await;
+                            if write_json_line!(writer, flood_msg).is_err() { break; }
                         }
                         Ok(FloodMessage::PoLPing { from, nonce, vdf_height }) => {
                             let flood_msg = serde_json::json!({
@@ -3750,8 +3756,7 @@ impl MeshService {
                                 "nonce": nonce,
                                 "vdf_height": vdf_height,
                             });
-                            let _ = writer.write_all(flood_msg.to_string().as_bytes()).await;
-                            let _ = writer.write_all(b"\n").await;
+                            if write_json_line!(writer, flood_msg).is_err() { break; }
                         }
                         Ok(FloodMessage::PoLPong { from, nonce, vdf_height }) => {
                             let flood_msg = serde_json::json!({
@@ -3760,8 +3765,7 @@ impl MeshService {
                                 "nonce": nonce,
                                 "vdf_height": vdf_height,
                             });
-                            let _ = writer.write_all(flood_msg.to_string().as_bytes()).await;
-                            let _ = writer.write_all(b"\n").await;
+                            if write_json_line!(writer, flood_msg).is_err() { break; }
                         }
                         Ok(FloodMessage::PoLSwapProposal { proposal }) => {
                             let flood_msg = serde_json::json!({
@@ -3792,8 +3796,7 @@ impl MeshService {
                                     "signature": hex::encode(p.signature),
                                 })).collect::<Vec<_>>(),
                             });
-                            let _ = writer.write_all(flood_msg.to_string().as_bytes()).await;
-                            let _ = writer.write_all(b"\n").await;
+                            if write_json_line!(writer, flood_msg).is_err() { break; }
                         }
                         Ok(FloodMessage::PoLSwapResponse { response }) => {
                             let flood_msg = serde_json::json!({
@@ -3825,19 +3828,16 @@ impl MeshService {
                                     "signature": hex::encode(p.signature),
                                 })).collect::<Vec<_>>(),
                             });
-                            let _ = writer.write_all(flood_msg.to_string().as_bytes()).await;
-                            let _ = writer.write_all(b"\n").await;
+                            if write_json_line!(writer, flood_msg).is_err() { break; }
                         }
                         Ok(FloodMessage::CvdfAttestation { att, vouch }) => {
                             let flood_msg = Self::cvdf_attestation_json(&att, vouch.as_ref());
-                            let _ = writer.write_all(flood_msg.to_string().as_bytes()).await;
-                            let _ = writer.write_all(b"\n").await;
+                            if write_json_line!(writer, flood_msg).is_err() { break; }
                         }
                         Ok(FloodMessage::CvdfNewRound { round, spore_proof }) => {
                             let flood_msg =
                                 Self::cvdf_round_json(&round, Some(spore_proof.range_count()));
-                            let _ = writer.write_all(flood_msg.to_string().as_bytes()).await;
-                            let _ = writer.write_all(b"\n").await;
+                            if write_json_line!(writer, flood_msg).is_err() { break; }
                         }
                         Ok(FloodMessage::CvdfSyncRequest { from_node, from_height }) => {
                             let flood_msg = serde_json::json!({
@@ -3845,8 +3845,7 @@ impl MeshService {
                                 "from_node": from_node,
                                 "from_height": from_height,
                             });
-                            let _ = writer.write_all(flood_msg.to_string().as_bytes()).await;
-                            let _ = writer.write_all(b"\n").await;
+                            if write_json_line!(writer, flood_msg).is_err() { break; }
                         }
                         Ok(FloodMessage::CvdfSyncResponse { rounds, claims }) => {
                             // Serialize full chain data for proper sync
@@ -3869,8 +3868,7 @@ impl MeshService {
                                 "height": rounds.last().map(|r| r.round).unwrap_or(0),
                                 "total_weight": rounds.iter().map(|r| r.weight() as u64).sum::<u64>(),
                             });
-                            let _ = writer.write_all(flood_msg.to_string().as_bytes()).await;
-                            let _ = writer.write_all(b"\n").await;
+                            if write_json_line!(writer, flood_msg).is_err() { break; }
                         }
                         Ok(FloodMessage::ContentHaveList { peer_id, release_ids }) => {
                             let flood_msg = serde_json::json!({
@@ -3878,16 +3876,14 @@ impl MeshService {
                                 "peer_id": peer_id,
                                 "release_ids": release_ids,
                             });
-                            let _ = writer.write_all(flood_msg.to_string().as_bytes()).await;
-                            let _ = writer.write_all(b"\n").await;
+                            if write_json_line!(writer, flood_msg).is_err() { break; }
                         }
                         Ok(FloodMessage::Release { release_json }) => {
                             let flood_msg = serde_json::json!({
                                 "type": "release_flood",
                                 "release": serde_json::from_str::<serde_json::Value>(&release_json).unwrap_or_default(),
                             });
-                            let _ = writer.write_all(flood_msg.to_string().as_bytes()).await;
-                            let _ = writer.write_all(b"\n").await;
+                            if write_json_line!(writer, flood_msg).is_err() { break; }
                             debug!(
                                 "Forwarded release_flood to peer {} ({} bytes)",
                                 current_peer_key,
@@ -3901,8 +3897,7 @@ impl MeshService {
                                 "peer_id": peer_id,
                                 "ranges": do_not_want,
                             });
-                            let _ = writer.write_all(flood_msg.to_string().as_bytes()).await;
-                            let _ = writer.write_all(b"\n").await;
+                            if write_json_line!(writer, flood_msg).is_err() { break; }
                         }
                         Ok(FloodMessage::ErasureConfirmation { peer_id, confirmed }) => {
                             // SPORE⁻¹: GDPR erasure confirmation with ranges
@@ -3911,8 +3906,7 @@ impl MeshService {
                                 "peer_id": peer_id,
                                 "ranges": confirmed,
                             });
-                            let _ = writer.write_all(flood_msg.to_string().as_bytes()).await;
-                            let _ = writer.write_all(b"\n").await;
+                            if write_json_line!(writer, flood_msg).is_err() { break; }
                         }
                         Ok(FloodMessage::BadBits { double_hashes }) => {
                             // BadBits: PERMANENT blocklist (DMCA, abuse, illegal content)
@@ -3923,8 +3917,7 @@ impl MeshService {
                                 "type": "bad_bits",
                                 "double_hashes": hashes_hex,
                             });
-                            let _ = writer.write_all(flood_msg.to_string().as_bytes()).await;
-                            let _ = writer.write_all(b"\n").await;
+                            if write_json_line!(writer, flood_msg).is_err() { break; }
                         }
                         Ok(FloodMessage::SporeSync { peer_id, have_list }) => {
                             // SPORE: Bilateral sync with range-based HaveList
@@ -3935,8 +3928,7 @@ impl MeshService {
                                 "peer_id": peer_id,
                                 "have_list": have_list,
                             });
-                            let _ = writer.write_all(flood_msg.to_string().as_bytes()).await;
-                            let _ = writer.write_all(b"\n").await;
+                            if write_json_line!(writer, flood_msg).is_err() { break; }
                         }
                         Ok(FloodMessage::PeerAddrSync { peer_id, have_list }) => {
                             let flood_msg = serde_json::json!({
@@ -3944,8 +3936,7 @@ impl MeshService {
                                 "peer_id": peer_id,
                                 "have_list": have_list,
                             });
-                            let _ = writer.write_all(flood_msg.to_string().as_bytes()).await;
-                            let _ = writer.write_all(b"\n").await;
+                            if write_json_line!(writer, flood_msg).is_err() { break; }
                         }
                         Ok(FloodMessage::SporeDelta { releases }) => {
                             // SPORE: Delta transfer - only send what they want that we have
@@ -3953,16 +3944,14 @@ impl MeshService {
                                 "type": "spore_delta",
                                 "releases": releases,
                             });
-                            let _ = writer.write_all(flood_msg.to_string().as_bytes()).await;
-                            let _ = writer.write_all(b"\n").await;
+                            if write_json_line!(writer, flood_msg).is_err() { break; }
                         }
                         Ok(FloodMessage::PeerAddrDelta { records }) => {
                             let flood_msg = serde_json::json!({
                                 "type": "peer_addr_delta",
                                 "records": records,
                             });
-                            let _ = writer.write_all(flood_msg.to_string().as_bytes()).await;
-                            let _ = writer.write_all(b"\n").await;
+                            if write_json_line!(writer, flood_msg).is_err() { break; }
                         }
                         Ok(FloodMessage::FeaturedSync { peer_id, featured }) => {
                             // SPORE: Featured releases sync for homepage
@@ -3971,8 +3960,7 @@ impl MeshService {
                                 "peer_id": peer_id,
                                 "featured": featured,
                             });
-                            let _ = writer.write_all(flood_msg.to_string().as_bytes()).await;
-                            let _ = writer.write_all(b"\n").await;
+                            if write_json_line!(writer, flood_msg).is_err() { break; }
                         }
                         Err(_) => {
                             // Channel closed or lagged, continue
