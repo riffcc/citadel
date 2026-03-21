@@ -3336,8 +3336,7 @@ impl MeshService {
                 Self::now_ms(),
             ));
         }
-        writer.write_all(hello.to_string().as_bytes()).await?;
-        writer.write_all(b"\n").await?;
+        { let mut buf = hello.to_string().into_bytes(); buf.push(b'\n'); writer.write_all(&buf).await?; }
 
         // Flood our complete state to this peer (event-driven, no request/response)
         // Admin list
@@ -3398,8 +3397,7 @@ impl MeshService {
                 "type": "flood_peers",
                 "peers": all_peers,
             });
-            writer.write_all(flood_peers.to_string().as_bytes()).await?;
-            writer.write_all(b"\n").await?;
+            { let mut buf = flood_peers.to_string().into_bytes(); buf.push(b'\n'); writer.write_all(&buf).await?; }
 
             // Also flood all claimed slots (with public keys for TGP)
             for claim in state.claimed_slots.values() {
@@ -3410,8 +3408,7 @@ impl MeshService {
                     "coord": [claim.coord.q, claim.coord.r, claim.coord.z],
                     "public_key": claim.public_key.as_ref().map(hex::encode),
                 });
-                writer.write_all(slot_msg.to_string().as_bytes()).await?;
-                writer.write_all(b"\n").await?;
+                { let mut buf = slot_msg.to_string().into_bytes(); buf.push(b'\n'); writer.write_all(&buf).await?; }
             }
 
             // SPORE: Send our HaveList so peer can identify missing slots
@@ -3421,8 +3418,7 @@ impl MeshService {
                 "peer_id": state.self_id,
                 "slots": have_slots,
             });
-            writer.write_all(have_list.to_string().as_bytes()).await?;
-            writer.write_all(b"\n").await?;
+            { let mut buf = have_list.to_string().into_bytes(); buf.push(b'\n'); writer.write_all(&buf).await?; }
         }
 
         // SPORE: Send range-based HaveList for optimal sync
@@ -3442,8 +3438,7 @@ impl MeshService {
                 "peer_id": self_id,
                 "have_list": have_list,
             });
-            writer.write_all(spore_sync.to_string().as_bytes()).await?;
-            writer.write_all(b"\n").await?;
+            { let mut buf = spore_sync.to_string().into_bytes(); buf.push(b'\n'); writer.write_all(&buf).await?; }
             debug!(
                 "SPORE: Sent HaveList with {} ranges to peer {}",
                 have_list.range_count(),
@@ -3524,8 +3519,7 @@ impl MeshService {
                     "type": "erasure_confirmation",
                     "ranges": &state.erasure_confirmed,
                 });
-                writer.write_all(erasure_msg.to_string().as_bytes()).await?;
-                writer.write_all(b"\n").await?;
+                { let mut buf = erasure_msg.to_string().into_bytes(); buf.push(b'\n'); writer.write_all(&buf).await?; }
                 debug!(
                     "SPORE⁻¹: Sent ErasureConfirmation with {} ranges to peer {}",
                     state.erasure_confirmed.range_count(),
@@ -3602,8 +3596,7 @@ impl MeshService {
                 "height": rounds.last().map(|r| r.round).unwrap_or(0),
                 "total_weight": rounds.iter().map(|r| r.weight() as u64).sum::<u64>(),
             });
-            writer.write_all(cvdf_sync.to_string().as_bytes()).await?;
-            writer.write_all(b"\n").await?;
+            { let mut buf = cvdf_sync.to_string().into_bytes(); buf.push(b'\n'); writer.write_all(&buf).await?; }
             debug!(
                 "Sent CVDF chain state to peer {} (height {}, {} claims)",
                 peer_id,
