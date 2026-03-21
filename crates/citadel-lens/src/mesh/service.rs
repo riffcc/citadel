@@ -3260,6 +3260,7 @@ impl MeshService {
         addr: SocketAddr,
         is_entry_peer: bool,
     ) -> Result<()> {
+        let _ = stream.set_nodelay(true);
         // Use full IP:port as initial peer_id to avoid collisions when connecting to
         // multiple peers that listen on the same port (e.g., all bootstrap nodes on :9000)
         let peer_id = format!("peer-{}", addr);
@@ -3641,7 +3642,7 @@ impl MeshService {
                 read_result = reader.read_line(&mut line) => {
                     match read_result {
                         Ok(0) => {
-                            info!("Peer {} disconnected", current_peer_key);
+                            info!("Peer {} disconnected (EOF)", current_peer_key);
                             break;
                         }
                         Ok(_) => {
