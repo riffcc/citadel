@@ -1507,12 +1507,32 @@ impl MeshService {
         }
     }
 
-    /// Get CVDF chain state for syncing
+    /// Get CVDF chain state for syncing.
+    ///
+    /// Limits rounds to the most recent MAX_SYNC_ROUNDS to keep the JSON
+    /// message size bounded. The full chain can be thousands of rounds after
+    /// running for hours — serializing all of them as a single JSON line
+    /// exceeds what the newline-delimited protocol can handle reliably.
+    ///
+    /// The weight comparison for chain adoption only needs enough rounds to
+    /// demonstrate the chain is heavier. Genesis round is always included
+    /// so the receiver can verify the chain root.
     pub async fn cvdf_chain_state(&self) -> Option<(Vec<CvdfRound>, Vec<AnchoredSlotClaim>)> {
+        const MAX_SYNC_ROUNDS: usize = 100;
+
         let state = self.state.read().await;
         let cvdf = state.cvdf.as_ref()?;
 
-        let rounds = cvdf.chain().all_rounds().to_vec();
+        let all_rounds = cvdf.chain().all_rounds();
+        let rounds = if all_rounds.len() <= MAX_SYNC_ROUNDS {
+            all_rounds.to_vec()
+        } else {
+            // Always include genesis + the last (MAX_SYNC_ROUNDS - 1) rounds
+            let mut r = vec![all_rounds[0].clone()];
+            let tail_start = all_rounds.len() - (MAX_SYNC_ROUNDS - 1);
+            r.extend_from_slice(&all_rounds[tail_start..]);
+            r
+        };
         let claims: Vec<AnchoredSlotClaim> = state.vdf_claims.values().cloned().collect();
 
         Some((rounds, claims))
@@ -1690,11 +1710,6 @@ impl MeshService {
                 // Staple SPORE proof to heartbeat - empty at convergence (zero overhead)
                 let spore_proof = citadel_spore::Spore::empty();
                 self.flood(FloodMessage::CvdfNewRound { round, spore_proof });
-
-                // Flood full chain state so peers on different chains can evaluate merge
-                if let Some((rounds, claims)) = self.cvdf_chain_state().await {
-                    self.flood(FloodMessage::CvdfSyncResponse { rounds, claims });
-                }
 
                 // EVENT-DRIVEN SLOT EVICTION: On round production, evict stale slots.
                 // Slots that haven't attested in SLOT_LIVENESS_THRESHOLD rounds are dead.
