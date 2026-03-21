@@ -279,7 +279,37 @@ impl MeshState {
             .any(|claim| claim.peer_id == peer_id && neighbor_coords.contains(&claim.coord))
     }
 
-    /// Count connected SPIRAL neighbors (not entry peers)
+    /// Count SPIRAL neighbors with ACTIVE TCP connections.
+    ///
+    /// `active_peer_ids` must come from `active_tcp_peers` to ensure only
+    /// peers with live TCP sockets are counted. Without this, indirect peers
+    /// (learned via flood but never directly connected) would be counted,
+    /// causing premature disconnection from entry peers.
+    pub fn connected_neighbor_count_with_active(&self, active_peer_ids: &std::collections::HashSet<String>) -> usize {
+        let Some(ref self_slot) = self.self_slot else {
+            return 0;
+        };
+
+        let neighbor_coords: std::collections::HashSet<_> =
+            self_slot.neighbor_coords().into_iter().collect();
+
+        self.peers
+            .values()
+            .filter(|peer| {
+                // Must have an active TCP connection
+                if !active_peer_ids.contains(&peer.id) {
+                    return false;
+                }
+                if let Some(ref slot) = peer.slot {
+                    neighbor_coords.contains(&slot.coord)
+                } else {
+                    false
+                }
+            })
+            .count()
+    }
+
+    /// Count connected SPIRAL neighbors (legacy — counts all known peers, not just active)
     pub fn connected_neighbor_count(&self) -> usize {
         let Some(ref self_slot) = self.self_slot else {
             return 0;
@@ -288,7 +318,6 @@ impl MeshState {
         let neighbor_coords: std::collections::HashSet<_> =
             self_slot.neighbor_coords().into_iter().collect();
 
-        // Count peers whose slots are in our neighborhood
         self.peers
             .values()
             .filter(|peer| {

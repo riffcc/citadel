@@ -1,0 +1,25 @@
+services:
+  meetme:
+    build:
+      context: ..
+      dockerfile: Dockerfile.fly
+    restart: unless-stopped
+    hostname: meetme
+    container_name: citadel-meetme
+    environment:
+      LENS_DATA_DIR: /data
+      LENS_API_BIND: "[::]:8080"
+      LENS_P2P_BIND: "[::]:9000"
+      RUST_LOG: "lens_node=info,citadel_lens=info,citadel_lens::mesh::service=info"
+      # No entry peers — this IS the entry peer
+      CITADEL_PEERS: ""
+    ports:
+      # Switchboard — the only port mesh nodes need to reach
+      - "9443:9443"
+      # API — for monitoring and content serving
+      - "8080:8080"
+    volumes:
+      - meetme_data:/data
+
+volumes:
+  meetme_data:

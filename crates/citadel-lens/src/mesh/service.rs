@@ -3631,10 +3631,13 @@ impl MeshService {
             tokio::select! {
                 // Check if this entry peer should be disconnected (have enough SPIRAL neighbors)
                 _ = entry_peer_check_interval.tick(), if is_entry_peer => {
+                    // Get active TCP peer set BEFORE acquiring state lock
+                    let active = self.active_peer_ids_snapshot().await;
                     let state = self.state.read().await;
-                    if state.entry_peers_to_disconnect().contains(&current_peer_key) {
-                        info!("Disconnecting entry peer {} - have sufficient SPIRAL neighbors ({})",
-                            current_peer_key, state.connected_neighbor_count());
+                    let active_neighbor_count = state.connected_neighbor_count_with_active(&active);
+                    if active_neighbor_count >= 3 && !state.is_spiral_neighbor(&current_peer_key) {
+                        info!("Disconnecting entry peer {} - have {} active SPIRAL neighbors",
+                            current_peer_key, active_neighbor_count);
                         break;
                     }
                 }
