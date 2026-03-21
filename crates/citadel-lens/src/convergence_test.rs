@@ -162,66 +162,39 @@ pub async fn test_two_node_swarm_sync() -> (bool, Duration, String) {
 
     println!("\n============================================================");
     println!("CITADEL TWO-NODE SWARM SYNC TEST");
-    println!("  Node A: port {}", PORT_A);
-    println!("  Node B: port {}", PORT_B);
+    println!("  Node A: port {} (switchboard {})", PORT_A, PORT_A + 443);
+    println!("  Node B: port {} (switchboard {})", PORT_B, PORT_B + 443);
     println!("============================================================\n");
 
     let start = Instant::now();
 
-    // Both nodes start independently (no entry peers)
+    // Node A: bootstrap node (no entry peers)
+    // Node B: entry peer points at A's mesh port — connect_to_entry_peers
+    //         dials the switchboard at mesh_port+443 automatically
     let (node_a, _tmp_a) = make_test_node(PORT_A, Vec::new());
-    let (node_b, _tmp_b) = make_test_node(PORT_B, Vec::new());
+    // Entry peer is A's switchboard port (mesh_port + 443)
+    let (node_b, _tmp_b) = make_test_node(PORT_B, vec![format!("127.0.0.1:{}", PORT_A + 443)]);
 
-    // Start both
+    // Start A first so switchboard is ready
     let a = Arc::clone(&node_a);
     tokio::spawn(async move { let _ = a.run().await; });
+
+    let init_start = Instant::now();
+    loop {
+        if node_a.cvdf_initialized().await { break; }
+        if init_start.elapsed() > Duration::from_secs(5) {
+            return (false, init_start.elapsed(), "A init timeout".into());
+        }
+        tokio::task::yield_now().await;
+    }
+    println!("Node A initialized ({:?})", init_start.elapsed());
+
+    // Start B — will connect to A via switchboard
     let b = Arc::clone(&node_b);
     tokio::spawn(async move { let _ = b.run().await; });
 
-    // Wait for both to init CVDF
-    let init_start = Instant::now();
-    loop {
-        if node_a.cvdf_initialized().await && node_b.cvdf_initialized().await {
-            break;
-        }
-        if init_start.elapsed() > Duration::from_secs(10) {
-            return (false, init_start.elapsed(), "CVDF init timeout".to_string());
-        }
-        tokio::task::yield_now().await;
-    }
-    println!("Both nodes initialized ({:?})", init_start.elapsed());
-
-    // Let both produce at least 1 round independently so they diverge
-    let round_start = Instant::now();
-    loop {
-        let h_a = node_a.cvdf_height().await;
-        let h_b = node_b.cvdf_height().await;
-        if h_a >= 1 && h_b >= 1 {
-            println!("Pre-bridge: A h={}, B h={}", h_a, h_b);
-            break;
-        }
-        if round_start.elapsed() > Duration::from_secs(30) {
-            return (false, round_start.elapsed(), format!("Round timeout: A={}, B={}", h_a, h_b));
-        }
-        tokio::task::yield_now().await;
-    }
-
-    // Record divergent state
-    let a_tip_pre = node_a.cvdf_tip().await;
-    let b_tip_pre = node_b.cvdf_tip().await;
-    println!("Pre-bridge: A wt={} tip={}, B wt={} tip={}",
-        node_a.cvdf_weight().await, hex::encode(&a_tip_pre[..8]),
-        node_b.cvdf_weight().await, hex::encode(&b_tip_pre[..8]),
-    );
-    assert_ne!(a_tip_pre, b_tip_pre, "Nodes must have divergent chains before bridge");
-
-    // Bridge: B connects directly to A (bypasses switchboard)
-    println!("Bridging B → A...");
-    node_b.connect_to_peer(&format!("127.0.0.1:{}", PORT_A)).await;
-
-    // Wait for convergence: both produce rounds on the same chain
-    // Success = same tip AND height > 0 (not just genesis)
-    println!("Waiting for cooperative CVDF convergence...");
+    // Wait for convergence
+    println!("Waiting for CVDF convergence...");
     let merge_start = Instant::now();
     let mut last_log = Instant::now();
 
@@ -230,18 +203,13 @@ pub async fn test_two_node_swarm_sync() -> (bool, Duration, String) {
         let tip_b = node_b.cvdf_tip().await;
         let h_a = node_a.cvdf_height().await;
         let h_b = node_b.cvdf_height().await;
-        // Converged = same tip, both have produced at least 2 rounds
         let converged = tip_a == tip_b && h_a >= 2 && h_b >= 2;
 
         if last_log.elapsed() > Duration::from_secs(2) {
-            let dbg_a = node_a.cvdf_debug_state().await;
-            let dbg_b = node_b.cvdf_debug_state().await;
             println!(
-                "  A [{}] tip={}, B [{}] tip={}, converged={}",
-                dbg_a,
-                hex::encode(&tip_a[..8]),
-                dbg_b,
-                hex::encode(&tip_b[..8]),
+                "  A h={} tip={}, B h={} tip={}, converged={}",
+                h_a, hex::encode(&tip_a[..8]),
+                h_b, hex::encode(&tip_b[..8]),
                 converged,
             );
             last_log = Instant::now();
@@ -249,19 +217,132 @@ pub async fn test_two_node_swarm_sync() -> (bool, Duration, String) {
 
         if converged {
             let dt = merge_start.elapsed();
-            let final_tip = hex::encode(&tip_a[..8]);
-            let final_wt = node_a.cvdf_weight().await;
             println!("\nCVDF CONVERGED in {:?}!", dt);
-            println!("  tip={} weight={} height={}", final_tip, final_wt, h_a);
             println!("  Total test time: {:?}", start.elapsed());
-            return (true, dt, format!("converged tip={} wt={}", final_tip, final_wt));
+            return (true, dt, format!("converged tip={}", hex::encode(&tip_a[..8])));
         }
 
         if merge_start.elapsed() > MAX_WAIT {
             println!("\nMerge TIMEOUT");
-            println!("  A: h={} wt={} tip={}", h_a, node_a.cvdf_weight().await, hex::encode(&tip_a[..8]));
-            println!("  B: h={} wt={} tip={}", h_b, node_b.cvdf_weight().await, hex::encode(&tip_b[..8]));
-            return (false, merge_start.elapsed(), "merge timeout".to_string());
+            return (false, merge_start.elapsed(), "merge timeout".into());
+        }
+
+        tokio::task::yield_now().await;
+    }
+}
+
+/// Test that 10 nodes form a mesh: connect, sync CVDF chains, and maintain connections.
+pub async fn test_10_node_mesh() -> (bool, Duration, String) {
+    const NODE_COUNT: usize = 10;
+    const BASE_PORT: u16 = 47000;
+    const MAX_WAIT: Duration = Duration::from_secs(60);
+
+    println!("\n============================================================");
+    println!("CITADEL 10-NODE MESH FORMATION TEST");
+    println!("============================================================\n");
+
+    let start = Instant::now();
+
+    // Node 0 is the bootstrap node (no entry peers)
+    // All other nodes use node 0 as entry peer (direct TCP, fine for localhost)
+    let mut nodes: Vec<Arc<MeshService>> = Vec::new();
+    let mut _temps: Vec<TempDir> = Vec::new();
+
+    for i in 0..NODE_COUNT {
+        // Entry peer is node 0's switchboard port (mesh_port + 443)
+        let entry_peers = if i == 0 {
+            Vec::new()
+        } else {
+            vec![format!("127.0.0.1:{}", BASE_PORT + 443)]
+        };
+        let (node, temp) = make_test_node(BASE_PORT + i as u16, entry_peers);
+        nodes.push(node);
+        _temps.push(temp);
+    }
+
+    // Start node 0 first
+    let n = Arc::clone(&nodes[0]);
+    tokio::spawn(async move { let _ = n.run().await; });
+
+    // Wait for node 0 to init
+    let init_start = Instant::now();
+    loop {
+        if nodes[0].cvdf_initialized().await { break; }
+        if init_start.elapsed() > Duration::from_secs(5) {
+            return (false, init_start.elapsed(), "Node 0 init timeout".into());
+        }
+        tokio::task::yield_now().await;
+    }
+    println!("Node 0 initialized ({:?})", init_start.elapsed());
+
+    // Start remaining nodes
+    for i in 1..NODE_COUNT {
+        let n = Arc::clone(&nodes[i]);
+        tokio::spawn(async move { let _ = n.run().await; });
+    }
+
+    // Wait for all nodes to have at least 1 connected peer and same CVDF tip
+    println!("Waiting for mesh formation...");
+    let mesh_start = Instant::now();
+    let mut last_log = Instant::now();
+
+    loop {
+        let mut tips: Vec<[u8; 32]> = Vec::new();
+        let mut min_peers = usize::MAX;
+        let mut all_init = true;
+
+        for node in &nodes {
+            if !node.cvdf_initialized().await {
+                all_init = false;
+                break;
+            }
+            tips.push(node.cvdf_tip().await);
+            let pc = node.connected_peer_count().await;
+            if pc < min_peers { min_peers = pc; }
+        }
+
+        if !all_init {
+            tokio::task::yield_now().await;
+            continue;
+        }
+
+        let all_same_tip = tips.windows(2).all(|w| w[0] == w[1]);
+        let all_connected = min_peers >= 1;
+
+        if last_log.elapsed() > Duration::from_secs(3) {
+            let unique_tips: std::collections::HashSet<_> = tips.iter().map(|t| hex::encode(&t[..6])).collect();
+            println!(
+                "  {:?}: min_peers={} unique_tips={} same_tip={}",
+                mesh_start.elapsed(),
+                min_peers,
+                unique_tips.len(),
+                all_same_tip,
+            );
+            last_log = Instant::now();
+        }
+
+        if all_same_tip && all_connected {
+            let dt = mesh_start.elapsed();
+            println!("\n10-NODE MESH FORMED in {:?}!", dt);
+            println!("  All on tip {}", hex::encode(&tips[0][..8]));
+            println!("  Min peers per node: {}", min_peers);
+            return (true, dt, format!("mesh formed, min_peers={}", min_peers));
+        }
+
+        if mesh_start.elapsed() > MAX_WAIT {
+            let unique_tips: std::collections::HashSet<_> = tips.iter().map(|t| hex::encode(&t[..6])).collect();
+            println!("\nMesh TIMEOUT");
+            println!("  Unique tips: {}", unique_tips.len());
+            println!("  Min peers: {}", min_peers);
+            for (i, node) in nodes.iter().enumerate() {
+                let dbg = node.cvdf_debug_state().await;
+                let pc = node.connected_peer_count().await;
+                println!("  Node {}: peers={} [{}]", i, pc, dbg);
+            }
+            return (false, mesh_start.elapsed(), format!(
+                "timeout: {} tips, min_peers={}",
+                unique_tips.len(), min_peers
+            ));
         }
 
         tokio::task::yield_now().await;
@@ -298,5 +379,13 @@ mod tests {
 
         println!("Sync result: {} ({:?})", result, time);
         assert!(converged, "Nodes must converge: {}", result);
+    }
+
+    /// 10 nodes form a mesh via a single bootstrap node.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_10_node_mesh_formation() {
+        let (formed, time, result) = test_10_node_mesh().await;
+        println!("Mesh result: {} ({:?})", result, time);
+        assert!(formed, "10-node mesh must form: {}", result);
     }
 }

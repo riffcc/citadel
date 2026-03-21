@@ -964,6 +964,16 @@ impl MeshService {
         let mesh = Arc::clone(self);
         tokio::spawn(async move {
             mesh.try_claim_slot_from_live_state().await;
+            // After potentially claiming a slot, dial SPIRAL neighbors
+            mesh.dial_missing_spiral_neighbors().await;
+        });
+    }
+
+    /// Trigger SPIRAL neighbor dialing after topology changes.
+    pub fn trigger_dial_spiral_neighbors(self: &Arc<Self>) {
+        let mesh = Arc::clone(self);
+        tokio::spawn(async move {
+            mesh.dial_missing_spiral_neighbors().await;
         });
     }
 
@@ -1135,7 +1145,90 @@ impl MeshService {
             claim: claim.clone(),
         });
 
+        // Dial SPIRAL neighbors we're not connected to yet.
+        // After claiming a slot, we know our position in the topology.
+        // Other nodes' positions are known from claimed_slots (populated
+        // via flood). Connect to adjacent nodes via switchboard.
+        self.dial_missing_spiral_neighbors().await;
+
         Some(claim)
+    }
+
+    /// Dial SPIRAL neighbors we're not connected to.
+    ///
+    /// After claiming a slot or learning about new peers, check which of our
+    /// 20 SPIRAL neighbors are occupied by known peers that we don't have an
+    /// active connection to, and queue them for connection via switchboard.
+    ///
+    /// This is the key function that turns the bootstrap star topology into
+    /// a proper SPIRAL mesh. Ported from Lagoon's dial_missing_spiral_neighbors.
+    async fn dial_missing_spiral_neighbors(&self) {
+        let state = self.state.read().await;
+
+        let self_slot = match state.self_slot.as_ref() {
+            Some(s) => s,
+            None => return, // no slot, can't compute neighbors
+        };
+
+        let my_neighbor_coords: std::collections::HashSet<_> =
+            citadel_topology::Neighbors::of(self_slot.coord).into_iter().collect();
+
+        let active_peers = {
+            drop(state);
+            let active = self.active_peer_ids_snapshot().await;
+            let state = self.state.read().await;
+            // Collect peer IDs we're already connected to
+            let connected: std::collections::HashSet<String> = state
+                .peers
+                .keys()
+                .filter(|id| active.contains(*id))
+                .cloned()
+                .collect();
+            (connected, state)
+        };
+        let (connected_peers, state) = active_peers;
+
+        // Find SPIRAL neighbors we should connect to
+        for (slot_idx, slot_claim) in &state.claimed_slots {
+            // Skip ourselves
+            if state.self_slot.as_ref().map(|s| s.index) == Some(*slot_idx) {
+                continue;
+            }
+
+            // Is this slot a SPIRAL neighbor?
+            if !my_neighbor_coords.contains(&slot_claim.coord) {
+                continue;
+            }
+
+            // Already connected?
+            if connected_peers.contains(&slot_claim.peer_id) {
+                continue;
+            }
+
+            // Get the peer's address from known peers
+            let peer_addr = state
+                .peers
+                .get(&slot_claim.peer_id)
+                .map(|p| p.addr);
+
+            if let Some(addr) = peer_addr {
+                info!(
+                    "Dialing SPIRAL neighbor {} (slot {}, coord {},{},{}) via switchboard",
+                    &slot_claim.peer_id[..12.min(slot_claim.peer_id.len())],
+                    slot_idx,
+                    slot_claim.coord.q, slot_claim.coord.r, slot_claim.coord.z,
+                );
+                let _ = self.pending_connect_tx
+                    .send((slot_claim.peer_id.clone(), addr))
+                    .await;
+            } else {
+                debug!(
+                    "SPIRAL neighbor {} (slot {}) has no known address — will dial when discovered",
+                    &slot_claim.peer_id[..12.min(slot_claim.peer_id.len())],
+                    slot_idx,
+                );
+            }
+        }
     }
 
     /// Process incoming VDF-anchored claim
@@ -2358,6 +2451,12 @@ impl MeshService {
         self.state.read().await.self_id.clone()
     }
 
+    /// Get connected peer count
+    pub async fn connected_peer_count(&self) -> usize {
+        let active = self.active_peer_ids_snapshot().await;
+        active.len()
+    }
+
     /// Get the shared mesh state (for API access)
     pub fn mesh_state(&self) -> Arc<RwLock<MeshState>> {
         Arc::clone(&self.state)
@@ -2977,10 +3076,11 @@ impl MeshService {
                             });
 
                         let asp_stream = if let Some(host) = asp_host {
+                            let sb_port = switchboard_port_for_mesh_port(addr.port());
                             match self_clone
                                 .try_switchboard_connect(
                                     &host,
-                                    addr.port(),
+                                    sb_port,
                                     &format!("peer:{discovered_id}"),
                                     2,
                                     false,
@@ -3045,7 +3145,7 @@ impl MeshService {
         for peer_addr in &self.entry_peers {
             info!("Connecting to entry peer via switchboard: {}", peer_addr);
 
-            let (host, mesh_port) = super::transport::extract_host_and_port(peer_addr, self.listen_addr.port());
+            let (host, port) = super::transport::extract_host_and_port(peer_addr, switchboard_port_for_mesh_port(self.listen_addr.port()));
 
             // Try up to 3 times — anycast may route to self on first attempts.
             // Pausing our switchboard listener makes the kernel RST self-routed SYNs
@@ -3055,7 +3155,7 @@ impl MeshService {
                 // Pause our switchboard so self-routed SYNs get kernel RST
                 let paused = self.pause_switchboard_listener().await;
 
-                let result = connect_switchboard(&host, mesh_port, &our_peer_id, "any").await;
+                let result = connect_switchboard(&host, port, &our_peer_id, "any").await;
 
                 // Resume immediately after dial completes
                 if paused {
@@ -4203,8 +4303,32 @@ impl MeshService {
                                 state.claimed_slots.insert(idx, claim);
                             }
                         }
+
+                        // Store indirect peer so dial_missing_spiral_neighbors
+                        // can find their address when it needs to connect.
+                        let slot_claim = slot_index.map(|idx| {
+                            SlotClaim::with_public_key(idx, id.clone(), public_key.clone())
+                        });
+                        state.peers.insert(
+                            id.clone(),
+                            MeshPeer {
+                                id: id.clone(),
+                                addr,
+                                yggdrasil_addr,
+                                underlay_uri,
+                                ygg_peer_uri,
+                                public_key,
+                                last_seen: std::time::Instant::now(),
+                                coordinated: false,
+                                slot: slot_claim,
+                                is_entry_peer: false,
+                                content_synced: false,
+                                their_have: None,
+                                their_peer_addr_have: None,
+                            },
+                        );
                         debug!(
-                            "Ignoring indirect flood-only peer {} at {} from {}; peer-addr sync handles dialable peer discovery",
+                            "Stored indirect peer {} at {} from {} (for SPIRAL neighbor dialing)",
                             id, addr_str, peer_id
                         );
                     }
@@ -4400,6 +4524,8 @@ impl MeshService {
                             if self.process_vdf_claim(claim.clone()).await {
                                 // Re-flood winning claim
                                 self.flood(FloodMessage::VdfSlotClaim { claim });
+                                // Topology changed — may have new SPIRAL neighbors to dial
+                                self.trigger_dial_spiral_neighbors();
                             }
                         }
                     }

@@ -16,6 +16,7 @@ And finally
 * No "FOR NOW" compromises - Do it right or don't do it
 * No "TODO" or "SIMPLIFIED IMPLEMENTATION" - Complete implementations only
 * **NO .internal ADDRESSES FOR MESH ENTRY PEERS** - Nodes use the PUBLIC IPv4 ANYCAST ADDRESS via APE (Any Point of Entry). The switchboard on port 9443 handles routing. This is non-negotiable. `.internal` is NOT the entry path.
+* **SWITCHBOARD IS THE ENTRY PROTOCOL** - The switchboard half-dial on port 9443 is how nodes bootstrap into the mesh via anycast. This is the entire point of using Fly.io. After bootstrap, nodes connect to SPIRAL neighbors via underlay addresses learned from HELLO exchange. Do not bypass the switchboard for entry peer connections.
 
 ## CVDF - Cooperative VDF (NOT "Cluster", "Chained", "Collaborative", etc.)
 

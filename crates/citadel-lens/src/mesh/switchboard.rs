@@ -135,11 +135,15 @@ pub async fn read_json_line(
 
 pub async fn connect_switchboard(
     host: &str,
-    mesh_port: u16,
+    port: u16,
     our_peer_id: &str,
     want: &str,
 ) -> io::Result<SwitchboardOutcome> {
-    let target = format_target(host, mesh_port);
+    let target = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
     let mut stream = TcpStream::connect(&target).await?;
     stream.set_nodelay(true)?;
 
