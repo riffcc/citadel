@@ -3147,20 +3147,12 @@ impl MeshService {
 
             let (host, port) = super::transport::extract_host_and_port(peer_addr, switchboard_port_for_mesh_port(self.listen_addr.port()));
 
-            // Try up to 3 times — anycast may route to self on first attempts.
-            // Pausing our switchboard listener makes the kernel RST self-routed SYNs
-            // so Fly forwards to the next machine.
+            // Try multiple times — anycast may route to self. Protocol-level
+            // self-detection (peer_id comparison in SwitchboardHello) handles this.
+            // No pause/resume — Fly's proxy layer absorbs kernel RSTs.
             let mut attempt_connected = false;
-            for attempt in 0..3 {
-                // Pause our switchboard so self-routed SYNs get kernel RST
-                let paused = self.pause_switchboard_listener().await;
-
+            for attempt in 0..5 {
                 let result = connect_switchboard(&host, port, &our_peer_id, "any").await;
-
-                // Resume immediately after dial completes
-                if paused {
-                    self.resume_switchboard_listener().await;
-                }
 
                 match result {
                     Ok(SwitchboardOutcome::Ready(stream, addr)) => {
